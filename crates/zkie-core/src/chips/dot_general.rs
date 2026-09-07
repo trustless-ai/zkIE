@@ -5,6 +5,7 @@
 //! Full M x N x K matrix tiling is out of scope here: a later ONNX-compiler
 //! sub-project will instantiate this chip once per output element.
 
+use crate::chips::lookup_range_check::{LookupRangeCheckChip, LookupRangeCheckConfig};
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_raw, FixedPointError, I18, SCALE_18};
@@ -99,8 +100,8 @@ pub struct DotProductConfig {
     pub(crate) a_shift: Column<Advice>,
     pub(crate) b_shift: Column<Advice>,
     pub(crate) s_shift: Selector,
-    pub(crate) range_a: RangeCheckConfig,
-    pub(crate) range_b: RangeCheckConfig,
+    pub(crate) range_a: LookupRangeCheckConfig,
+    pub(crate) range_b: LookupRangeCheckConfig,
     pub(crate) k: usize,
 }
 
@@ -200,8 +201,11 @@ impl DotProductChip {
             ]
         });
 
-        let range_a = RangeCheckChip::configure(meta, a_shift, bits, 64);
-        let range_b = RangeCheckChip::configure(meta, b_shift, bits, 64);
+        // Lookup-based, not bit decomposition: there are 2k of these per
+        // instance, so 8 rows each instead of 64 is the difference between a
+        // usable bound and an unusable one. See `chips::lookup_range_check`.
+        let range_a = LookupRangeCheckChip::configure(meta, a_shift, bits, 64);
+        let range_b = LookupRangeCheckChip::configure(meta, b_shift, bits, 64);
         let range_q = RangeCheckChip::configure(meta, q, bits, 64);
         let range_r = RangeCheckChip::configure(meta, r, bits, REMAINDER_BITS);
         let range_r_slack = RangeCheckChip::configure(meta, slack, bits, REMAINDER_BITS);
@@ -235,6 +239,15 @@ impl DotProductChip {
 
     /// Assigns the dot-product region for `a` and `b` (each must have exactly
     /// the configured `K` elements), returning the requantized I18 result.
+    /// Loads the byte table backing the operand range checks. Must be called
+    /// once per circuit synthesis, independently of [`Self::assign`].
+    pub fn load_range_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        LookupRangeCheckChip::construct(self.config.range_a.clone())
+            .load_table(layouter.namespace(|| "dot operand byte table a"))?;
+        LookupRangeCheckChip::construct(self.config.range_b.clone())
+            .load_table(layouter.namespace(|| "dot operand byte table b"))
+    }
+
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -334,8 +347,8 @@ impl DotProductChip {
         )?;
 
         // Bound each operand to i64 via its shifted copy.
-        let range_a_chip = RangeCheckChip::construct(self.config.range_a.clone());
-        let range_b_chip = RangeCheckChip::construct(self.config.range_b.clone());
+        let range_a_chip = LookupRangeCheckChip::construct(self.config.range_a.clone());
+        let range_b_chip = LookupRangeCheckChip::construct(self.config.range_b.clone());
         let mut operand_links = Vec::with_capacity(2 * k);
         for i in 0..k {
             let (a_shift_fr, a_shift_raw) = shifted_i64_witness(a[i].raw());
@@ -436,9 +449,10 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            layouter: impl Layouter<Fr>,
+            mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = DotProductChip::construct(config.dot);
+            chip.load_range_table(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, self.a.clone(), self.b.clone())
                 .map(|_| ())
                 .map_err(|e| match e {
@@ -948,8 +962,8 @@ mod tests {
                         },
                     )?;
 
-                let range_a_chip = RangeCheckChip::construct(config.dot.range_a.clone());
-                let range_b_chip = RangeCheckChip::construct(config.dot.range_b.clone());
+                let range_a_chip = LookupRangeCheckChip::construct(config.dot.range_a.clone());
+                let range_b_chip = LookupRangeCheckChip::construct(config.dot.range_b.clone());
                 let mut operand_links = Vec::with_capacity(2 * K);
                 for i in 0..K {
                     let a_s = range_witness(self.a_raw[i]);

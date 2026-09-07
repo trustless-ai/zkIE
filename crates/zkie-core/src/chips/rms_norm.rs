@@ -241,10 +241,16 @@ impl RmsNormChip {
         RmsNormChip { config, rsqrt_chip }
     }
 
-    /// Loads the fixed `rsqrt` table. Must be called exactly once per
-    /// circuit synthesis. Delegates to [`RsqrtChip::load_table`].
-    pub fn load_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        self.rsqrt_chip.load_table(layouter)
+    /// Loads the fixed `rsqrt` table and the byte table backing this chip's
+    /// multiply operand range checks. Must be called exactly once per
+    /// circuit synthesis.
+    pub fn load_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        self.rsqrt_chip
+            .load_table(layouter.namespace(|| "rms norm rsqrt table"))?;
+        crate::chips::eltwise::load_mul_operand_range_table(
+            &self.config.mul,
+            layouter.namespace(|| "rms norm mul operand tables"),
+        )
     }
 
     fn unshift(

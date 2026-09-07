@@ -1,3 +1,4 @@
+use crate::chips::lookup_range_check::{LookupRangeCheckChip, LookupRangeCheckConfig};
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_mul, I18, SCALE_18};
@@ -175,8 +176,20 @@ pub struct EltwiseMulConfig {
     pub(crate) a_shift: Column<Advice>,
     pub(crate) b_shift: Column<Advice>,
     pub(crate) s_shift: Selector,
-    pub(crate) range_a: RangeCheckConfig,
-    pub(crate) range_b: RangeCheckConfig,
+    pub(crate) range_a: LookupRangeCheckConfig,
+    pub(crate) range_b: LookupRangeCheckConfig,
+}
+
+/// Loads the byte table backing a multiply's operand range checks. Must be
+/// called once per circuit synthesis by whoever configured the chip.
+pub(crate) fn load_mul_operand_range_table(
+    mul: &EltwiseMulConfig,
+    mut layouter: impl Layouter<Fr>,
+) -> Result<(), ErrorFront> {
+    LookupRangeCheckChip::construct(mul.range_a.clone())
+        .load_table(layouter.namespace(|| "mul operand byte table a"))?;
+    LookupRangeCheckChip::construct(mul.range_b.clone())
+        .load_table(layouter.namespace(|| "mul operand byte table b"))
 }
 
 /// Witnesses the signed-shifted copies of a multiply's operands at `offset`
@@ -211,13 +224,13 @@ pub(crate) fn link_mul_operand_ranges(
     b_shift_cell: &AssignedCell<Fr, Fr>,
 ) -> Result<(), ErrorFront> {
     let (a_fr, a_raw) = shifted_i64_witness(a_val.raw());
-    let a_range_cell = RangeCheckChip::construct(mul.range_a.clone()).assign(
+    let a_range_cell = LookupRangeCheckChip::construct(mul.range_a.clone()).assign(
         layouter.namespace(|| "range a"),
         a_fr,
         a_raw,
     )?;
     let (b_fr, b_raw) = shifted_i64_witness(b_val.raw());
-    let b_range_cell = RangeCheckChip::construct(mul.range_b.clone()).assign(
+    let b_range_cell = LookupRangeCheckChip::construct(mul.range_b.clone()).assign(
         layouter.namespace(|| "range b"),
         b_fr,
         b_raw,
@@ -303,8 +316,10 @@ impl EltwiseMulChip {
             ]
         });
 
-        let range_a = RangeCheckChip::configure(meta, a_shift, bits, 64);
-        let range_b = RangeCheckChip::configure(meta, b_shift, bits, 64);
+        // Lookup-based for the same reason as the dot product's: these are
+        // per-operand, so 8 rows each instead of 64.
+        let range_a = LookupRangeCheckChip::configure(meta, a_shift, bits, 64);
+        let range_b = LookupRangeCheckChip::configure(meta, b_shift, bits, 64);
         let range_q = RangeCheckChip::configure(meta, q, bits, 64);
         let range_r = RangeCheckChip::configure(meta, r, bits, REMAINDER_BITS);
         let range_r_slack = RangeCheckChip::configure(meta, slack, bits, REMAINDER_BITS);
@@ -340,6 +355,12 @@ impl EltwiseMulChip {
     /// this cell to any cell where they re-witness the same value, rather
     /// than re-assigning it disconnected from this one (see the soundness
     /// note at the top of this file).
+    /// Loads the byte table backing the operand range checks. Must be called
+    /// once per circuit synthesis, independently of [`Self::assign`].
+    pub fn load_range_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        load_mul_operand_range_table(&self.config, layouter)
+    }
+
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -693,9 +714,10 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            layouter: impl Layouter<Fr>,
+            mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = EltwiseMulChip::construct(config.mul);
+            chip.load_range_table(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, self.a, self.b).map(|_| ())
         }
     }
@@ -1022,13 +1044,13 @@ mod tests {
                     )?;
 
                 let a_s = range_witness(self.a_raw);
-                let a_range_cell = RangeCheckChip::construct(config.mul.range_a.clone()).assign(
+                let a_range_cell = LookupRangeCheckChip::construct(config.mul.range_a.clone()).assign(
                     layouter.namespace(|| "range a"),
                     Value::known(i128_to_fr(a_s)),
                     Value::known(a_s),
                 )?;
                 let b_s = range_witness(self.b_raw);
-                let b_range_cell = RangeCheckChip::construct(config.mul.range_b.clone()).assign(
+                let b_range_cell = LookupRangeCheckChip::construct(config.mul.range_b.clone()).assign(
                     layouter.namespace(|| "range b"),
                     Value::known(i128_to_fr(b_s)),
                     Value::known(b_s),

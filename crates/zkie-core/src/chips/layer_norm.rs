@@ -506,12 +506,17 @@ impl LayerNormChip {
         LayerNormChip { config, rsqrt_chip }
     }
 
-    /// Loads the fixed `rsqrt` table backing this chip's lookup argument.
-    /// Must be called exactly once per circuit synthesis, independently of
-    /// how many times `assign` is called. Delegates to
-    /// [`RsqrtChip::load_table`].
-    pub fn load_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        self.rsqrt_chip.load_table(layouter)
+    /// Loads the fixed `rsqrt` table backing this chip's lookup argument, and
+    /// the byte table backing its multiply's operand range checks. Must be
+    /// called exactly once per circuit synthesis, independently of how many
+    /// times `assign` is called.
+    pub fn load_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        self.rsqrt_chip
+            .load_table(layouter.namespace(|| "layer norm rsqrt table"))?;
+        crate::chips::eltwise::load_mul_operand_range_table(
+            &self.config.mul,
+            layouter.namespace(|| "layer norm mul operand tables"),
+        )
     }
 
     /// Assigns the full layer-norm pipeline for `inputs` (must have length

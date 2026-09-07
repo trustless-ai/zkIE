@@ -507,6 +507,21 @@ impl AssemblerChip {
     /// Distinct from [`AssemblerChip::assign`] (rather than folded into it)
     /// so callers whose program has no `RmsNorm` instruction pay no extra
     /// cost and need not call this at all.
+    /// Loads the byte tables backing every configured dot product's and the
+    /// multiply's operand range checks. Unlike
+    /// [`AssemblerChip::load_rms_norm_tables`] this is unconditional: the
+    /// dot and multiply configs exist for every program.
+    pub fn load_range_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        for (k, cfg) in self.config.dot.iter() {
+            DotProductChip::construct(cfg.clone())
+                .load_range_table(layouter.namespace(|| format!("assembler dot range table {k}")))?;
+        }
+        crate::chips::eltwise::load_mul_operand_range_table(
+            &self.config.mul,
+            layouter.namespace(|| "assembler mul range tables"),
+        )
+    }
+
     pub fn load_rms_norm_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
         for (key, cfg) in self.config.rms_norm.iter() {
             let chip = RmsNormChip::construct(cfg.clone());
@@ -1239,9 +1254,10 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            layouter: impl Layouter<Fr>,
+            mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = AssemblerChip::construct(config);
+            chip.load_range_tables(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, &self.program)
                 .map(|_| ())
                 .map_err(|e| panic!("assembler assign failed: {e}"))
@@ -1312,9 +1328,10 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            layouter: impl Layouter<Fr>,
+            mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = AssemblerChip::construct(config);
+            chip.load_range_tables(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, &self.program)
                 .map(|_| ())
                 .map_err(|e| panic!("assembler assign failed: {e}"))
@@ -1389,9 +1406,10 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            layouter: impl Layouter<Fr>,
+            mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = AssemblerChip::construct(config);
+            chip.load_range_tables(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, &self.program)
                 .map(|_| ())
                 .map_err(|e| panic!("assembler assign failed: {e}"))

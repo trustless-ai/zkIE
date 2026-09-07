@@ -964,6 +964,10 @@ mod tests {
 
                 let range_a_chip = LookupRangeCheckChip::construct(config.dot.range_a.clone());
                 let range_b_chip = LookupRangeCheckChip::construct(config.dot.range_b.clone());
+                // Without this the lookup fails for lack of a table and the
+                // circuit would be rejected for the wrong reason.
+                range_a_chip.load_table(layouter.namespace(|| "byte table a"))?;
+                range_b_chip.load_table(layouter.namespace(|| "byte table b"))?;
                 let mut operand_links = Vec::with_capacity(2 * K);
                 for i in 0..K {
                     let a_s = range_witness(self.a_raw[i]);

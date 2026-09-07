@@ -1043,6 +1043,13 @@ mod tests {
                         },
                     )?;
 
+                // Without the byte tables the lookups fail for lack of a
+                // table and the circuit would be rejected for the wrong reason.
+                load_mul_operand_range_table(
+                    &config.mul,
+                    layouter.namespace(|| "mul byte tables"),
+                )?;
+
                 let a_s = range_witness(self.a_raw);
                 let a_range_cell = LookupRangeCheckChip::construct(config.mul.range_a.clone()).assign(
                     layouter.namespace(|| "range a"),

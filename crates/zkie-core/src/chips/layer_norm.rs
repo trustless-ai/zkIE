@@ -870,7 +870,8 @@ pub(crate) fn assign_mul_row(
     let slack = SCALE_18 - 1 - r;
     let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
 
-    let (a_cell, b_cell, q_cell, r_cell, slack_cell) = layouter.assign_region(
+    let (a_cell, b_cell, q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter
+        .assign_region(
         || "layer norm mul row",
         |mut region| {
             mul.s_mul.enable(&mut region, 0)?;
@@ -887,8 +888,27 @@ pub(crate) fn assign_mul_row(
                 0,
                 || Value::known(i128_to_fr(slack)),
             )?;
-            Ok((a_cell, b_cell, q_cell, r_cell, slack_cell))
+            let (a_shift_cell, b_shift_cell) =
+                crate::chips::eltwise::assign_mul_operand_shifts(mul, &mut region, 0, a_val, b_val)?;
+            Ok((
+                a_cell,
+                b_cell,
+                q_cell,
+                r_cell,
+                slack_cell,
+                a_shift_cell,
+                b_shift_cell,
+            ))
         },
+    )?;
+
+    crate::chips::eltwise::link_mul_operand_ranges(
+        mul,
+        layouter.namespace(|| "mul operand ranges"),
+        a_val,
+        b_val,
+        &a_shift_cell,
+        &b_shift_cell,
     )?;
 
     let range_q_chip = RangeCheckChip::construct(mul.range_q.clone());

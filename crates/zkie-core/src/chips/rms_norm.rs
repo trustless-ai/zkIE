@@ -509,7 +509,7 @@ mod tests {
     const RSQRT_DOMAIN_MAX: f64 = 3.0;
     const RSQRT_DOMAIN_N: usize = 101;
 
-    const CIRCUIT_K: u32 = 12;
+    const CIRCUIT_K: u32 = 13;
 
     fn sample_inputs() -> Vec<I18> {
         // x^2: 2.25, 0.25, 0.25, 2.25 -> mean = 1.25 exactly.

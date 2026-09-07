@@ -99,7 +99,7 @@ fn sample_circuit() -> PatchEmbedCircuit {
 
 #[test]
 fn patch_embed_real_kzg_roundtrip() {
-    let k = 10;
+    let k = 11;
     let mut rng = OsRng;
     let circuit = sample_circuit();
 
@@ -142,7 +142,7 @@ fn patch_embed_real_kzg_roundtrip() {
 
 #[test]
 fn patch_embed_tampered_proof_fails_verification() {
-    let k = 10;
+    let k = 11;
     let mut rng = OsRng;
     let circuit = sample_circuit();
 

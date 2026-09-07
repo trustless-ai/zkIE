@@ -270,7 +270,7 @@ mod tests {
             patch: patch.clone(),
             weights: weights.clone(),
         };
-        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
 
         assert!((expected[0].to_f64() - 1.0).abs() < 1e-9);
@@ -282,7 +282,7 @@ mod tests {
         let patch = vec![I18::from_raw(0); PATCH_LEN];
         let weights = vec![vec![I18::from_raw(0); PATCH_LEN]; EMBED_DIM];
         let circuit = PatchEmbedTestCircuit { patch, weights };
-        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
@@ -330,7 +330,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN - 1],
             weights: vec![vec![I18::from_raw(1); PATCH_LEN]; EMBED_DIM],
         };
-        let _ = MockProver::run(10, &circuit, vec![]);
+        let _ = MockProver::run(11, &circuit, vec![]);
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN],
             weights: vec![vec![I18::from_raw(1); PATCH_LEN]; EMBED_DIM - 1],
         };
-        let _ = MockProver::run(10, &circuit, vec![]);
+        let _ = MockProver::run(11, &circuit, vec![]);
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN],
             weights,
         };
-        let _ = MockProver::run(10, &circuit, vec![]);
+        let _ = MockProver::run(11, &circuit, vec![]);
     }
 
     /// Forges the final-row quotient witness for one output dimension's
@@ -561,7 +561,7 @@ mod tests {
                 ],
             ],
         };
-        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
     }
 }

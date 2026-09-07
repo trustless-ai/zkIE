@@ -513,8 +513,9 @@ impl AssemblerChip {
     /// dot and multiply configs exist for every program.
     pub fn load_range_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
         for (k, cfg) in self.config.dot.iter() {
-            DotProductChip::construct(cfg.clone())
-                .load_range_table(layouter.namespace(|| format!("assembler dot range table {k}")))?;
+            DotProductChip::construct(cfg.clone()).load_range_table(
+                layouter.namespace(|| format!("assembler dot range table {k}")),
+            )?;
         }
         crate::chips::eltwise::load_mul_operand_range_table(
             &self.config.mul,

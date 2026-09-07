@@ -871,8 +871,8 @@ mod tests {
             ) -> Result<(), ErrorFront> {
                 let mut raw_sum: i128 = 0;
                 let mut partial_sums = Vec::with_capacity(K);
-                for i in 0..K {
-                    raw_sum += self.a_raw[i] * self.b_raw[i];
+                for (a, b) in self.a_raw.iter().zip(self.b_raw.iter()) {
+                    raw_sum += a * b;
                     partial_sums.push(raw_sum);
                 }
                 let (q, r) = requantize_raw(raw_sum).unwrap();
@@ -902,7 +902,7 @@ mod tests {
                         |mut region| {
                             let mut a_shift_cells = Vec::with_capacity(K);
                             let mut b_shift_cells = Vec::with_capacity(K);
-                            for i in 0..K {
+                            for (i, partial) in partial_sums.iter().enumerate() {
                                 region.assign_advice(
                                     || format!("a_{i}"),
                                     config.dot.a,
@@ -932,7 +932,7 @@ mod tests {
                                     || format!("accumulator_{i}"),
                                     config.dot.accumulator,
                                     i,
-                                    || Value::known(i128_to_fr(partial_sums[i])),
+                                    || Value::known(i128_to_fr(*partial)),
                                 )?;
                                 if i == 0 {
                                     config.dot.s_acc_start.enable(&mut region, i)?;
@@ -1040,5 +1040,4 @@ mod tests {
             );
         }
     }
-
 }

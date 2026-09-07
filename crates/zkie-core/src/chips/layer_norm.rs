@@ -877,35 +877,50 @@ pub(crate) fn assign_mul_row(
 
     let (a_cell, b_cell, q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter
         .assign_region(
-        || "layer norm mul row",
-        |mut region| {
-            mul.s_mul.enable(&mut region, 0)?;
-            mul.s_slack.enable(&mut region, 0)?;
-            let a_cell =
-                region.assign_advice(|| "a", mul.a, 0, || Value::known(i64_to_fr(a_val.raw())))?;
-            let b_cell =
-                region.assign_advice(|| "b", mul.b, 0, || Value::known(i64_to_fr(b_val.raw())))?;
-            let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
-            let r_cell = region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
-            let slack_cell = region.assign_advice(
-                || "slack",
-                mul.slack,
-                0,
-                || Value::known(i128_to_fr(slack)),
-            )?;
-            let (a_shift_cell, b_shift_cell) =
-                crate::chips::eltwise::assign_mul_operand_shifts(mul, &mut region, 0, a_val, b_val)?;
-            Ok((
-                a_cell,
-                b_cell,
-                q_cell,
-                r_cell,
-                slack_cell,
-                a_shift_cell,
-                b_shift_cell,
-            ))
-        },
-    )?;
+            || "layer norm mul row",
+            |mut region| {
+                mul.s_mul.enable(&mut region, 0)?;
+                mul.s_slack.enable(&mut region, 0)?;
+                let a_cell = region.assign_advice(
+                    || "a",
+                    mul.a,
+                    0,
+                    || Value::known(i64_to_fr(a_val.raw())),
+                )?;
+                let b_cell = region.assign_advice(
+                    || "b",
+                    mul.b,
+                    0,
+                    || Value::known(i64_to_fr(b_val.raw())),
+                )?;
+                let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
+                let r_cell =
+                    region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
+                let slack_cell = region.assign_advice(
+                    || "slack",
+                    mul.slack,
+                    0,
+                    || Value::known(i128_to_fr(slack)),
+                )?;
+                let (a_shift_cell, b_shift_cell) =
+                    crate::chips::eltwise::assign_mul_operand_shifts(
+                        mul,
+                        &mut region,
+                        0,
+                        a_val,
+                        b_val,
+                    )?;
+                Ok((
+                    a_cell,
+                    b_cell,
+                    q_cell,
+                    r_cell,
+                    slack_cell,
+                    a_shift_cell,
+                    b_shift_cell,
+                ))
+            },
+        )?;
 
     crate::chips::eltwise::link_mul_operand_ranges(
         mul,

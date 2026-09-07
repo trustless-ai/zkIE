@@ -47,7 +47,7 @@ impl LookupRangeCheckChip {
         n_bits: usize,
     ) -> LookupRangeCheckConfig {
         assert!(
-            n_bits > 0 && n_bits % LIMB_BITS == 0,
+            n_bits > 0 && n_bits.is_multiple_of(LIMB_BITS),
             "n_bits must be a positive multiple of {LIMB_BITS}"
         );
         meta.enable_equality(limbs);
@@ -130,7 +130,8 @@ impl LookupRangeCheckChip {
             |mut region| {
                 for i in 0..n_limbs {
                     self.config.s_limb.enable(&mut region, i)?;
-                    let limb = raw_value.map(|v| ((v >> (LIMB_BITS * i)) as u64) & (LIMB_VALUES - 1));
+                    let limb =
+                        raw_value.map(|v| ((v >> (LIMB_BITS * i)) as u64) & (LIMB_VALUES - 1));
                     region.assign_advice(
                         || format!("limb {i}"),
                         self.config.limbs,

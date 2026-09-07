@@ -197,6 +197,7 @@ pub(crate) fn load_mul_operand_range_table(
 /// [`link_mul_operand_ranges`], which does the checking; both are needed for
 /// the bound to hold, and callers that assemble mul rows by hand (see
 /// `layer_norm::assign_mul_row`) must call both.
+#[allow(clippy::type_complexity)]
 pub(crate) fn assign_mul_operand_shifts(
     mul: &EltwiseMulConfig,
     region: &mut Region<Fr>,
@@ -1051,17 +1052,19 @@ mod tests {
                 )?;
 
                 let a_s = range_witness(self.a_raw);
-                let a_range_cell = LookupRangeCheckChip::construct(config.mul.range_a.clone()).assign(
-                    layouter.namespace(|| "range a"),
-                    Value::known(i128_to_fr(a_s)),
-                    Value::known(a_s),
-                )?;
+                let a_range_cell = LookupRangeCheckChip::construct(config.mul.range_a.clone())
+                    .assign(
+                        layouter.namespace(|| "range a"),
+                        Value::known(i128_to_fr(a_s)),
+                        Value::known(a_s),
+                    )?;
                 let b_s = range_witness(self.b_raw);
-                let b_range_cell = LookupRangeCheckChip::construct(config.mul.range_b.clone()).assign(
-                    layouter.namespace(|| "range b"),
-                    Value::known(i128_to_fr(b_s)),
-                    Value::known(b_s),
-                )?;
+                let b_range_cell = LookupRangeCheckChip::construct(config.mul.range_b.clone())
+                    .assign(
+                        layouter.namespace(|| "range b"),
+                        Value::known(i128_to_fr(b_s)),
+                        Value::known(b_s),
+                    )?;
                 let q_range_cell = RangeCheckChip::construct(config.mul.range_q.clone()).assign(
                     layouter.namespace(|| "range q"),
                     q_shift_fr,
@@ -1072,14 +1075,12 @@ mod tests {
                     Value::known(i128_to_fr(r)),
                     Value::known(r),
                 )?;
-                let slack_range_cell = RangeCheckChip::construct(
-                    config.mul.range_r_slack.clone(),
-                )
-                .assign(
-                    layouter.namespace(|| "range r slack"),
-                    Value::known(i128_to_fr(slack)),
-                    Value::known(slack),
-                )?;
+                let slack_range_cell = RangeCheckChip::construct(config.mul.range_r_slack.clone())
+                    .assign(
+                        layouter.namespace(|| "range r slack"),
+                        Value::known(i128_to_fr(slack)),
+                        Value::known(slack),
+                    )?;
 
                 layouter.assign_region(
                     || "out of range mul links",
@@ -1115,5 +1116,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -5,6 +5,10 @@ use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
+/// A reduced value, its canonical output cell, and the input cells linked to
+/// that reduction region.
+pub type ReduceAssignment = (I18, AssignedCell<Fr, Fr>, Vec<AssignedCell<Fr, Fr>>);
+
 const REMAINDER_BITS: usize = 60; // 2^60 > SCALE_18 - 1, matches eltwise.rs's mul gadget.
 
 // See the soundness note in chips/eltwise.rs: any column that needs both to
@@ -111,12 +115,20 @@ impl ReduceSumChip {
     /// `region.constrain_equal` these cells to any cell where they
     /// re-witness the same value, rather than re-assigning it disconnected
     /// from this one.
-    #[allow(clippy::type_complexity)]
     pub fn assign(
+        &self,
+        layouter: impl Layouter<Fr>,
+        inputs: &[I18],
+    ) -> Result<ReduceAssignment, ErrorFront> {
+        self.assign_with_witness_mode(layouter, inputs, true)
+    }
+
+    pub(crate) fn assign_with_witness_mode(
         &self,
         mut layouter: impl Layouter<Fr>,
         inputs: &[I18],
-    ) -> Result<(I18, AssignedCell<Fr, Fr>, Vec<AssignedCell<Fr, Fr>>), ErrorFront> {
+        witnesses_known: bool,
+    ) -> Result<ReduceAssignment, ErrorFront> {
         assert_eq!(
             inputs.len(),
             self.config.k,
@@ -151,7 +163,7 @@ impl ReduceSumChip {
                         || format!("value {i}"),
                         self.config.values,
                         i,
-                        || Value::known(i64_to_fr(v.raw())),
+                        || witness_value(witnesses_known, i64_to_fr(v.raw())),
                     )?;
                     value_cells.push(value_cell);
                     if i == 0 {
@@ -163,7 +175,7 @@ impl ReduceSumChip {
                         || format!("sum {i}"),
                         self.config.sum,
                         i,
-                        || Value::known(i64_to_fr(*s)),
+                        || witness_value(witnesses_known, i64_to_fr(*s)),
                     )?;
                     last_sum_cell = Some(cell);
                 }
@@ -173,7 +185,7 @@ impl ReduceSumChip {
                     || "sum shift",
                     self.config.sum_shift,
                     last_row,
-                    || sum_shift_fr,
+                    || witness_or_unknown(witnesses_known, sum_shift_fr),
                 )?;
                 Ok((last_sum_cell.expect("k >= 1"), sum_shift_cell, value_cells))
             },
@@ -182,8 +194,8 @@ impl ReduceSumChip {
         let range_sum_chip = RangeCheckChip::construct(self.config.range_sum.clone());
         let range_cell = range_sum_chip.assign(
             layouter.namespace(|| "range sum"),
-            sum_shift_fr,
-            sum_shift_raw,
+            witness_or_unknown(witnesses_known, sum_shift_fr),
+            witness_or_unknown(witnesses_known, sum_shift_raw),
         )?;
 
         layouter.assign_region(
@@ -312,15 +324,26 @@ impl ReduceMeanChip {
     /// `region.constrain_equal` these cells to any cell where they re-derive
     /// or re-witness the same value, rather than leaving this chip's copies
     /// disconnected from them.
-    #[allow(clippy::type_complexity)]
     pub fn assign(
+        &self,
+        layouter: impl Layouter<Fr>,
+        inputs: &[I18],
+    ) -> Result<ReduceAssignment, ErrorFront> {
+        self.assign_with_witness_mode(layouter, inputs, true)
+    }
+
+    pub(crate) fn assign_with_witness_mode(
         &self,
         mut layouter: impl Layouter<Fr>,
         inputs: &[I18],
-    ) -> Result<(I18, AssignedCell<Fr, Fr>, Vec<AssignedCell<Fr, Fr>>), ErrorFront> {
+        witnesses_known: bool,
+    ) -> Result<ReduceAssignment, ErrorFront> {
         let sum_chip = ReduceSumChip::construct(self.config.sum.clone());
-        let (sum, sum_cell, value_cells) =
-            sum_chip.assign(layouter.namespace(|| "mean sum"), inputs)?;
+        let (sum, sum_cell, value_cells) = sum_chip.assign_with_witness_mode(
+            layouter.namespace(|| "mean sum"),
+            inputs,
+            witnesses_known,
+        )?;
 
         let (mean, r) =
             requantize_mul(sum, self.config.reciprocal).expect("I18 mean rescale overflow");
@@ -336,41 +359,49 @@ impl ReduceMeanChip {
                     || "sum",
                     self.config.sum.sum,
                     0,
-                    || Value::known(i64_to_fr(sum.raw())),
+                    || witness_value(witnesses_known, i64_to_fr(sum.raw())),
                 )?;
-                let q_cell = region.assign_advice(|| "q", self.config.q, 0, || q_shift_fr)?;
+                let q_cell = region.assign_advice(
+                    || "q",
+                    self.config.q,
+                    0,
+                    || witness_or_unknown(witnesses_known, q_shift_fr),
+                )?;
                 let r_cell = region.assign_advice(
                     || "r",
                     self.config.r,
                     0,
-                    || Value::known(i128_to_fr(r)),
+                    || witness_value(witnesses_known, i128_to_fr(r)),
                 )?;
                 let slack_cell = region.assign_advice(
                     || "slack",
                     self.config.slack,
                     0,
-                    || Value::known(i128_to_fr(slack)),
+                    || witness_value(witnesses_known, i128_to_fr(slack)),
                 )?;
                 Ok((sum_link_cell, q_cell, r_cell, slack_cell))
             },
         )?;
 
         let range_q_chip = RangeCheckChip::construct(self.config.range_q.clone());
-        let q_range_cell =
-            range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
+        let q_range_cell = range_q_chip.assign(
+            layouter.namespace(|| "range q"),
+            witness_or_unknown(witnesses_known, q_shift_fr),
+            witness_or_unknown(witnesses_known, q_shift_raw),
+        )?;
 
         let range_r_chip = RangeCheckChip::construct(self.config.range_r.clone());
         let r_range_cell = range_r_chip.assign(
             layouter.namespace(|| "range r"),
-            Value::known(i128_to_fr(r)),
-            Value::known(r),
+            witness_value(witnesses_known, i128_to_fr(r)),
+            witness_value(witnesses_known, r),
         )?;
 
         let range_r_slack_chip = RangeCheckChip::construct(self.config.range_r_slack.clone());
         let slack_range_cell = range_r_slack_chip.assign(
             layouter.namespace(|| "range r slack"),
-            Value::known(i128_to_fr(slack)),
-            Value::known(slack),
+            witness_value(witnesses_known, i128_to_fr(slack)),
+            witness_value(witnesses_known, slack),
         )?;
 
         layouter.assign_region(
@@ -389,6 +420,21 @@ impl ReduceMeanChip {
         )?;
 
         Ok((mean, q_cell, value_cells))
+    }
+}
+
+fn witness_value<T: Copy>(known: bool, value: T) -> Value<T> {
+    if known {
+        Value::known(value)
+    } else {
+        Value::unknown()
+    }
+}
+fn witness_or_unknown<T: Copy>(known: bool, value: Value<T>) -> Value<T> {
+    if known {
+        value
+    } else {
+        Value::unknown()
     }
 }
 
@@ -411,6 +457,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for SumTestCircuit {
+        type Params = ();
+
         type Config = SumTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -461,6 +509,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedSumCircuit {
+            type Params = ();
+
             type Config = SumTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -538,6 +588,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Params = ();
+
             type Config = SumTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -648,6 +700,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for MeanTestCircuit {
+        type Params = ();
+
         type Config = MeanTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -718,6 +772,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedMeanCircuit {
+            type Params = ();
+
             type Config = MeanTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -794,6 +850,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Params = ();
+
             type Config = MeanTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

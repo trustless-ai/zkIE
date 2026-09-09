@@ -220,8 +220,17 @@ impl LookupChip {
     /// layouter if `input` is not an exact point of the chip's domain.
     pub fn assign(
         &self,
+        layouter: impl Layouter<Fr>,
+        input: I18,
+    ) -> Result<(I18, AssignedCell<Fr, Fr>), LookupError> {
+        self.assign_with_witness_mode(layouter, input, true)
+    }
+
+    pub(crate) fn assign_with_witness_mode(
+        &self,
         mut layouter: impl Layouter<Fr>,
         input: I18,
+        witnesses_known: bool,
     ) -> Result<(I18, AssignedCell<Fr, Fr>), LookupError> {
         let output = self
             .domain
@@ -238,18 +247,26 @@ impl LookupChip {
                     || "input",
                     self.config.input,
                     0,
-                    || Value::known(i64_to_fr(input.raw())),
+                    || witness_value(witnesses_known, i64_to_fr(input.raw())),
                 )?;
                 region.assign_advice(
                     || "output",
                     self.config.output,
                     0,
-                    || Value::known(i64_to_fr(output.raw())),
+                    || witness_value(witnesses_known, i64_to_fr(output.raw())),
                 )
             },
         )?;
 
         Ok((output, output_cell))
+    }
+}
+
+fn witness_value<T: Copy>(known: bool, value: T) -> Value<T> {
+    if known {
+        Value::known(value)
+    } else {
+        Value::unknown()
     }
 }
 
@@ -354,6 +371,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for LookupTestCircuit {
+        type Params = ();
+
         type Config = LookupTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -423,6 +442,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for GuardTestCircuit {
+            type Params = ();
+
             type Config = LookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -483,6 +504,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedOutputCircuit {
+            type Params = ();
+
             type Config = LookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -565,6 +588,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedInputCircuit {
+            type Params = ();
+
             type Config = LookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

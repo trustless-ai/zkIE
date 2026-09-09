@@ -191,6 +191,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for PatchEmbedTestCircuit {
+        type Params = ();
+
         type Config = PatchEmbedTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -301,6 +303,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
+            type Params = ();
+
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -348,6 +352,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
+            type Params = ();
+
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -395,6 +401,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
+            type Params = ();
+
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -453,6 +461,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedPatchEmbedCircuit {
+            type Params = ();
+
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

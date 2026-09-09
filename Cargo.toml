@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/zkie-core", "crates/zkie-compiler", "engines/timesfm"]
+members = [
+    "crates/zkie-core",
+    "crates/zkie-compiler",
+    "crates/zkie-prover",
+    "crates/zkie-types",
+    "engines/timesfm",
+]

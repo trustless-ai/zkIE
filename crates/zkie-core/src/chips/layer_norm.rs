@@ -301,8 +301,17 @@ impl RsqrtChip {
     /// by its caller, the same discipline `EltwiseAddChip`/`EltwiseMulChip`
     /// already require of their callers -- see `LayerNormChip::assign`).
     pub fn assign(&self, layouter: impl Layouter<Fr>, input: I18) -> Result<I18, LookupError> {
+        self.assign_with_witness_mode(layouter, input, true)
+    }
+
+    pub(crate) fn assign_with_witness_mode(
+        &self,
+        layouter: impl Layouter<Fr>,
+        input: I18,
+        witnesses_known: bool,
+    ) -> Result<I18, LookupError> {
         self.inner
-            .assign(layouter, input)
+            .assign_with_witness_mode(layouter, input, witnesses_known)
             .map(|(value, _cell)| value)
     }
 }
@@ -796,9 +805,27 @@ impl LayerNormChip {
 #[allow(clippy::type_complexity)]
 pub(crate) fn assign_add_row(
     add: &EltwiseAddConfig,
+    layouter: impl Layouter<Fr>,
+    a_raw: i64,
+    b_raw: i64,
+) -> Result<
+    (
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+    ),
+    ErrorFront,
+> {
+    assign_add_row_with_witnesses(add, layouter, a_raw, b_raw, true)
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn assign_add_row_with_witnesses(
+    add: &EltwiseAddConfig,
     mut layouter: impl Layouter<Fr>,
     a_raw: i64,
     b_raw: i64,
+    witnesses_known: bool,
 ) -> Result<
     (
         AssignedCell<Fr, Fr>,
@@ -818,22 +845,46 @@ pub(crate) fn assign_add_row(
         || "layer norm add row",
         |mut region| {
             add.s_add.enable(&mut region, 0)?;
-            let a_cell = region.assign_advice(|| "a", add.a, 0, || a_shift_fr)?;
-            let b_cell = region.assign_advice(|| "b", add.b, 0, || b_shift_fr)?;
-            let c_cell = region.assign_advice(|| "c", add.c, 0, || c_shift_fr)?;
+            let a_cell = region.assign_advice(
+                || "a",
+                add.a,
+                0,
+                || value_or_unknown(witnesses_known, a_shift_fr),
+            )?;
+            let b_cell = region.assign_advice(
+                || "b",
+                add.b,
+                0,
+                || value_or_unknown(witnesses_known, b_shift_fr),
+            )?;
+            let c_cell = region.assign_advice(
+                || "c",
+                add.c,
+                0,
+                || value_or_unknown(witnesses_known, c_shift_fr),
+            )?;
             Ok((a_cell, b_cell, c_cell))
         },
     )?;
 
     let range_a_chip = RangeCheckChip::construct(add.range_a.clone());
-    let a_range_cell =
-        range_a_chip.assign(layouter.namespace(|| "range a"), a_shift_fr, a_shift_raw)?;
+    let a_range_cell = range_a_chip.assign(
+        layouter.namespace(|| "range a"),
+        value_or_unknown(witnesses_known, a_shift_fr),
+        value_or_unknown(witnesses_known, a_shift_raw),
+    )?;
     let range_b_chip = RangeCheckChip::construct(add.range_b.clone());
-    let b_range_cell =
-        range_b_chip.assign(layouter.namespace(|| "range b"), b_shift_fr, b_shift_raw)?;
+    let b_range_cell = range_b_chip.assign(
+        layouter.namespace(|| "range b"),
+        value_or_unknown(witnesses_known, b_shift_fr),
+        value_or_unknown(witnesses_known, b_shift_raw),
+    )?;
     let range_c_chip = RangeCheckChip::construct(add.range_c.clone());
-    let c_range_cell =
-        range_c_chip.assign(layouter.namespace(|| "range c"), c_shift_fr, c_shift_raw)?;
+    let c_range_cell = range_c_chip.assign(
+        layouter.namespace(|| "range c"),
+        value_or_unknown(witnesses_known, c_shift_fr),
+        value_or_unknown(witnesses_known, c_shift_raw),
+    )?;
 
     layouter.assign_region(
         || "layer norm add row range check links",
@@ -860,9 +911,27 @@ pub(crate) fn assign_add_row(
 #[allow(clippy::type_complexity)]
 pub(crate) fn assign_mul_row(
     mul: &EltwiseMulConfig,
+    layouter: impl Layouter<Fr>,
+    a_val: I18,
+    b_val: I18,
+) -> Result<
+    (
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+    ),
+    ErrorFront,
+> {
+    assign_mul_row_with_witnesses(mul, layouter, a_val, b_val, true)
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn assign_mul_row_with_witnesses(
+    mul: &EltwiseMulConfig,
     mut layouter: impl Layouter<Fr>,
     a_val: I18,
     b_val: I18,
+    witnesses_known: bool,
 ) -> Result<
     (
         AssignedCell<Fr, Fr>,
@@ -885,30 +954,40 @@ pub(crate) fn assign_mul_row(
                     || "a",
                     mul.a,
                     0,
-                    || Value::known(i64_to_fr(a_val.raw())),
+                    || value_or_unknown(witnesses_known, Value::known(i64_to_fr(a_val.raw()))),
                 )?;
                 let b_cell = region.assign_advice(
                     || "b",
                     mul.b,
                     0,
-                    || Value::known(i64_to_fr(b_val.raw())),
+                    || value_or_unknown(witnesses_known, Value::known(i64_to_fr(b_val.raw()))),
                 )?;
-                let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
-                let r_cell =
-                    region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
+                let q_cell = region.assign_advice(
+                    || "q",
+                    mul.q,
+                    0,
+                    || value_or_unknown(witnesses_known, q_shift_fr),
+                )?;
+                let r_cell = region.assign_advice(
+                    || "r",
+                    mul.r,
+                    0,
+                    || value_or_unknown(witnesses_known, Value::known(i128_to_fr(r))),
+                )?;
                 let slack_cell = region.assign_advice(
                     || "slack",
                     mul.slack,
                     0,
-                    || Value::known(i128_to_fr(slack)),
+                    || value_or_unknown(witnesses_known, Value::known(i128_to_fr(slack))),
                 )?;
                 let (a_shift_cell, b_shift_cell) =
-                    crate::chips::eltwise::assign_mul_operand_shifts(
+                    crate::chips::eltwise::assign_mul_operand_shifts_with_witness_mode(
                         mul,
                         &mut region,
                         0,
                         a_val,
                         b_val,
+                        witnesses_known,
                     )?;
                 Ok((
                     a_cell,
@@ -922,29 +1001,33 @@ pub(crate) fn assign_mul_row(
             },
         )?;
 
-    crate::chips::eltwise::link_mul_operand_ranges(
+    crate::chips::eltwise::link_mul_operand_ranges_with_witness_mode(
         mul,
         layouter.namespace(|| "mul operand ranges"),
         a_val,
         b_val,
         &a_shift_cell,
         &b_shift_cell,
+        witnesses_known,
     )?;
 
     let range_q_chip = RangeCheckChip::construct(mul.range_q.clone());
-    let q_range_cell =
-        range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
+    let q_range_cell = range_q_chip.assign(
+        layouter.namespace(|| "range q"),
+        value_or_unknown(witnesses_known, q_shift_fr),
+        value_or_unknown(witnesses_known, q_shift_raw),
+    )?;
     let range_r_chip = RangeCheckChip::construct(mul.range_r.clone());
     let r_range_cell = range_r_chip.assign(
         layouter.namespace(|| "range r"),
-        Value::known(i128_to_fr(r)),
-        Value::known(r),
+        value_or_unknown(witnesses_known, Value::known(i128_to_fr(r))),
+        value_or_unknown(witnesses_known, Value::known(r)),
     )?;
     let range_r_slack_chip = RangeCheckChip::construct(mul.range_r_slack.clone());
     let slack_range_cell = range_r_slack_chip.assign(
         layouter.namespace(|| "range r slack"),
-        Value::known(i128_to_fr(slack)),
-        Value::known(slack),
+        value_or_unknown(witnesses_known, Value::known(i128_to_fr(slack))),
+        value_or_unknown(witnesses_known, Value::known(slack)),
     )?;
 
     layouter.assign_region(
@@ -958,6 +1041,14 @@ pub(crate) fn assign_mul_row(
     )?;
 
     Ok((a_cell, b_cell, q_cell))
+}
+
+fn value_or_unknown<T: Copy>(known: bool, value: Value<T>) -> Value<T> {
+    if known {
+        value
+    } else {
+        Value::unknown()
+    }
 }
 
 /// Bridges a value produced in `EltwiseAddChip`'s signed-shifted
@@ -1044,6 +1135,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for LayerNormTestCircuit {
+        type Params = ();
+
         type Config = LayerNormTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -1199,6 +1292,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for GuardCircuit {
+            type Params = ();
+
             type Config = LayerNormTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -1258,6 +1353,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedCircuit {
+            type Params = ();
+
             type Config = LayerNormTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -1352,6 +1449,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedSquareCircuit {
+            type Params = ();
+
             type Config = LayerNormTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

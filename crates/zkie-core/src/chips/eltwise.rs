@@ -180,6 +180,8 @@ pub struct EltwiseMulConfig {
     pub(crate) range_b: LookupRangeCheckConfig,
 }
 
+type MulOperandShiftCells = (AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>);
+
 /// Loads the byte table backing a multiply's operand range checks. Must be
 /// called once per circuit synthesis by whoever configured the chip.
 pub(crate) fn load_mul_operand_range_table(
@@ -204,12 +206,33 @@ pub(crate) fn assign_mul_operand_shifts(
     offset: usize,
     a_val: I18,
     b_val: I18,
-) -> Result<(AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>), ErrorFront> {
+) -> Result<MulOperandShiftCells, ErrorFront> {
+    assign_mul_operand_shifts_with_witness_mode(mul, region, offset, a_val, b_val, true)
+}
+
+pub(crate) fn assign_mul_operand_shifts_with_witness_mode(
+    mul: &EltwiseMulConfig,
+    region: &mut Region<Fr>,
+    offset: usize,
+    a_val: I18,
+    b_val: I18,
+    witnesses_known: bool,
+) -> Result<MulOperandShiftCells, ErrorFront> {
     mul.s_shift.enable(region, offset)?;
     let (a_shift_fr, _) = shifted_i64_witness(a_val.raw());
     let (b_shift_fr, _) = shifted_i64_witness(b_val.raw());
-    let a_cell = region.assign_advice(|| "a_shift", mul.a_shift, offset, || a_shift_fr)?;
-    let b_cell = region.assign_advice(|| "b_shift", mul.b_shift, offset, || b_shift_fr)?;
+    let a_cell = region.assign_advice(
+        || "a_shift",
+        mul.a_shift,
+        offset,
+        || witness_value(witnesses_known, a_shift_fr),
+    )?;
+    let b_cell = region.assign_advice(
+        || "b_shift",
+        mul.b_shift,
+        offset,
+        || witness_value(witnesses_known, b_shift_fr),
+    )?;
     Ok((a_cell, b_cell))
 }
 
@@ -218,23 +241,43 @@ pub(crate) fn assign_mul_operand_shifts(
 /// constraint the range check would bound an unrelated cell.
 pub(crate) fn link_mul_operand_ranges(
     mul: &EltwiseMulConfig,
-    mut layouter: impl Layouter<Fr>,
+    layouter: impl Layouter<Fr>,
     a_val: I18,
     b_val: I18,
     a_shift_cell: &AssignedCell<Fr, Fr>,
     b_shift_cell: &AssignedCell<Fr, Fr>,
 ) -> Result<(), ErrorFront> {
+    link_mul_operand_ranges_with_witness_mode(
+        mul,
+        layouter,
+        a_val,
+        b_val,
+        a_shift_cell,
+        b_shift_cell,
+        true,
+    )
+}
+
+pub(crate) fn link_mul_operand_ranges_with_witness_mode(
+    mul: &EltwiseMulConfig,
+    mut layouter: impl Layouter<Fr>,
+    a_val: I18,
+    b_val: I18,
+    a_shift_cell: &AssignedCell<Fr, Fr>,
+    b_shift_cell: &AssignedCell<Fr, Fr>,
+    witnesses_known: bool,
+) -> Result<(), ErrorFront> {
     let (a_fr, a_raw) = shifted_i64_witness(a_val.raw());
     let a_range_cell = LookupRangeCheckChip::construct(mul.range_a.clone()).assign(
         layouter.namespace(|| "range a"),
-        a_fr,
-        a_raw,
+        witness_value(witnesses_known, a_fr),
+        witness_value(witnesses_known, a_raw),
     )?;
     let (b_fr, b_raw) = shifted_i64_witness(b_val.raw());
     let b_range_cell = LookupRangeCheckChip::construct(mul.range_b.clone()).assign(
         layouter.namespace(|| "range b"),
-        b_fr,
-        b_raw,
+        witness_value(witnesses_known, b_fr),
+        witness_value(witnesses_known, b_raw),
     )?;
     layouter.assign_region(
         || "mul operand range check links",
@@ -244,6 +287,14 @@ pub(crate) fn link_mul_operand_ranges(
             Ok(())
         },
     )
+}
+
+fn witness_value<T: Copy>(known: bool, value: Value<T>) -> Value<T> {
+    if known {
+        value
+    } else {
+        Value::unknown()
+    }
 }
 
 pub struct EltwiseMulChip {
@@ -468,6 +519,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for AddTestCircuit {
+        type Params = ();
+
         type Config = AddTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -526,6 +579,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedAddCircuit {
+            type Params = ();
+
             type Config = AddTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -594,6 +649,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Params = ();
+
             type Config = AddTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -690,6 +747,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for MulTestCircuit {
+        type Params = ();
+
         type Config = MulTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -751,6 +810,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedMulCircuit {
+            type Params = ();
+
             type Config = MulTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -831,6 +892,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Params = ();
+
             type Config = MulTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -956,6 +1019,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for OutOfRangeMulCircuit {
+            type Params = ();
+
             type Config = MulTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

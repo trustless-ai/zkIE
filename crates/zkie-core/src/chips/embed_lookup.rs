@@ -271,6 +271,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for EmbedLookupTestCircuit {
+        type Params = ();
+
         type Config = EmbedLookupTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -344,6 +346,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for GuardCircuit {
+            type Params = ();
+
             type Config = EmbedLookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -396,6 +400,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for GuardCircuit {
+            type Params = ();
+
             type Config = EmbedLookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -440,6 +446,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for GuardCircuit {
+            type Params = ();
+
             type Config = EmbedLookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -493,6 +501,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedCircuit {
+            type Params = ();
+
             type Config = EmbedLookupTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

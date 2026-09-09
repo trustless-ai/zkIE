@@ -37,6 +37,8 @@ struct LayerNormCircuit {
 }
 
 impl Circuit<Fr> for LayerNormCircuit {
+    type Params = ();
+
     type Config = LayerNormCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

@@ -5,6 +5,7 @@ pub mod embed_lookup;
 pub mod gelu;
 pub mod layer_norm;
 pub mod lookup;
+pub mod lookup_range_check;
 pub mod patch_embed;
 pub mod range_check;
 pub mod reduce;

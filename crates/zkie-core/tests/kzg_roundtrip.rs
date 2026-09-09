@@ -95,11 +95,11 @@ impl Circuit<Fr> for MulCircuit {
     fn synthesize(
         &self,
         config: Self::Config,
-        layouter: impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        EltwiseMulChip::construct(config.mul)
-            .assign(layouter, self.a, self.b)
-            .map(|_| ())
+        let chip = EltwiseMulChip::construct(config.mul);
+        chip.load_range_table(layouter.namespace(|| "range tables"))?;
+        chip.assign(layouter, self.a, self.b).map(|_| ())
     }
 }
 

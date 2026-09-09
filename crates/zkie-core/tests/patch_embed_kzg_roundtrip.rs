@@ -66,10 +66,11 @@ impl Circuit<Fr> for PatchEmbedCircuit {
     fn synthesize(
         &self,
         config: Self::Config,
-        layouter: impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        PatchEmbedChip::construct(config.embed)
-            .assign(layouter, &self.patch, &self.weights)
+        let chip = PatchEmbedChip::construct(config.embed);
+        chip.load_range_table(layouter.namespace(|| "range tables"))?;
+        chip.assign(layouter, &self.patch, &self.weights)
             .map(|_| ())
             .map_err(|e| panic!("patch embed assign failed: {e}"))
     }
@@ -99,7 +100,7 @@ fn sample_circuit() -> PatchEmbedCircuit {
 
 #[test]
 fn patch_embed_real_kzg_roundtrip() {
-    let k = 10;
+    let k = 11;
     let mut rng = OsRng;
     let circuit = sample_circuit();
 
@@ -142,7 +143,7 @@ fn patch_embed_real_kzg_roundtrip() {
 
 #[test]
 fn patch_embed_tampered_proof_fails_verification() {
-    let k = 10;
+    let k = 11;
     let mut rng = OsRng;
     let circuit = sample_circuit();
 

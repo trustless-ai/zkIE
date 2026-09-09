@@ -506,12 +506,17 @@ impl LayerNormChip {
         LayerNormChip { config, rsqrt_chip }
     }
 
-    /// Loads the fixed `rsqrt` table backing this chip's lookup argument.
-    /// Must be called exactly once per circuit synthesis, independently of
-    /// how many times `assign` is called. Delegates to
-    /// [`RsqrtChip::load_table`].
-    pub fn load_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        self.rsqrt_chip.load_table(layouter)
+    /// Loads the fixed `rsqrt` table backing this chip's lookup argument, and
+    /// the byte table backing its multiply's operand range checks. Must be
+    /// called exactly once per circuit synthesis, independently of how many
+    /// times `assign` is called.
+    pub fn load_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        self.rsqrt_chip
+            .load_table(layouter.namespace(|| "layer norm rsqrt table"))?;
+        crate::chips::eltwise::load_mul_operand_range_table(
+            &self.config.mul,
+            layouter.namespace(|| "layer norm mul operand tables"),
+        )
     }
 
     /// Assigns the full layer-norm pipeline for `inputs` (must have length
@@ -870,25 +875,60 @@ pub(crate) fn assign_mul_row(
     let slack = SCALE_18 - 1 - r;
     let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
 
-    let (a_cell, b_cell, q_cell, r_cell, slack_cell) = layouter.assign_region(
-        || "layer norm mul row",
-        |mut region| {
-            mul.s_mul.enable(&mut region, 0)?;
-            mul.s_slack.enable(&mut region, 0)?;
-            let a_cell =
-                region.assign_advice(|| "a", mul.a, 0, || Value::known(i64_to_fr(a_val.raw())))?;
-            let b_cell =
-                region.assign_advice(|| "b", mul.b, 0, || Value::known(i64_to_fr(b_val.raw())))?;
-            let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
-            let r_cell = region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
-            let slack_cell = region.assign_advice(
-                || "slack",
-                mul.slack,
-                0,
-                || Value::known(i128_to_fr(slack)),
-            )?;
-            Ok((a_cell, b_cell, q_cell, r_cell, slack_cell))
-        },
+    let (a_cell, b_cell, q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter
+        .assign_region(
+            || "layer norm mul row",
+            |mut region| {
+                mul.s_mul.enable(&mut region, 0)?;
+                mul.s_slack.enable(&mut region, 0)?;
+                let a_cell = region.assign_advice(
+                    || "a",
+                    mul.a,
+                    0,
+                    || Value::known(i64_to_fr(a_val.raw())),
+                )?;
+                let b_cell = region.assign_advice(
+                    || "b",
+                    mul.b,
+                    0,
+                    || Value::known(i64_to_fr(b_val.raw())),
+                )?;
+                let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
+                let r_cell =
+                    region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
+                let slack_cell = region.assign_advice(
+                    || "slack",
+                    mul.slack,
+                    0,
+                    || Value::known(i128_to_fr(slack)),
+                )?;
+                let (a_shift_cell, b_shift_cell) =
+                    crate::chips::eltwise::assign_mul_operand_shifts(
+                        mul,
+                        &mut region,
+                        0,
+                        a_val,
+                        b_val,
+                    )?;
+                Ok((
+                    a_cell,
+                    b_cell,
+                    q_cell,
+                    r_cell,
+                    slack_cell,
+                    a_shift_cell,
+                    b_shift_cell,
+                ))
+            },
+        )?;
+
+    crate::chips::eltwise::link_mul_operand_ranges(
+        mul,
+        layouter.namespace(|| "mul operand ranges"),
+        a_val,
+        b_val,
+        &a_shift_cell,
+        &b_shift_cell,
     )?;
 
     let range_q_chip = RangeCheckChip::construct(mul.range_q.clone());

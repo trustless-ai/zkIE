@@ -27,6 +27,7 @@ use zkie_core::assembler::{
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
 use zkie_core::isa::{EltwiseOp, Instruction};
+use zkie_core::program_circuit::AssemblerCircuit;
 
 const CIRCUIT_K: u32 = 12;
 
@@ -75,6 +76,8 @@ struct LinearLayerCircuit {
 }
 
 impl Circuit<Fr> for LinearLayerCircuit {
+    type Params = ();
+
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -142,6 +145,43 @@ fn linear_layer_real_kzg_roundtrip() {
         result.is_ok(),
         "linear layer assembler proof failed to verify: {:?}",
         result
+    );
+}
+
+#[test]
+fn runtime_assembler_keys_from_unknown_witnesses_prove_the_witnessed_layout() {
+    let mut rng = OsRng;
+    let circuit = AssemblerCircuit::new(linear_layer_program(), Default::default());
+    let blank = circuit.without_witnesses();
+    let params = ParamsKZG::<Bn256>::setup(CIRCUIT_K, &mut rng);
+    let vk = keygen_vk(&params, &blank).expect("blank circuit keygen_vk should succeed");
+    let pk =
+        keygen_pk(&params, vk.clone(), &blank).expect("blank circuit keygen_pk should succeed");
+
+    let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+    create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+        &params,
+        &pk,
+        &[circuit],
+        &[vec![]],
+        &mut rng,
+        &mut transcript,
+    )
+    .expect("witnessed circuit should match keys generated from its blank form");
+    let proof = transcript.finalize();
+
+    let mut verifier_transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof[..]);
+    let verifier_params = params.verifier_params();
+    let strategy = SingleStrategy::new(&verifier_params);
+    assert!(
+        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<Bn256>, _, _, _>(
+            &verifier_params,
+            &vk,
+            strategy,
+            &[vec![]],
+            &mut verifier_transcript,
+        )
+        .is_ok()
     );
 }
 

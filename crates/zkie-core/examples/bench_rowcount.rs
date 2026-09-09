@@ -84,6 +84,8 @@ struct BenchCircuit {
 }
 
 impl Circuit<Fr> for BenchCircuit {
+    type Params = ();
+
     type Config = BenchConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

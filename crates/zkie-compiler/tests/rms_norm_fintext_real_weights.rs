@@ -279,6 +279,8 @@ struct RmsNormFinTextCircuit {
 }
 
 impl Circuit<Fr> for RmsNormFinTextCircuit {
+    type Params = ();
+
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

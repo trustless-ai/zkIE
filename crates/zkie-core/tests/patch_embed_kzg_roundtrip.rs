@@ -29,6 +29,8 @@ struct PatchEmbedCircuit {
 }
 
 impl Circuit<Fr> for PatchEmbedCircuit {
+    type Params = ();
+
     type Config = PatchEmbedCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

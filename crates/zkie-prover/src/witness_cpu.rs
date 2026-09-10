@@ -195,6 +195,10 @@ impl CpuWitnessArtifact {
         &self.shard_identity
     }
 
+    pub fn configured_shard(&self) -> &Shard {
+        &self.shard
+    }
+
     pub fn run_identity(&self) -> &RunIdentity {
         &self.run_identity
     }
@@ -543,6 +547,10 @@ impl ZkieIsaCpuWitnessBackend {
 
     pub fn shard_identity(&self) -> &ShardIdentity {
         &self.shard_identity
+    }
+
+    pub fn configured_shard(&self) -> &Shard {
+        &self.shard
     }
 
     pub fn run_identity(&self) -> &RunIdentity {

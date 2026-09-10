@@ -5,11 +5,10 @@
 //! authoritative store validation. `prove` and `verify` never regenerate or
 //! silently fall back when that exact cache entry is absent.
 //!
-//! This first public-model POC exposes boundary inputs, used weights, and
-//! selected shard outputs as raw public instances. It therefore provides no
-//! model, input, or intermediate-value confidentiality. A privacy-preserving
-//! backend must replace these values with circuit-constrained commitments and
-//! fixed/private weight handling.
+//! Schema v2 exposes circuit-constrained commitments for boundary inputs and
+//! selected shard outputs. Used weights remain raw public instances, so this
+//! POC does not provide model confidentiality. A private-model backend needs
+//! an in-circuit weight commitment or fixed-weight design.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -31,17 +30,23 @@ use halo2_proofs::transcript::{
 use halo2_proofs::SerdeFormat;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use zkie_compiler::graph_compiler::Register;
+use zkie_compiler::shard_binding::{
+    BoundShardProgram, BoundaryDescriptor as CompilerBoundaryDescriptor,
+};
 use zkie_core::assembler::AssemblerProgram;
 use zkie_core::chips::layer_norm::RsqrtDomain;
+use zkie_core::chips::poseidon_boundary::{commit_boundary_native, BoundaryDescriptor};
 use zkie_core::field_convert::{i64_to_fr, Fr};
 use zkie_core::fixed_point::I18;
 use zkie_core::program_circuit::AssemblerCircuit;
 use zkie_types::{Digest32, ExecutionBackendId, ModelVisibility, ProofFlavorId, ResourceRequest};
 
 use crate::{
-    BackendCapabilities, BackendError, CapabilityId, CryptoVerificationReceipt,
-    CryptoVerificationRequest, KeyIdentity, KeyMaterialStore, PrepareJob, PreparedKeys,
-    ProofBackend, ProofJob, UnverifiedProof, VerificationError, ZkieIsaCpuWitnessBackend,
+    BackendCapabilities, BackendError, BoundaryClaim, CapabilityId, CryptoVerificationReceipt,
+    CryptoVerificationRequest, KeyIdentity, KeyMaterialStore, LeafStatement, PrepareJob,
+    PreparedKeys, ProofBackend, ProofJob, UnverifiedProof, VerificationError,
+    ZkieIsaCpuWitnessBackend, LEAF_STATEMENT_SCHEMA_VERSION,
 };
 
 const FLAVOR: &str = "halo2-kzg-bn256-shplonk-v1";
@@ -54,6 +59,36 @@ const PUBLIC_STATEMENT_MAGIC: &[u8] = b"zkie.public-instances.v1\0";
 const PUBLIC_STATEMENT_SCHEMA: u32 = 1;
 const MAX_PUBLIC_VALUES: usize = ((1 << 20) - 80) / 8;
 const MAX_CIRCUIT_K: u32 = 20;
+
+fn core_boundary_descriptor(
+    descriptor: &CompilerBoundaryDescriptor,
+    role: zkie_core::chips::poseidon_boundary::BoundaryRole,
+) -> Result<BoundaryDescriptor, BackendError> {
+    let register_id = match descriptor.register() {
+        Register::GraphInput(name) => format!("graph-input:{name}"),
+        Register::Virtual(index) => format!("virtual:{index}"),
+        Register::Weight(_) => {
+            return Err(BackendError::InvalidJob {
+                message: "weights cannot be shard boundary descriptors".into(),
+            })
+        }
+    };
+    BoundaryDescriptor::flat_i18(
+        role,
+        register_id,
+        descriptor
+            .edge_ids()
+            .iter()
+            .map(|edge| edge.as_str().to_owned())
+            .collect(),
+        descriptor.graph_output_names().to_vec(),
+        descriptor.element_count(),
+        u64::try_from(zkie_core::fixed_point::SCALE_18).expect("I18 scale fits u64"),
+    )
+    .map_err(|error| BackendError::InvalidJob {
+        message: error.to_string(),
+    })
+}
 
 #[derive(Clone, Debug)]
 pub enum SrsPolicy {
@@ -127,6 +162,10 @@ pub struct Halo2KzgCpuBackend {
     prepare_lock: Mutex<()>,
     cache: Mutex<HashMap<CacheKey, Arc<CacheEntry>>>,
     keygen_invocations: AtomicUsize,
+    boundary_inputs: Option<Vec<BoundaryDescriptor>>,
+    boundary_outputs: Option<Vec<(usize, BoundaryDescriptor)>>,
+    statement_schema: u32,
+    trusted_public_weights: Vec<I18>,
 }
 
 impl Halo2KzgCpuBackend {
@@ -145,17 +184,129 @@ impl Halo2KzgCpuBackend {
         k: u32,
         policy: SrsPolicy,
     ) -> Result<Self, BackendError> {
+        Self::build(
+            witness_backend,
+            template_program,
+            domains,
+            k,
+            policy,
+            PUBLIC_STATEMENT_SCHEMA,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_with_boundary_commitments(
+        witness_backend: Arc<ZkieIsaCpuWitnessBackend>,
+        bound_shard: &BoundShardProgram,
+        domains: HashMap<(usize, u64), RsqrtDomain>,
+        k: u32,
+        policy: SrsPolicy,
+    ) -> Result<Self, BackendError> {
+        if bound_shard.partition_plan_digest()
+            != witness_backend.run_identity().partition_plan_digest
+            || bound_shard.shard_id() != witness_backend.shard_identity().id()
+            || bound_shard.shard_name() != witness_backend.shard_identity().name()
+            || bound_shard.shard_range() != witness_backend.configured_shard().range
+        {
+            return Err(BackendError::InvalidJob {
+                message: "bound shard partition/shard identity mismatch".into(),
+            });
+        }
+        let boundary_inputs = bound_shard
+            .input_boundaries()
+            .iter()
+            .map(|descriptor| {
+                core_boundary_descriptor(
+                    descriptor,
+                    zkie_core::chips::poseidon_boundary::BoundaryRole::Input,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let boundary_outputs = bound_shard
+            .output_boundaries()
+            .iter()
+            .map(|descriptor| {
+                let global = match descriptor.register() {
+                    Register::Virtual(index) => *index,
+                    _ => {
+                        return Err(BackendError::InvalidJob {
+                            message: "shard output boundary is not virtual".into(),
+                        })
+                    }
+                };
+                let local = *bound_shard.global_to_local().get(&global).ok_or_else(|| {
+                    BackendError::InvalidJob {
+                        message: "shard output is not mapped to a local assembler cell".into(),
+                    }
+                })?;
+                Ok((
+                    local,
+                    core_boundary_descriptor(
+                        descriptor,
+                        zkie_core::chips::poseidon_boundary::BoundaryRole::Output,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
+        Self::build(
+            witness_backend,
+            bound_shard.assembler_program().clone(),
+            domains,
+            k,
+            policy,
+            LEAF_STATEMENT_SCHEMA_VERSION,
+            Some(boundary_inputs),
+            Some(boundary_outputs),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        witness_backend: Arc<ZkieIsaCpuWitnessBackend>,
+        template_program: AssemblerProgram,
+        domains: HashMap<(usize, u64), RsqrtDomain>,
+        k: u32,
+        policy: SrsPolicy,
+        statement_schema: u32,
+        boundary_inputs: Option<Vec<BoundaryDescriptor>>,
+        boundary_outputs: Option<Vec<(usize, BoundaryDescriptor)>>,
+    ) -> Result<Self, BackendError> {
         if k == 0
             || k > MAX_CIRCUIT_K
             || witness_backend.run_identity().proof_flavor.as_str() != FLAVOR
-            || witness_backend.run_identity().public_input_schema_version != PUBLIC_STATEMENT_SCHEMA
+            || witness_backend.run_identity().public_input_schema_version != statement_schema
         {
             return Err(BackendError::InvalidJob {
                 message: "unsupported flavor or k".into(),
             });
         }
         Self::validate_model_visibility(witness_backend.run_identity())?;
-        let template = witness_backend.validate_assembler_template(template_program, &domains)?;
+        let boundary_template_program = template_program.clone();
+        let trusted_public_weights = template_program
+            .weight_values
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let raw_template =
+            witness_backend.validate_assembler_template(template_program, &domains)?;
+        let template = match (&boundary_inputs, &boundary_outputs) {
+            (Some(inputs), Some(outputs)) => AssemblerCircuit::new_with_boundary_commitments(
+                boundary_template_program,
+                domains.clone(),
+                inputs.clone(),
+                outputs.clone(),
+                vec![Fr::from(0); 17],
+            )
+            .map_err(|message| BackendError::InvalidJob { message })?,
+            (None, None) => raw_template,
+            _ => {
+                return Err(BackendError::InvalidJob {
+                    message: "incomplete boundary layout".into(),
+                })
+            }
+        };
         let (params, srs_digest, production) = match policy {
             SrsPolicy::DevelopmentGenerate => (None, None, false),
             SrsPolicy::ProductionExisting {
@@ -202,6 +353,10 @@ impl Halo2KzgCpuBackend {
             prepare_lock: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             keygen_invocations: AtomicUsize::new(0),
+            boundary_inputs,
+            boundary_outputs,
+            statement_schema,
+            trusted_public_weights,
         })
     }
 
@@ -214,10 +369,160 @@ impl Halo2KzgCpuBackend {
     }
 
     pub fn statement_for(&self, witness: &crate::WitnessArtifact) -> Result<Vec<u8>, BackendError> {
-        let (_, values) = self
+        let (program, values) = self
             .witness_backend
             .load_assembler_program_and_public_values(witness)?;
-        encode_public_statement(&values, self.template.params().shape_digest())
+        if self.statement_schema == PUBLIC_STATEMENT_SCHEMA {
+            return encode_public_statement(&values, self.template.params().shape_digest());
+        }
+        let cache = self.cache.lock().map_err(|_| BackendError::Resource {
+            message: "key cache poisoned".into(),
+        })?;
+        let mut identities = cache.keys().map(|key| key.identity.clone());
+        let identity = identities.next().ok_or_else(|| BackendError::InvalidJob {
+            message: "statement construction requires one prepared key".into(),
+        })?;
+        if identities.next().is_some() {
+            return Err(BackendError::InvalidJob {
+                message: "statement construction is ambiguous across prepared keys".into(),
+            });
+        }
+        drop(cache);
+        self.leaf_statement(&identity, &program, &values)?
+            .encode()
+            .map_err(|error| BackendError::Serialization {
+                format: "zkie-leaf-statement-v1".into(),
+                message: error.to_string(),
+            })
+    }
+
+    pub fn statement_for_key(
+        &self,
+        witness: &crate::WitnessArtifact,
+        identity: &KeyIdentity,
+    ) -> Result<Vec<u8>, BackendError> {
+        if self.statement_schema != LEAF_STATEMENT_SCHEMA_VERSION {
+            return self.statement_for(witness);
+        }
+        self.cached_entry(identity)?;
+        let (program, values) = self
+            .witness_backend
+            .load_assembler_program_and_public_values(witness)?;
+        self.leaf_statement(identity, &program, &values)?
+            .encode()
+            .map_err(|error| BackendError::Serialization {
+                format: "zkie-leaf-statement-v1".into(),
+                message: error.to_string(),
+            })
+    }
+
+    fn leaf_statement(
+        &self,
+        identity: &KeyIdentity,
+        program: &AssemblerProgram,
+        public_values: &[I18],
+    ) -> Result<LeafStatement, BackendError> {
+        let inputs = self
+            .boundary_inputs
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidJob {
+                message: "missing trusted boundary input layout".into(),
+            })?;
+        let outputs = self
+            .boundary_outputs
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidJob {
+                message: "missing trusted boundary output layout".into(),
+            })?;
+        if inputs.len() != program.input_values.len() {
+            return Err(BackendError::InvalidJob {
+                message: "boundary input layout mismatch".into(),
+            });
+        }
+        let input_count = program.input_values.iter().map(Vec::len).sum::<usize>();
+        let weight_count = program.weight_values.iter().map(Vec::len).sum::<usize>();
+        let output_count = outputs
+            .iter()
+            .try_fold(0usize, |sum, (_, descriptor)| {
+                sum.checked_add(descriptor.element_count())
+            })
+            .ok_or_else(|| BackendError::Resource {
+                message: "boundary output count overflow".into(),
+            })?;
+        let expected_count = input_count
+            .checked_add(weight_count)
+            .and_then(|count| count.checked_add(output_count))
+            .ok_or_else(|| BackendError::Resource {
+                message: "public statement value count overflow".into(),
+            })?;
+        if public_values.len() != expected_count {
+            return Err(BackendError::InvalidJob {
+                message: "public boundary value layout mismatch".into(),
+            });
+        }
+        let input_claims = inputs
+            .iter()
+            .zip(&program.input_values)
+            .map(|(descriptor, values)| {
+                BoundaryClaim::new(
+                    descriptor.clone(),
+                    commit_boundary_native(descriptor, values).map_err(|error| {
+                        BackendError::InvalidJob {
+                            message: error.to_string(),
+                        }
+                    })?,
+                )
+                .map_err(|error| BackendError::InvalidJob {
+                    message: error.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_offset = input_count + weight_count;
+        let output_claims = outputs
+            .iter()
+            .map(|(_, descriptor)| {
+                let end = output_offset
+                    .checked_add(descriptor.element_count())
+                    .ok_or_else(|| BackendError::Resource {
+                        message: "boundary output offset overflow".into(),
+                    })?;
+                let values = public_values.get(output_offset..end).ok_or_else(|| {
+                    BackendError::InvalidJob {
+                        message: "missing boundary output values".into(),
+                    }
+                })?;
+                output_offset = end;
+                BoundaryClaim::new(
+                    descriptor.clone(),
+                    commit_boundary_native(descriptor, values).map_err(|error| {
+                        BackendError::InvalidJob {
+                            message: error.to_string(),
+                        }
+                    })?,
+                )
+                .map_err(|error| BackendError::InvalidJob {
+                    message: error.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let public_weights = program.weight_values.iter().flatten().copied().collect();
+        let run = self.witness_backend.run_identity();
+        LeafStatement::new(
+            self.witness_backend.shard_identity().id(),
+            self.witness_backend.shard_identity().name().into(),
+            self.witness_backend.circuit_digest(),
+            run.partition_plan_digest,
+            run.model_graph_digest,
+            run.weights_digest,
+            flavor(),
+            identity.key_digest(),
+            input_claims,
+            output_claims,
+            public_weights,
+        )
+        .map_err(|error| BackendError::InvalidJob {
+            message: error.to_string(),
+        })
     }
 
     /// Convenience verifier that always rereads and digests the named artifact.
@@ -262,7 +567,7 @@ impl Halo2KzgCpuBackend {
             srs_digest,
             production: self.production,
             assembler_shape_digest: self.template.params().shape_digest(),
-            public_statement_schema_version: PUBLIC_STATEMENT_SCHEMA,
+            public_statement_schema_version: self.statement_schema,
         }
     }
 
@@ -344,7 +649,7 @@ impl Halo2KzgCpuBackend {
             || shard != self.witness_backend.shard_identity()
             || shard.circuit_digest() != self.witness_backend.circuit_digest()
             || run.proof_flavor.as_str() != FLAVOR
-            || run.public_input_schema_version != PUBLIC_STATEMENT_SCHEMA
+            || run.public_input_schema_version != self.statement_schema
         {
             return Err(BackendError::InvalidJob {
                 message: "Halo2 backend run/shard/circuit/flavor mismatch".into(),
@@ -496,12 +801,43 @@ impl ProofBackend for Halo2KzgCpuBackend {
         let (program, public_values) = self
             .witness_backend
             .load_assembler_program_and_public_values(job.witness())?;
-        let circuit = AssemblerCircuit::new_with_public_outputs(
-            program,
-            self.domains.clone(),
-            self.witness_backend.public_output_indices(),
-        )
-        .map_err(|message| BackendError::InvalidJob { message })?;
+        let (circuit, public_statement, instance_values) =
+            if self.statement_schema == LEAF_STATEMENT_SCHEMA_VERSION {
+                let statement = self.leaf_statement(identity, &program, &public_values)?;
+                let circuit = AssemblerCircuit::new_with_boundary_commitments(
+                    program,
+                    self.domains.clone(),
+                    self.boundary_inputs
+                        .clone()
+                        .expect("schema validated at construction"),
+                    self.boundary_outputs
+                        .clone()
+                        .expect("schema validated at construction"),
+                    statement.instance_prefix(),
+                )
+                .map_err(|message| BackendError::InvalidJob { message })?;
+                let encoded = statement
+                    .encode()
+                    .map_err(|error| BackendError::Serialization {
+                        format: "zkie-leaf-statement-v1".into(),
+                        message: error.to_string(),
+                    })?;
+                (circuit, encoded, statement.instances())
+            } else {
+                let circuit = AssemblerCircuit::new_with_public_outputs(
+                    program,
+                    self.domains.clone(),
+                    self.witness_backend.public_output_indices(),
+                )
+                .map_err(|message| BackendError::InvalidJob { message })?;
+                let encoded =
+                    encode_public_statement(&public_values, self.template.params().shape_digest())?;
+                let instances = public_values
+                    .iter()
+                    .map(|value| i64_to_fr(value.raw()))
+                    .collect();
+                (circuit, encoded, instances)
+            };
         if circuit.params().shape_digest() != self.template.params().shape_digest() {
             return Err(BackendError::InvalidJob {
                 message: "witness circuit shape differs from prepared circuit".into(),
@@ -521,15 +857,10 @@ impl ProofBackend for Halo2KzgCpuBackend {
             srs_digest: entry.metadata.srs_digest,
             production: self.production,
             assembler_shape_digest: self.template.params().shape_digest(),
-            public_statement_schema_version: PUBLIC_STATEMENT_SCHEMA,
+            public_statement_schema_version: self.statement_schema,
         })
         .map_err(|e| serialization("halo2-proof-manifest-v1", e))?;
-        let public_statement =
-            encode_public_statement(&public_values, self.template.params().shape_digest())?;
-        let instances = vec![vec![public_values
-            .iter()
-            .map(|value| i64_to_fr(value.raw()))
-            .collect::<Vec<_>>()]];
+        let instances = vec![vec![instance_values]];
         let temp = create_temp_sibling(&output)?;
         let result = (|| {
             let file = temp.1;
@@ -607,7 +938,7 @@ impl ProofBackend for Halo2KzgCpuBackend {
             || manifest.k != self.k
             || manifest.production != self.production
             || manifest.assembler_shape_digest != self.template.params().shape_digest()
-            || manifest.public_statement_schema_version != PUBLIC_STATEMENT_SCHEMA
+            || manifest.public_statement_schema_version != self.statement_schema
             || manifest.witness_digest != request.expected_witness_artifact_digest()
         {
             return Err(VerificationError::MalformedProofArtifact);
@@ -622,10 +953,61 @@ impl ProofBackend for Halo2KzgCpuBackend {
         }
         let verifier_params = entry.params.verifier_params();
         let strategy = SingleStrategy::new(&verifier_params);
-        let public_values = decode_public_statement(
-            request.public_statement(),
-            self.template.params().shape_digest(),
-        )?;
+        let public_values = if self.statement_schema == LEAF_STATEMENT_SCHEMA_VERSION {
+            let statement = LeafStatement::decode(request.public_statement())
+                .map_err(|_| VerificationError::MalformedProofArtifact)?;
+            // The request/manifest remains the trusted provenance source; a
+            // self-described statement cannot replace any expected identity.
+            let trusted_inputs = self
+                .boundary_inputs
+                .as_ref()
+                .ok_or(VerificationError::MalformedProofArtifact)?;
+            let trusted_outputs = self
+                .boundary_outputs
+                .as_ref()
+                .ok_or(VerificationError::MalformedProofArtifact)?;
+            if statement
+                .input_claims()
+                .iter()
+                .map(BoundaryClaim::descriptor)
+                .ne(trusted_inputs.iter())
+                || statement
+                    .output_claims()
+                    .iter()
+                    .map(BoundaryClaim::descriptor)
+                    .ne(trusted_outputs.iter().map(|(_, descriptor)| descriptor))
+            {
+                return Err(VerificationError::MalformedProofArtifact);
+            }
+            if statement.public_weights() != self.trusted_public_weights {
+                return Err(VerificationError::MalformedProofArtifact);
+            }
+            // Identity equality is checked without witness reconstruction by
+            // rebuilding the statement from trusted request expectations.
+            let trusted_prefix = LeafStatement::new(
+                self.witness_backend.shard_identity().id(),
+                self.witness_backend.shard_identity().name().into(),
+                self.witness_backend.circuit_digest(),
+                self.witness_backend.run_identity().partition_plan_digest,
+                self.witness_backend.run_identity().model_graph_digest,
+                self.witness_backend.run_identity().weights_digest,
+                flavor(),
+                request.verification_key().key_digest(),
+                statement.input_claims().to_vec(),
+                statement.output_claims().to_vec(),
+                statement.public_weights().to_vec(),
+            )
+            .map_err(|_| VerificationError::MalformedProofArtifact)?;
+            if trusted_prefix != statement {
+                return Err(VerificationError::MalformedProofArtifact);
+            }
+            statement.instances()
+        } else {
+            decode_public_statement(
+                request.public_statement(),
+                self.template.params().shape_digest(),
+            )?
+        };
         let instances = vec![vec![public_values]];
         let consumed = Arc::new(AtomicUsize::new(0));
         let reader = CountingReader {

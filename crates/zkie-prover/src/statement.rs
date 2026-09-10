@@ -197,7 +197,30 @@ impl LeafStatement {
     pub fn public_weights(&self) -> &[I18] {
         &self.public_weights
     }
-
+    pub fn shard_id(&self) -> u64 {
+        self.shard_id
+    }
+    pub fn shard_name(&self) -> &str {
+        &self.shard_name
+    }
+    pub fn circuit_digest(&self) -> Digest32 {
+        self.circuit_digest
+    }
+    pub fn partition_digest(&self) -> Digest32 {
+        self.partition_digest
+    }
+    pub fn model_digest(&self) -> Digest32 {
+        self.model_digest
+    }
+    pub fn weights_digest(&self) -> Digest32 {
+        self.weights_digest
+    }
+    pub fn proof_flavor(&self) -> &ProofFlavorId {
+        &self.proof_flavor
+    }
+    pub fn verification_key_digest(&self) -> Digest32 {
+        self.verification_key_digest
+    }
     pub fn instance_prefix(&self) -> Vec<Fr> {
         let mut values = vec![
             Fr::from(LEAF_STATEMENT_SCHEMA_VERSION as u64),
@@ -219,12 +242,19 @@ impl LeafStatement {
     }
 
     /// Exact Halo2 public-instance order: protocol, shard identity, circuit,
-    /// partition, model, weights, flavor, VK, then input and output commitments.
+    /// partition, model, weights, flavor, VK, then each exact descriptor
+    /// binding followed by its role-neutral input/output value commitment.
     pub fn instances(&self) -> Vec<Fr> {
         let mut values = self.instance_prefix();
-        values.extend(self.input_claims.iter().map(BoundaryClaim::commitment));
+        for claim in &self.input_claims {
+            values.extend(claim.descriptor.public_binding_fields());
+            values.push(claim.commitment());
+        }
         values.push(Fr::from(self.output_claims.len() as u64));
-        values.extend(self.output_claims.iter().map(BoundaryClaim::commitment));
+        for claim in &self.output_claims {
+            values.extend(claim.descriptor.public_binding_fields());
+            values.push(claim.commitment());
+        }
         values.push(Fr::from(self.public_weights.len() as u64));
         values.extend(
             self.public_weights

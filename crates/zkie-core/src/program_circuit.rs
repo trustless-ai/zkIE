@@ -9,6 +9,7 @@ use crate::assembler::{
 use crate::chips::layer_norm::RsqrtDomain;
 use crate::chips::poseidon_boundary::{
     BoundaryDescriptor, BoundaryRole, PoseidonBoundaryChip, PoseidonBoundaryConfig,
+    BOUNDARY_COMMITMENT_SCHEMA_VERSION,
 };
 use crate::field_convert::Fr;
 use crate::isa::{EltwiseOp, Instruction, ReduceOp};
@@ -126,6 +127,7 @@ fn encode_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(value.as_bytes());
 }
 fn encode_boundary_descriptor(bytes: &mut Vec<u8>, descriptor: &BoundaryDescriptor) {
+    bytes.extend_from_slice(&BOUNDARY_COMMITMENT_SCHEMA_VERSION.to_le_bytes());
     bytes.push(match descriptor.role() {
         BoundaryRole::Input => 1,
         BoundaryRole::Output => 2,
@@ -423,6 +425,18 @@ impl Circuit<Fr> for AssemblerCircuit {
                 offset += 1;
             }
             for (index, descriptor) in self.params.boundary_inputs.iter().enumerate() {
+                for (limb_index, field) in
+                    descriptor.public_binding_fields().into_iter().enumerate()
+                {
+                    let cell = poseidon.assign_constant(
+                        layouter.namespace(|| {
+                            format!("input boundary {index} descriptor limb {limb_index}")
+                        }),
+                        field,
+                    )?;
+                    layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                    offset += 1;
+                }
                 let tensor = assigned.inputs.get(index).ok_or(ErrorFront::Synthesis)?;
                 let commitment = poseidon.commit_assigned(
                     layouter.namespace(|| format!("input boundary {index}")),
@@ -439,6 +453,18 @@ impl Circuit<Fr> for AssemblerCircuit {
             layouter.constrain_instance(output_count.cell(), public_instance, offset)?;
             offset += 1;
             for (index, descriptor) in &self.params.boundary_outputs {
+                for (limb_index, field) in
+                    descriptor.public_binding_fields().into_iter().enumerate()
+                {
+                    let cell = poseidon.assign_constant(
+                        layouter.namespace(|| {
+                            format!("output boundary {index} descriptor limb {limb_index}")
+                        }),
+                        field,
+                    )?;
+                    layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                    offset += 1;
+                }
                 let tensor = assigned.virtuals.get(*index).ok_or(ErrorFront::Synthesis)?;
                 if tensor.cells.len() != descriptor.element_count() {
                     return Err(ErrorFront::Synthesis);
@@ -631,8 +657,10 @@ mod tests {
         .unwrap();
         let input_commitment =
             commit_boundary_native(&input_descriptor, &program.input_values[0]).unwrap();
+        let input_binding = input_descriptor.public_binding_fields();
         let output = [I18::from_raw(2_000_000_000_000_000_000)];
         let output_commitment = commit_boundary_native(&output_descriptor, &output).unwrap();
+        let output_binding = output_descriptor.public_binding_fields();
         let mut altered_program = program.clone();
         altered_program.weight_values[0][0] = I18::from_raw(2_000_000_000_000_000_000);
         let altered = AssemblerCircuit::new_with_boundary_commitments(
@@ -660,8 +688,12 @@ mod tests {
         let instances = vec![(0..17)
             .map(|_| Fr::from(42))
             .chain([
+                input_binding[0],
+                input_binding[1],
                 input_commitment,
                 Fr::from(1),
+                output_binding[0],
+                output_binding[1],
                 output_commitment,
                 Fr::from(2),
                 one,

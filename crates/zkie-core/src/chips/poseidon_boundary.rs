@@ -11,7 +11,7 @@ use light_poseidon::{parameters::bn254_x5, Poseidon, PoseidonHasher};
 use crate::field_convert::i64_to_fr;
 use crate::fixed_point::I18;
 
-pub const BOUNDARY_COMMITMENT_SCHEMA_VERSION: u32 = 1;
+pub const BOUNDARY_COMMITMENT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_BOUNDARY_ELEMENTS: usize = 1 << 13;
 pub const MAX_BOUNDARY_IDENTITIES: usize = 64;
 pub const MAX_BOUNDARY_ID_BYTES: usize = 256;
@@ -143,15 +143,15 @@ impl BoundaryDescriptor {
         Ok(())
     }
 
-    /// Field sequence committed before tensor values. Every variable-length
-    /// component is count- or length-bound and every semantic role is tagged.
+    /// Role-neutral field sequence committed before tensor values.
+    ///
+    /// Producer and consumer descriptors for the same register intentionally
+    /// share this sequence so aggregation can compare their value commitment.
+    /// Routing and endpoint-role metadata remains separately proof-bound by
+    /// [`Self::public_binding_fields`].
     pub fn canonical_fields(&self) -> Vec<Fr> {
         let mut fields = vec![
             Fr::from(BOUNDARY_COMMITMENT_SCHEMA_VERSION as u64),
-            Fr::from(match self.role {
-                BoundaryRole::Input => 1,
-                BoundaryRole::Output => 2,
-            }),
             Fr::from(match self.dtype {
                 BoundaryDType::I18 => 1,
             }),
@@ -160,16 +160,40 @@ impl BoundaryDescriptor {
             Fr::from(self.quantization_scale),
         ];
         fields.extend(identity_fields(&self.register_id));
-        fields.push(Fr::from(self.edge_ids.len() as u64));
-        for id in &self.edge_ids {
-            fields.extend(identity_fields(id));
-        }
-        fields.push(Fr::from(self.graph_output_names.len() as u64));
-        for id in &self.graph_output_names {
-            fields.extend(identity_fields(id));
-        }
         fields
     }
+
+    /// Two public field limbs binding the complete endpoint and routing
+    /// descriptor independently from the role-neutral tensor commitment.
+    pub fn public_binding_fields(&self) -> [Fr; 2] {
+        let mut bytes = b"zkie.boundary-descriptor-binding.v2\0".to_vec();
+        bytes.extend_from_slice(&BOUNDARY_COMMITMENT_SCHEMA_VERSION.to_le_bytes());
+        bytes.push(match self.role {
+            BoundaryRole::Input => 1,
+            BoundaryRole::Output => 2,
+        });
+        bytes.push(match self.dtype {
+            BoundaryDType::I18 => 1,
+        });
+        bytes.push(1); // FlatElementCountOnly
+        bytes.extend_from_slice(&(self.element_count() as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.quantization_scale.to_le_bytes());
+        encode_identity(&mut bytes, &self.register_id);
+        bytes.extend_from_slice(&(self.edge_ids.len() as u64).to_le_bytes());
+        for id in &self.edge_ids {
+            encode_identity(&mut bytes, id);
+        }
+        bytes.extend_from_slice(&(self.graph_output_names.len() as u64).to_le_bytes());
+        for name in &self.graph_output_names {
+            encode_identity(&mut bytes, name);
+        }
+        digest_fields(blake3::hash(&bytes).as_bytes())
+    }
+}
+
+fn encode_identity(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
 }
 
 fn valid_id(value: &str) -> bool {
@@ -184,7 +208,10 @@ fn identity_fields(value: &str) -> [Fr; 2] {
     bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());
     let digest = blake3::hash(&bytes);
-    let raw = digest.as_bytes();
+    digest_fields(digest.as_bytes())
+}
+
+fn digest_fields(raw: &[u8; 32]) -> [Fr; 2] {
     [limb_to_fr(&raw[..16]), limb_to_fr(&raw[16..])]
 }
 

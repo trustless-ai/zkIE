@@ -57,7 +57,29 @@ fn boundary_commitment_binds_metadata_length_and_values() {
         1_000_000_000_000_000_000,
     )
     .unwrap();
-    assert_ne!(baseline, commit_boundary_native(&output, &values).unwrap());
+    assert_eq!(baseline, commit_boundary_native(&output, &values).unwrap());
+    assert_ne!(
+        input.public_binding_fields(),
+        output.public_binding_fields()
+    );
+
+    let broadcast_output = BoundaryDescriptor::flat_i18(
+        BoundaryRole::Output,
+        "graph-input:x",
+        vec!["edge:0".into(), "edge:1".into()],
+        Vec::new(),
+        2,
+        1_000_000_000_000_000_000,
+    )
+    .unwrap();
+    assert_eq!(
+        baseline,
+        commit_boundary_native(&broadcast_output, &values).unwrap()
+    );
+    assert_ne!(
+        input.public_binding_fields(),
+        broadcast_output.public_binding_fields()
+    );
 
     let other_scale = BoundaryDescriptor::flat_i18(
         BoundaryRole::Input,

@@ -213,10 +213,11 @@ fn readiness_waits_for_live_predecessors_blocks_on_permanent_failure_and_require
     let first_attempt = db
         .begin_attempt(&first, JobEvent::StartVerification)
         .unwrap();
-    db.apply_attempt_event(
+    db.handle_attempt_failure(
         &first,
         &first_attempt,
-        JobEvent::ExecutionFailed(failure(FailureKind::Execution, FailureStage::Verify)),
+        failure(FailureKind::Execution, FailureStage::Verify),
+        None,
     )
     .unwrap();
     let second = seed_verified_predecessor(&mut db, &path, "second");
@@ -226,7 +227,8 @@ fn readiness_waits_for_live_predecessors_blocks_on_permanent_failure_and_require
     db.add_dependency(&first, &downstream).unwrap();
     db.add_dependency(&second, &downstream).unwrap();
 
-    assert_eq!(db.refresh_readiness().unwrap(), 0);
+    // The retryable root is admitted again, while its dependent stays pending.
+    assert_eq!(db.refresh_readiness().unwrap(), 1);
     let waiting = db.job(&downstream).unwrap();
     assert_eq!(waiting.state, JobState::Pending);
     assert_eq!(waiting.blocking_predecessor_id, None);
@@ -279,14 +281,15 @@ fn failure_columns_and_attempt_count_are_independent_and_sanitized() {
     let mut db = RunDb::open(&path, "run-failure").unwrap();
     let job = insert_ready(&mut db, "leaf", JobKind::LeafProof);
     let attempt = db.begin_attempt(&job, JobEvent::StartProving).unwrap();
-    db.apply_attempt_event(
+    db.handle_attempt_failure(
         &job,
         &attempt,
-        JobEvent::ExecutionFailed(failure(FailureKind::Execution, FailureStage::Prove)),
+        failure(FailureKind::Execution, FailureStage::Prove),
+        None,
     )
     .unwrap();
     let row = db.job(&job).unwrap();
-    assert_eq!(row.state, JobState::ExecutionFailed);
+    assert_eq!(row.state, JobState::Requeued);
     assert_eq!(row.attempt_count, 1);
     assert_eq!(row.failure_kind, Some(FailureKind::Execution));
     assert_eq!(row.failure_stage, Some(FailureStage::Prove));
@@ -636,7 +639,7 @@ fn untrusted_worker_text_is_never_written_to_persisted_failure_fields() {
             FailureCode::WorkerExit,
             message,
         );
-        db.apply_attempt_event(&job, &attempt, JobEvent::ExecutionFailed(record))
+        db.handle_attempt_failure(&job, &attempt, record, None)
             .unwrap();
         let persisted = db.job(&job).unwrap();
         assert_eq!(persisted.failure_summary.as_deref(), Some("[REDACTED]"));
@@ -825,13 +828,13 @@ fn stale_and_wrong_job_attempts_cannot_commit_worker_results() {
     let second = insert_ready(&mut db, "second", JobKind::LeafProof);
 
     let stale = db.begin_attempt(&first, JobEvent::StartProving).unwrap();
-    db.apply_attempt_event(
+    db.handle_attempt_failure(
         &first,
         &stale,
-        JobEvent::ExecutionFailed(failure(FailureKind::Execution, FailureStage::Prove)),
+        failure(FailureKind::Execution, FailureStage::Prove),
+        None,
     )
     .unwrap();
-    db.apply_event(&first, JobEvent::RetryExecution).unwrap();
     db.refresh_readiness().unwrap();
     let current = db.begin_attempt(&first, JobEvent::StartProving).unwrap();
     let other = db.begin_attempt(&second, JobEvent::StartProving).unwrap();

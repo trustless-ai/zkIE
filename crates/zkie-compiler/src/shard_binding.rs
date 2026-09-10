@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 
 use zkie_core::assembler::{AssemblerInstruction, AssemblerProgram, RegisterRef};
 use zkie_core::fixed_point::I18;
@@ -125,6 +126,10 @@ pub struct BoundShardProgram {
     output_boundaries: Vec<BoundaryDescriptor>,
     global_to_local: HashMap<usize, usize>,
     weight_names: Vec<String>,
+    partition_plan_digest: Digest32,
+    shard_id: u64,
+    shard_name: String,
+    shard_range: Range<usize>,
 }
 
 impl BoundShardProgram {
@@ -142,6 +147,18 @@ impl BoundShardProgram {
     }
     pub fn weight_names(&self) -> &[String] {
         &self.weight_names
+    }
+    pub fn partition_plan_digest(&self) -> Digest32 {
+        self.partition_plan_digest
+    }
+    pub fn shard_id(&self) -> u64 {
+        self.shard_id
+    }
+    pub fn shard_name(&self) -> &str {
+        &self.shard_name
+    }
+    pub fn shard_range(&self) -> Range<usize> {
+        self.shard_range.clone()
     }
 }
 
@@ -427,6 +444,10 @@ pub fn bind_shard_program(
         output_boundaries,
         global_to_local,
         weight_names,
+        partition_plan_digest: plan.digest(),
+        shard_id: planned.id(),
+        shard_name: planned.name().into(),
+        shard_range: planned.range(),
     })
 }
 

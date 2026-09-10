@@ -7,6 +7,9 @@ use crate::assembler::{
     AssemblerChip, AssemblerConfig, AssemblerInstruction, AssemblerProgram, RegisterRef,
 };
 use crate::chips::layer_norm::RsqrtDomain;
+use crate::chips::poseidon_boundary::{
+    BoundaryDescriptor, BoundaryRole, PoseidonBoundaryChip, PoseidonBoundaryConfig,
+};
 use crate::field_convert::Fr;
 use crate::isa::{EltwiseOp, Instruction, ReduceOp};
 
@@ -19,6 +22,10 @@ pub struct AssemblerCircuitParams {
     input_shapes: Vec<usize>,
     weight_shapes: Vec<usize>,
     public_output_indices: Vec<usize>,
+    boundary_inputs: Vec<BoundaryDescriptor>,
+    boundary_outputs: Vec<(usize, BoundaryDescriptor)>,
+    leaf_prefix_len: usize,
+    fixed_public_weights: Vec<Vec<i64>>,
 }
 
 impl AssemblerCircuitParams {
@@ -33,6 +40,10 @@ impl AssemblerCircuitParams {
             input_shapes: program.input_values.iter().map(Vec::len).collect(),
             weight_shapes: program.weight_values.iter().map(Vec::len).collect(),
             public_output_indices,
+            boundary_inputs: Vec::new(),
+            boundary_outputs: Vec::new(),
+            leaf_prefix_len: 0,
+            fixed_public_weights: Vec::new(),
         }
     }
 
@@ -43,11 +54,34 @@ impl AssemblerCircuitParams {
     }
 
     fn canonical_shape_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"zkie.assembler-circuit-shape.v2\0".to_vec();
-        bytes.extend_from_slice(b"public-instances-v1:inputs,weights,selected-outputs\0");
+        let mut bytes = b"zkie.assembler-circuit-shape.v3\0".to_vec();
+        if self.boundary_inputs.is_empty() && self.boundary_outputs.is_empty() {
+            bytes.extend_from_slice(b"public-instances-v1:inputs,weights,selected-outputs\0");
+        } else {
+            bytes.extend_from_slice(
+                b"public-instances-v2:leaf,input-commitments,output-commitments,weights\0",
+            );
+        }
         encode_usizes(&mut bytes, &self.input_shapes);
         encode_usizes(&mut bytes, &self.weight_shapes);
         encode_usizes(&mut bytes, &self.public_output_indices);
+        encode_usize(&mut bytes, self.leaf_prefix_len);
+        encode_usize(&mut bytes, self.boundary_inputs.len());
+        for descriptor in &self.boundary_inputs {
+            encode_boundary_descriptor(&mut bytes, descriptor);
+        }
+        encode_usize(&mut bytes, self.boundary_outputs.len());
+        for (index, descriptor) in &self.boundary_outputs {
+            encode_usize(&mut bytes, *index);
+            encode_boundary_descriptor(&mut bytes, descriptor);
+        }
+        encode_usize(&mut bytes, self.fixed_public_weights.len());
+        for tensor in &self.fixed_public_weights {
+            encode_usize(&mut bytes, tensor.len());
+            for value in tensor {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
         encode_usize(&mut bytes, self.instructions.len());
         for instruction in &self.instructions {
             encode_instruction(&mut bytes, instruction);
@@ -86,6 +120,27 @@ fn encode_usizes(bytes: &mut Vec<u8>, values: &[usize]) {
     for value in values {
         encode_usize(bytes, *value);
     }
+}
+fn encode_string(bytes: &mut Vec<u8>, value: &str) {
+    encode_usize(bytes, value.len());
+    bytes.extend_from_slice(value.as_bytes());
+}
+fn encode_boundary_descriptor(bytes: &mut Vec<u8>, descriptor: &BoundaryDescriptor) {
+    bytes.push(match descriptor.role() {
+        BoundaryRole::Input => 1,
+        BoundaryRole::Output => 2,
+    });
+    encode_string(bytes, descriptor.register_id());
+    encode_usize(bytes, descriptor.edge_ids().len());
+    for value in descriptor.edge_ids() {
+        encode_string(bytes, value);
+    }
+    encode_usize(bytes, descriptor.graph_output_names().len());
+    for value in descriptor.graph_output_names() {
+        encode_string(bytes, value);
+    }
+    encode_usize(bytes, descriptor.element_count());
+    bytes.extend_from_slice(&descriptor.quantization_scale().to_le_bytes());
 }
 fn encode_instruction(bytes: &mut Vec<u8>, instruction: &AssemblerInstruction) {
     encode_usize(bytes, instruction.inputs.len());
@@ -175,6 +230,7 @@ pub struct AssemblerCircuit {
     params: AssemblerCircuitParams,
     program: AssemblerProgram,
     has_known_witnesses: bool,
+    leaf_prefix: Vec<Fr>,
 }
 
 impl AssemblerCircuit {
@@ -214,6 +270,62 @@ impl AssemblerCircuit {
             params,
             program,
             has_known_witnesses: true,
+            leaf_prefix: Vec::new(),
+        })
+    }
+
+    pub fn new_with_boundary_commitments(
+        program: AssemblerProgram,
+        rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
+        boundary_inputs: Vec<BoundaryDescriptor>,
+        boundary_outputs: Vec<(usize, BoundaryDescriptor)>,
+        leaf_prefix: Vec<Fr>,
+    ) -> Result<Self, String> {
+        let poseidon_work = boundary_inputs
+            .iter()
+            .chain(boundary_outputs.iter().map(|(_, descriptor)| descriptor))
+            .try_fold(0usize, |sum, descriptor| {
+                sum.checked_add(descriptor.canonical_fields().len())?
+                    .checked_add(descriptor.element_count())?
+                    .checked_add(2)
+            });
+        if boundary_inputs.len() != program.input_values.len()
+            || boundary_inputs
+                .iter()
+                .zip(&program.input_values)
+                .any(|(descriptor, values)| {
+                    descriptor.role() != BoundaryRole::Input
+                        || descriptor.element_count() != values.len()
+                        || descriptor.validate().is_err()
+                })
+            || boundary_outputs
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+            || boundary_outputs.iter().any(|(index, descriptor)| {
+                *index >= program.instructions.len()
+                    || descriptor.role() != BoundaryRole::Output
+                    || descriptor.validate().is_err()
+            })
+            || leaf_prefix.len() != 17
+            || poseidon_work.is_none_or(|work| work > 12_000)
+        {
+            return Err("invalid boundary commitment public layout".into());
+        }
+        let mut params =
+            AssemblerCircuitParams::from_program(&program, rms_norm_domains, Vec::new());
+        params.boundary_inputs = boundary_inputs;
+        params.boundary_outputs = boundary_outputs;
+        params.leaf_prefix_len = leaf_prefix.len();
+        params.fixed_public_weights = program
+            .weight_values
+            .iter()
+            .map(|tensor| tensor.iter().map(|value| value.raw()).collect())
+            .collect();
+        Ok(Self {
+            params,
+            program,
+            has_known_witnesses: true,
+            leaf_prefix,
         })
     }
 
@@ -237,8 +349,14 @@ impl AssemblerCircuit {
     }
 }
 
+#[derive(Clone)]
+pub struct AssemblerCircuitConfig {
+    assembler: AssemblerConfig,
+    poseidon: PoseidonBoundaryConfig,
+}
+
 impl Circuit<Fr> for AssemblerCircuit {
-    type Config = AssemblerConfig;
+    type Config = AssemblerCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
     type Params = AssemblerCircuitParams;
 
@@ -247,6 +365,7 @@ impl Circuit<Fr> for AssemblerCircuit {
             params: self.params.clone(),
             program: self.program.clone(),
             has_known_witnesses: false,
+            leaf_prefix: self.leaf_prefix.clone(),
         }
     }
 
@@ -258,11 +377,16 @@ impl Circuit<Fr> for AssemblerCircuit {
         meta: &mut ConstraintSystem<Fr>,
         params: Self::Params,
     ) -> Self::Config {
-        AssemblerChip::configure_with_rms_norm_domains_and_public_instances(
+        let assembler = AssemblerChip::configure_with_rms_norm_domains_and_public_instances(
             meta,
             &params.instructions,
             &params.rms_norm_domains,
-        )
+        );
+        let poseidon = PoseidonBoundaryChip::configure(meta);
+        AssemblerCircuitConfig {
+            assembler,
+            poseidon,
+        }
     }
 
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -275,9 +399,11 @@ impl Circuit<Fr> for AssemblerCircuit {
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
         let public_instance = config
+            .assembler
             .public_instance
             .expect("AssemblerCircuit always configures public instances");
-        let chip = AssemblerChip::construct(config);
+        let poseidon = PoseidonBoundaryChip::construct(config.poseidon);
+        let chip = AssemblerChip::construct(config.assembler);
         chip.load_rms_norm_tables(layouter.namespace(|| "assembler rms norm tables"))?;
         let assigned = chip
             .assign_with_cells_with_witnesses(
@@ -287,6 +413,73 @@ impl Circuit<Fr> for AssemblerCircuit {
             )
             .map_err(|_| ErrorFront::Synthesis)?;
         let mut offset = 0;
+        if !self.params.boundary_inputs.is_empty() || !self.params.boundary_outputs.is_empty() {
+            for (index, value) in self.leaf_prefix.iter().enumerate() {
+                let cell = poseidon.assign_public_value(
+                    layouter.namespace(|| format!("leaf identity {index}")),
+                    *value,
+                )?;
+                layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                offset += 1;
+            }
+            for (index, descriptor) in self.params.boundary_inputs.iter().enumerate() {
+                let tensor = assigned.inputs.get(index).ok_or(ErrorFront::Synthesis)?;
+                let commitment = poseidon.commit_assigned(
+                    layouter.namespace(|| format!("input boundary {index}")),
+                    descriptor,
+                    &tensor.cells,
+                )?;
+                layouter.constrain_instance(commitment.cell(), public_instance, offset)?;
+                offset += 1;
+            }
+            let output_count = poseidon.assign_constant(
+                layouter.namespace(|| "output boundary count"),
+                Fr::from(self.params.boundary_outputs.len() as u64),
+            )?;
+            layouter.constrain_instance(output_count.cell(), public_instance, offset)?;
+            offset += 1;
+            for (index, descriptor) in &self.params.boundary_outputs {
+                let tensor = assigned.virtuals.get(*index).ok_or(ErrorFront::Synthesis)?;
+                if tensor.cells.len() != descriptor.element_count() {
+                    return Err(ErrorFront::Synthesis);
+                }
+                let commitment = poseidon.commit_assigned(
+                    layouter.namespace(|| format!("output boundary {index}")),
+                    descriptor,
+                    &tensor.cells,
+                )?;
+                layouter.constrain_instance(commitment.cell(), public_instance, offset)?;
+                offset += 1;
+            }
+            let weight_count = self
+                .program
+                .weight_values
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+            let count_cell = poseidon.assign_constant(
+                layouter.namespace(|| "public weight count"),
+                Fr::from(weight_count as u64),
+            )?;
+            layouter.constrain_instance(count_cell.cell(), public_instance, offset)?;
+            offset += 1;
+            for (tensor, expected) in assigned
+                .weights
+                .iter()
+                .zip(&self.params.fixed_public_weights)
+            {
+                for (cell, expected) in tensor.cells.iter().zip(expected) {
+                    poseidon.constrain_equal_to_constant(
+                        layouter.namespace(|| "fixed public-model weight"),
+                        cell,
+                        crate::field_convert::i64_to_fr(*expected),
+                    )?;
+                    layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                    offset += 1;
+                }
+            }
+            return Ok(());
+        }
         for tensor in assigned.inputs.iter().chain(&assigned.weights) {
             for cell in &tensor.cells {
                 layouter.constrain_instance(cell.cell(), public_instance, offset)?;
@@ -410,6 +603,74 @@ mod tests {
     fn plain_configure_is_an_empty_shape_compatibility_fallback() {
         let mut constraint_system = ConstraintSystem::default();
         let _ = AssemblerCircuit::configure(&mut constraint_system);
+    }
+
+    #[test]
+    fn boundary_commitments_use_exact_assembler_cells() {
+        use crate::chips::poseidon_boundary::{
+            commit_boundary_native, BoundaryDescriptor, BoundaryRole,
+        };
+        let program = dot_program(2);
+        let input_descriptor = BoundaryDescriptor::flat_i18(
+            BoundaryRole::Input,
+            "graph-input:x",
+            Vec::new(),
+            Vec::new(),
+            2,
+            1_000_000_000_000_000_000,
+        )
+        .unwrap();
+        let output_descriptor = BoundaryDescriptor::flat_i18(
+            BoundaryRole::Output,
+            "virtual:0",
+            Vec::new(),
+            vec!["y".into()],
+            1,
+            1_000_000_000_000_000_000,
+        )
+        .unwrap();
+        let input_commitment =
+            commit_boundary_native(&input_descriptor, &program.input_values[0]).unwrap();
+        let output = [I18::from_raw(2_000_000_000_000_000_000)];
+        let output_commitment = commit_boundary_native(&output_descriptor, &output).unwrap();
+        let mut altered_program = program.clone();
+        altered_program.weight_values[0][0] = I18::from_raw(2_000_000_000_000_000_000);
+        let altered = AssemblerCircuit::new_with_boundary_commitments(
+            altered_program,
+            Default::default(),
+            vec![input_descriptor.clone()],
+            vec![(0, output_descriptor.clone())],
+            vec![Fr::from(42); 17],
+        )
+        .unwrap();
+        let circuit = AssemblerCircuit::new_with_boundary_commitments(
+            program,
+            Default::default(),
+            vec![input_descriptor],
+            vec![(0, output_descriptor)],
+            vec![Fr::from(42); 17],
+        )
+        .unwrap();
+        assert_ne!(
+            circuit.params().shape_digest(),
+            altered.params().shape_digest(),
+            "fixed public-model weights must produce a distinct key identity",
+        );
+        let one = crate::field_convert::i64_to_fr(1_000_000_000_000_000_000);
+        let instances = vec![(0..17)
+            .map(|_| Fr::from(42))
+            .chain([
+                input_commitment,
+                Fr::from(1),
+                output_commitment,
+                Fr::from(2),
+                one,
+                one,
+            ])
+            .collect()];
+        MockProver::run(12, &circuit, instances)
+            .unwrap()
+            .assert_satisfied();
     }
 
     #[derive(Clone)]

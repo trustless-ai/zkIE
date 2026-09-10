@@ -1592,8 +1592,12 @@ dependencies = [
 name = "zkie-runtime"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "getrandom 0.2.17",
  "rusqlite",
+ "rustix",
  "thiserror 1.0.69",
+ "zkie-types",
 ]
 
 [[package]]

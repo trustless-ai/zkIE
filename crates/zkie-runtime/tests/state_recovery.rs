@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use zkie_runtime::{
     DbError, FailureCode, FailureKind, FailureRecord, FailureStage, JobEvent, JobId, JobKind,
     JobState, RunDb, VerificationRecordId, SCHEMA_VERSION,
@@ -354,6 +354,8 @@ fn schema_enables_durability_guards_rejects_duplicates_and_unknown_enums() {
     assert!(settings.foreign_keys);
     assert_eq!(settings.synchronous, "FULL");
     assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    db.refresh_readiness().unwrap();
+    let attempt = db.begin_attempt(&job, JobEvent::StartWitnessing).unwrap();
     drop(db);
 
     let raw = Connection::open(&path).unwrap();
@@ -387,17 +389,47 @@ fn schema_enables_durability_guards_rejects_duplicates_and_unknown_enums() {
         )
         .unwrap();
     assert_eq!(successor_index, 1);
+    let insert_artifact = "INSERT INTO artifacts(
+        artifact_id,run_id,job_id,logical_job_id,attempt_id,object_digest,content_digest,
+        store_identity_digest,identity_digest,attestation_digest,artifact_role,job_kind,circuit_k,
+        aggregation_arity_tag,aggregation_arity,artifact_manifest_digest,run_identity_digest,
+        public_statement_digest,circuit_digest,verifying_key_digest,srs_source_digest,
+        shard_identity_digest,witness_artifact_digest,proof_flavor,execution_backend,created_at_unix_ms
+    ) VALUES(?1,'run-schema',?2,'same',?3,'digest-1','content','store','identity','attestation',
+        'witness','witness',1,0,NULL,'manifest','run','statement','circuit','vk','srs','shard',
+        'witness','flavor','backend',1)";
     raw.execute(
-        "INSERT INTO artifacts(artifact_id, run_id, logical_job_id, digest, path, created_at_unix_ms) VALUES('a1','run-schema','same','digest-1','/a',1)",
-        [],
+        insert_artifact,
+        params!["a1", job.as_str(), attempt.as_str()],
     )
     .unwrap();
     assert!(raw
         .execute(
-            "INSERT INTO artifacts(artifact_id, run_id, logical_job_id, digest, path, created_at_unix_ms) VALUES('a2','run-schema','same','digest-1','/b',2)",
-            [],
+            insert_artifact,
+            params!["a2", job.as_str(), attempt.as_str()]
         )
         .is_err());
+    raw.execute(
+        "INSERT INTO runs(run_id,created_at_unix_ms) VALUES('run-schema-two',1)",
+        [],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO jobs(job_id,run_id,logical_job_id,kind,state,created_at_unix_ms,updated_at_unix_ms) VALUES('run-schema-two:same','run-schema-two','same','witness','witnessing',1,1)",
+        [],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO attempts(attempt_id,run_id,job_id,state,started_at_unix_ms) VALUES('run-schema-two:same:attempt:1','run-schema-two','run-schema-two:same','witnessing',1)",
+        [],
+    )
+    .unwrap();
+    let cross_run_insert = insert_artifact.replace("'run-schema'", "'run-schema-two'");
+    raw.execute(
+        &cross_run_insert,
+        params!["a1", "run-schema-two:same", "run-schema-two:same:attempt:1"],
+    )
+    .unwrap();
     raw.execute(
         "UPDATE jobs SET state='future-state' WHERE job_id=?1",
         [job.as_str()],

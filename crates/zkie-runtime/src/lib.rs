@@ -1,3 +1,4 @@
+mod cli;
 mod db;
 mod estimate;
 mod monitor;
@@ -6,6 +7,7 @@ mod state;
 mod store;
 mod worker;
 
+pub use cli::*;
 pub use db::*;
 pub use estimate::*;
 pub use monitor::*;

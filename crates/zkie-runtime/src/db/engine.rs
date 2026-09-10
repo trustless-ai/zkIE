@@ -386,4 +386,18 @@ impl RunDb {
             Err(DbError::JobNotFound(job.clone()))
         }
     }
+
+    /// Every job of the run, ordered by logical id so status output is stable.
+    pub fn jobs(&self) -> Result<Vec<JobRecord>, DbError> {
+        let ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT job_id FROM jobs WHERE run_id=?1 ORDER BY logical_job_id")?;
+            let rows = statement.query_map([&self.run_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        ids.into_iter()
+            .map(|raw| self.job(&JobId::new(raw)?))
+            .collect()
+    }
 }

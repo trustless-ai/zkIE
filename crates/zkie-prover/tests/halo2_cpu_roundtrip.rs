@@ -5,15 +5,22 @@ use std::sync::{Arc, Mutex};
 
 use zkie_compiler::circuit_binding::to_assembler_program;
 use zkie_compiler::dag::Shard;
+use zkie_compiler::dag::{
+    InstructionCostModel, InstructionEstimate, PartitionError, PartitionPlanner, PartitionRequest,
+    ShardEstimate,
+};
 use zkie_compiler::graph_compiler::{CompiledInstruction, CompiledProgram, Register};
 use zkie_compiler::onnx_parser::WeightTensor;
+use zkie_compiler::shard_binding::{bind_shard_program, BoundaryLayout, BoundaryTensorSpec};
+use zkie_core::chips::poseidon_boundary::{BoundaryDescriptor, BoundaryRole};
 use zkie_core::fixed_point::I18;
 use zkie_core::isa::{EltwiseOp, Instruction};
 use zkie_prover::{
-    verify_proof, BackendError, BoundaryShapeManifest, Digest32, Halo2KzgCpuBackend, KeyIdentity,
-    KeyMaterialStore, KeyWriteOutcome, ModelVisibility, PrepareJob, ProofBackend, ProofFlavorId,
-    ProofJob, RunIdentity, ShardIdentity, SrsPolicy, VerificationError, VerificationExpectation,
-    VerificationJob, WitnessBackend, WitnessJob, ZkieIsaCpuWitnessBackend,
+    verify_proof, BackendError, BoundaryClaim, BoundaryShapeManifest, Digest32, Halo2KzgCpuBackend,
+    KeyIdentity, KeyMaterialStore, KeyWriteOutcome, LeafStatement, ModelVisibility, PrepareJob,
+    ProofBackend, ProofFlavorId, ProofJob, RunIdentity, ShardIdentity, SrsPolicy,
+    VerificationError, VerificationExpectation, VerificationJob, WitnessBackend, WitnessJob,
+    ZkieIsaCpuWitnessBackend,
 };
 
 #[derive(Default)]
@@ -164,6 +171,103 @@ fn ready(label: &str) -> (PathBuf, Halo2KzgCpuBackend, ProofJob) {
         cpu.clone(),
         assembler,
         domains,
+        13,
+        SrsPolicy::DevelopmentGenerate,
+    )
+    .unwrap();
+    let prepare = PrepareJob::new_development_generate(
+        cpu.run_identity().clone(),
+        cpu.shard_identity().clone(),
+        13,
+    )
+    .unwrap();
+    let keys = backend.prepare(prepare, &Store::default()).unwrap();
+    let job = ProofJob::new(
+        cpu.run_identity().clone(),
+        cpu.shard_identity().clone(),
+        witness,
+        keys,
+    )
+    .unwrap();
+    (dir, backend, job)
+}
+
+fn ready_boundary(label: &str) -> (PathBuf, Halo2KzgCpuBackend, ProofJob) {
+    let dir = temp_dir(label);
+    #[derive(Clone)]
+    struct UnitCost;
+    impl InstructionCostModel for UnitCost {
+        fn identity(&self) -> &str {
+            "unit"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn estimate_instruction(
+            &self,
+            _: &CompiledInstruction,
+        ) -> Result<InstructionEstimate, PartitionError> {
+            InstructionEstimate::new(1, 1)
+        }
+        fn estimate_shard(
+            &self,
+            instructions: &[CompiledInstruction],
+        ) -> Result<ShardEstimate, PartitionError> {
+            ShardEstimate::new(instructions.len() as u64, 1)
+        }
+    }
+    let compiled = CompiledProgram {
+        instructions: vec![CompiledInstruction {
+            instruction: Instruction::Eltwise { op: EltwiseOp::Add },
+            inputs: vec![
+                Register::GraphInput("x".into()),
+                Register::Weight("b".into()),
+            ],
+            output_name: "y".into(),
+        }],
+        weights: HashMap::from([(
+            "b".into(),
+            WeightTensor {
+                shape: vec![2],
+                data: vec![0.25, -0.5],
+            },
+        )]),
+        graph_inputs: vec!["x".into()],
+        graph_outputs: vec![("y".into(), Register::Virtual(0))],
+    };
+    let layout = BoundaryLayout::new(vec![
+        BoundaryTensorSpec::flat(Register::GraphInput("x".into()), 2).unwrap(),
+        BoundaryTensorSpec::flat(Register::Virtual(0), 2).unwrap(),
+    ])
+    .unwrap();
+    let request = PartitionRequest::new(1, 20, d(1), "compiler-v1", UnitCost)
+        .unwrap()
+        .with_boundary_layout_digest(layout.digest());
+    let plan = PartitionPlanner::plan(&compiled, &request).unwrap();
+    let graph = HashMap::from([(
+        "x".into(),
+        vec![I18::from_f64(1.0).unwrap(), I18::from_f64(2.0).unwrap()],
+    )]);
+    let bound =
+        bind_shard_program(&compiled, &plan, 0, d(1), &layout, &graph, &HashMap::new()).unwrap();
+    let mut identity = run(ModelVisibility::PublicModel);
+    identity.public_input_schema_version = 2;
+    identity.partition_plan_digest = plan.digest();
+    let cpu = Arc::new(
+        ZkieIsaCpuWitnessBackend::new(
+            Arc::new(compiled),
+            plan.dag().shards[0].clone(),
+            HashMap::new(),
+            identity,
+            BoundaryShapeManifest::new(BTreeMap::from([("x".into(), 2)]), BTreeMap::new()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let witness = write_witness(&cpu, &dir);
+    let backend = Halo2KzgCpuBackend::new_with_boundary_commitments(
+        cpu.clone(),
+        &bound,
+        HashMap::new(),
         13,
         SrsPolicy::DevelopmentGenerate,
     )
@@ -729,7 +833,7 @@ fn crossed_shard_circuit_flavor_and_missing_proof_are_rejected() {
 
 #[test]
 fn proof_for_witness_a_cannot_verify_against_public_statement_b() {
-    let (dir, backend, job_a) = ready("substitution");
+    let (dir, backend, job_a) = ready_boundary("substitution");
     let proof_a = backend
         .prove(job_a.clone(), dir.join("proof-a.bin"))
         .unwrap();
@@ -739,7 +843,9 @@ fn proof_for_witness_a_cannot_verify_against_public_statement_b() {
         "witness-b.json",
         [3_000_000_000_000_000_000, 4_000_000_000_000_000_000],
     );
-    let statement_b = backend.statement_for(&witness_b).unwrap();
+    let statement_b = backend
+        .statement_for_key(&witness_b, job_a.prepared_keys().proving_key())
+        .unwrap();
     let forged = zkie_prover::UnverifiedProof::new(
         proof_a.proof_path().clone(),
         proof_a.proof_digest(),
@@ -770,4 +876,199 @@ fn proof_for_witness_a_cannot_verify_against_public_statement_b() {
         Err(VerificationError::CryptographicVerificationFailed { .. })
     ));
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn boundary_leaf_proof_rejects_commitment_descriptor_and_identity_tampering() {
+    let (dir, backend, job) = ready_boundary("boundary-tamper-matrix");
+    let proof = backend.prove(job.clone(), dir.join("proof.bin")).unwrap();
+    let baseline_expectation = VerificationExpectation::from_proof_job(
+        &job,
+        backend.capabilities().execution_backend().clone(),
+        proof.public_statement().to_vec(),
+        proof.proof_digest(),
+        proof.artifact_manifest().to_vec(),
+    )
+    .unwrap();
+    verify_proof(
+        &backend,
+        VerificationJob::new(
+            baseline_expectation,
+            proof.clone(),
+            fs::read(proof.proof_path()).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let statement = LeafStatement::decode(proof.public_statement()).unwrap();
+    let input = &statement.input_claims()[0];
+    let output = &statement.output_claims()[0];
+    let changed_descriptor = BoundaryDescriptor::flat_i18(
+        BoundaryRole::Input,
+        "graph-input:other",
+        Vec::new(),
+        Vec::new(),
+        2,
+        1_000_000_000_000_000_000,
+    )
+    .unwrap();
+    let variants = vec![
+        statement
+            .clone()
+            .with_input_claim(
+                0,
+                BoundaryClaim::new(
+                    input.descriptor().clone(),
+                    input.commitment() + halo2_proofs::halo2curves::bn256::Fr::from(1),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        statement
+            .clone()
+            .with_output_claim(
+                0,
+                BoundaryClaim::new(
+                    output.descriptor().clone(),
+                    output.commitment() + halo2_proofs::halo2curves::bn256::Fr::from(1),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        statement
+            .clone()
+            .with_input_claim(
+                0,
+                BoundaryClaim::new(changed_descriptor, input.commitment()).unwrap(),
+            )
+            .unwrap(),
+        statement.clone().with_partition_digest(d(90)),
+        statement.clone().with_model_digest(d(91)),
+        statement.clone().with_weights_digest(d(92)),
+        statement
+            .clone()
+            .with_public_weight(0, I18::from_raw(123))
+            .unwrap(),
+        statement
+            .clone()
+            .with_proof_flavor(ProofFlavorId::parse("other-proof-v1").unwrap()),
+        statement.with_verification_key_digest(d(93)),
+    ];
+    let bytes = fs::read(proof.proof_path()).unwrap();
+    for altered in variants {
+        let encoded = altered.encode().unwrap();
+        let forged = zkie_prover::UnverifiedProof::new(
+            proof.proof_path().clone(),
+            proof.proof_digest(),
+            encoded.clone(),
+            proof.circuit_digest(),
+            proof.verification_key_digest(),
+            proof.proof_flavor().clone(),
+            proof.execution_backend().clone(),
+            proof.shard().clone(),
+            proof.artifact_manifest().to_vec(),
+            proof.run_identity_digest(),
+        )
+        .unwrap();
+        let expectation = VerificationExpectation::from_proof_job(
+            &job,
+            backend.capabilities().execution_backend().clone(),
+            encoded,
+            proof.proof_digest(),
+            proof.artifact_manifest().to_vec(),
+        )
+        .unwrap();
+        assert!(verify_proof(
+            &backend,
+            VerificationJob::new(expectation, forged, bytes.clone()).unwrap(),
+        )
+        .is_err());
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn boundary_backend_rejects_bound_program_from_sibling_shard() {
+    #[derive(Clone)]
+    struct TwinCost;
+    impl InstructionCostModel for TwinCost {
+        fn identity(&self) -> &str {
+            "twins"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn estimate_instruction(
+            &self,
+            _: &CompiledInstruction,
+        ) -> Result<InstructionEstimate, PartitionError> {
+            InstructionEstimate::new(1, 1)
+        }
+        fn estimate_shard(
+            &self,
+            instructions: &[CompiledInstruction],
+        ) -> Result<ShardEstimate, PartitionError> {
+            ShardEstimate::new(instructions.len() as u64, 1)
+        }
+    }
+    let instruction = CompiledInstruction {
+        instruction: Instruction::Eltwise { op: EltwiseOp::Add },
+        inputs: vec![
+            Register::GraphInput("x".into()),
+            Register::Weight("b".into()),
+        ],
+        output_name: "out".into(),
+    };
+    let compiled = CompiledProgram {
+        instructions: vec![instruction.clone(), instruction],
+        weights: HashMap::from([(
+            "b".into(),
+            WeightTensor {
+                shape: vec![2],
+                data: vec![1.0, 1.0],
+            },
+        )]),
+        graph_inputs: vec!["x".into()],
+        graph_outputs: vec![
+            ("a".into(), Register::Virtual(0)),
+            ("b".into(), Register::Virtual(1)),
+        ],
+    };
+    let layout = BoundaryLayout::new(vec![
+        BoundaryTensorSpec::flat(Register::GraphInput("x".into()), 2).unwrap(),
+        BoundaryTensorSpec::flat(Register::Virtual(0), 2).unwrap(),
+        BoundaryTensorSpec::flat(Register::Virtual(1), 2).unwrap(),
+    ])
+    .unwrap();
+    let request = PartitionRequest::new(1, 1, d(1), "compiler-v1", TwinCost)
+        .unwrap()
+        .with_boundary_layout_digest(layout.digest());
+    let plan = PartitionPlanner::plan(&compiled, &request).unwrap();
+    assert_eq!(plan.shards().len(), 2);
+    let graph = HashMap::from([("x".into(), vec![I18::from_raw(1), I18::from_raw(2)])]);
+    let sibling =
+        bind_shard_program(&compiled, &plan, 1, d(1), &layout, &graph, &HashMap::new()).unwrap();
+    let mut identity = run(ModelVisibility::PublicModel);
+    identity.public_input_schema_version = 2;
+    identity.partition_plan_digest = plan.digest();
+    let cpu = Arc::new(
+        ZkieIsaCpuWitnessBackend::new(
+            Arc::new(compiled),
+            plan.dag().shards[0].clone(),
+            HashMap::new(),
+            identity,
+            BoundaryShapeManifest::new(BTreeMap::from([("x".into(), 2)]), BTreeMap::new()).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        Halo2KzgCpuBackend::new_with_boundary_commitments(
+            cpu,
+            &sibling,
+            HashMap::new(),
+            13,
+            SrsPolicy::DevelopmentGenerate,
+        ),
+        Err(BackendError::InvalidJob { .. })
+    ));
 }

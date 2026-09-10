@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use zkie_types::{ResourceCapacity, ResourceRequest};
 
-use crate::{DbError, JobId, JobState, MemoryAction, RunDb};
+use crate::{DbError, JobId, JobState, MemoryAction, RunDb, WorkerJob, WorkerSpec};
 
 pub const DEFAULT_AGING_SECONDS: i64 = 600;
 
@@ -89,6 +89,29 @@ impl<C: SchedulerClock> Scheduler<C> {
             });
         }
         self.decide(db, candidates, available)
+    }
+
+    /// Builds the immutable worker spec for a selected candidate.
+    ///
+    /// Thread and device placement are derived from the resources reserved for that
+    /// candidate, so a worker can never be launched with more parallelism than the
+    /// scheduler accounted for.
+    pub fn spec_for(
+        &self,
+        candidate: &SchedulableJob,
+        run_digest: zkie_types::Digest32,
+        attempt_id: crate::AttemptId,
+        job: WorkerJob,
+        staged_output_dir: std::path::PathBuf,
+    ) -> Result<WorkerSpec, crate::ProtocolError> {
+        crate::worker_spec(
+            run_digest,
+            candidate.job_id.clone(),
+            attempt_id,
+            job,
+            staged_output_dir,
+            &candidate.request,
+        )
     }
 
     pub fn decide(

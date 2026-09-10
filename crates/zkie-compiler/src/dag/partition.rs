@@ -107,6 +107,7 @@ pub struct PartitionRequest<M> {
     compiler_version: String,
     cost_model: M,
     boundary_hints: Vec<BoundaryHint>,
+    boundary_layout_digest: Option<Digest32>,
 }
 
 impl<M> PartitionRequest<M> {
@@ -133,6 +134,7 @@ impl<M> PartitionRequest<M> {
             compiler_version,
             cost_model,
             boundary_hints: Vec::new(),
+            boundary_layout_digest: None,
         })
     }
 
@@ -155,6 +157,11 @@ impl<M> PartitionRequest<M> {
         Ok(self)
     }
 
+    pub fn with_boundary_layout_digest(mut self, digest: Digest32) -> Self {
+        self.boundary_layout_digest = Some(digest);
+        self
+    }
+
     pub fn target_shard_ram_bytes(&self) -> u64 {
         self.target_shard_ram_bytes
     }
@@ -172,6 +179,9 @@ impl<M> PartitionRequest<M> {
     }
     pub fn boundary_hints(&self) -> &[BoundaryHint] {
         &self.boundary_hints
+    }
+    pub fn boundary_layout_digest(&self) -> Option<Digest32> {
+        self.boundary_layout_digest
     }
 }
 
@@ -202,11 +212,14 @@ impl PlannedShard {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PartitionPlan {
     shards: Vec<PlannedShard>,
     dag: Dag,
+    model_digest: Digest32,
+    boundary_layout_digest: Option<Digest32>,
     digest: Digest32,
+    program_snapshot: CompiledProgram,
 }
 
 impl PartitionPlan {
@@ -218,6 +231,15 @@ impl PartitionPlan {
     }
     pub fn digest(&self) -> Digest32 {
         self.digest
+    }
+    pub fn model_digest(&self) -> Digest32 {
+        self.model_digest
+    }
+    pub fn boundary_layout_digest(&self) -> Option<Digest32> {
+        self.boundary_layout_digest
+    }
+    pub(crate) fn matches_program(&self, program: &CompiledProgram) -> bool {
+        &self.program_snapshot == program
     }
 }
 
@@ -359,7 +381,10 @@ impl PartitionPlanner {
         Ok(PartitionPlan {
             shards,
             dag,
+            model_digest: request.model_digest,
+            boundary_layout_digest: request.boundary_layout_digest,
             digest,
+            program_snapshot: program.clone(),
         })
     }
 }
@@ -462,6 +487,13 @@ fn plan_digest<M: InstructionCostModel>(
     encode_u32(&mut bytes, request.max_k);
     encode_text(&mut bytes, request.cost_model.identity());
     encode_u32(&mut bytes, request.cost_model.version());
+    match request.boundary_layout_digest {
+        Some(digest) => {
+            bytes.push(1);
+            bytes.extend_from_slice(digest.as_bytes());
+        }
+        None => bytes.push(0),
+    }
     encode_u64(&mut bytes, request.boundary_hints.len() as u64);
     for hint in &request.boundary_hints {
         encode_u64(&mut bytes, hint.boundary as u64);

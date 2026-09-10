@@ -27,7 +27,7 @@ impl ProofBackend for FakeBackend {
         _: &dyn KeyMaterialStore,
     ) -> Result<PreparedKeys, BackendError> {
         assert_eq!(
-            job.key_identity().circuit_digest(),
+            job.key_identity().unwrap().circuit_digest(),
             job.shard().circuit_digest()
         );
         Ok(keys())

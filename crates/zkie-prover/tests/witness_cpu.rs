@@ -17,10 +17,10 @@ use zkie_core::fixed_point::I18;
 use zkie_core::isa::{EltwiseOp, Instruction};
 use zkie_core::program_circuit::{AssemblerCircuit, AssemblerCircuitParams};
 use zkie_prover::{
-    BackendError, CpuWitnessInputs, Digest32, ModelVisibility, ProofFlavorId, RunIdentity,
-    ShardIdentity, WitnessArtifact, WitnessBackend, WitnessJob, ZkieIsaCpuWitnessBackend,
-    MAX_CPU_WITNESS_ARTIFACT_BYTES, MAX_CPU_WITNESS_DOMAIN_POINTS, MAX_CPU_WITNESS_INPUT_BYTES,
-    MAX_CPU_WITNESS_VALUES_PER_TENSOR,
+    BackendError, BoundaryShapeManifest, CpuWitnessInputs, Digest32, ModelVisibility,
+    ProofFlavorId, RunIdentity, ShardIdentity, WitnessArtifact, WitnessBackend, WitnessJob,
+    ZkieIsaCpuWitnessBackend, MAX_CPU_WITNESS_ARTIFACT_BYTES, MAX_CPU_WITNESS_DOMAIN_POINTS,
+    MAX_CPU_WITNESS_INPUT_BYTES, MAX_CPU_WITNESS_VALUES_PER_TENSOR,
 };
 
 fn raw(values: &[i64]) -> Vec<I18> {
@@ -88,7 +88,85 @@ fn backend(
     shard: Shard,
     domains: HashMap<(usize, u64), RsqrtDomain>,
 ) -> ZkieIsaCpuWitnessBackend {
-    ZkieIsaCpuWitnessBackend::new(Arc::new(program), shard, domains, run_identity()).unwrap()
+    let shapes = test_boundary_shapes(&program, &shard);
+    ZkieIsaCpuWitnessBackend::new(Arc::new(program), shard, domains, run_identity(), shapes)
+        .unwrap()
+}
+
+fn test_boundary_shapes(program: &CompiledProgram, shard: &Shard) -> BoundaryShapeManifest {
+    fn output_len(program: &CompiledProgram, index: usize) -> usize {
+        match &program.instructions[index].instruction {
+            Instruction::DotGeneral { m, n, .. } => m * n,
+            Instruction::RmsNorm { dim, .. } => *dim,
+            Instruction::Reduce { .. } => 1,
+            Instruction::Softmax { axis_dim } => *axis_dim,
+            Instruction::Eltwise { .. } => program.instructions[index]
+                .inputs
+                .iter()
+                .find_map(|register| match register {
+                    Register::Weight(name) => Some(program.weights[name].data.len()),
+                    Register::Virtual(source) if *source < index => {
+                        Some(output_len(program, *source))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(1),
+            _ => 1,
+        }
+    }
+    let mut graph = BTreeMap::new();
+    let mut virtuals = BTreeMap::new();
+    for (index, instruction) in program.instructions[shard.range.clone()].iter().enumerate() {
+        let global = shard.range.start + index;
+        for (position, register) in instruction.inputs.iter().enumerate() {
+            let len = match register {
+                Register::GraphInput(_) => match &instruction.instruction {
+                    Instruction::DotGeneral {
+                        m, n, k, trans_a, ..
+                    } => {
+                        if position == 0 {
+                            if *trans_a {
+                                k * m
+                            } else {
+                                m * k
+                            }
+                        } else {
+                            k * n
+                        }
+                    }
+                    Instruction::RmsNorm { dim, .. } => *dim,
+                    Instruction::Reduce { .. } => 1,
+                    Instruction::Softmax { axis_dim } => *axis_dim,
+                    Instruction::Eltwise { .. } => instruction
+                        .inputs
+                        .iter()
+                        .find_map(|other| match other {
+                            Register::Weight(name) => Some(program.weights[name].data.len()),
+                            Register::Virtual(source) if *source < global => {
+                                Some(output_len(program, *source))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(1),
+                    _ => 1,
+                },
+                Register::Virtual(source) if *source < shard.range.start => {
+                    output_len(program, *source)
+                }
+                _ => continue,
+            };
+            match register {
+                Register::GraphInput(name) => {
+                    graph.insert(name.clone(), len);
+                }
+                Register::Virtual(source) => {
+                    virtuals.insert(*source, len);
+                }
+                Register::Weight(_) => {}
+            }
+        }
+    }
+    BoundaryShapeManifest::new(graph, virtuals).unwrap()
 }
 
 #[derive(Clone)]
@@ -325,6 +403,7 @@ fn rejects_missing_forward_shape_and_overflow_with_typed_errors() {
         whole_shard(&forward_program),
         HashMap::new(),
         run_identity(),
+        BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap(),
     )
     .err()
     .unwrap();
@@ -336,7 +415,7 @@ fn rejects_missing_forward_shape_and_overflow_with_typed_errors() {
             BTreeMap::new(),
         ))
         .unwrap_err();
-    assert!(matches!(shape, BackendError::ShapeMismatch { .. }));
+    assert!(matches!(shape, BackendError::InvalidJob { .. }));
 
     let mut overflow_program = linear_program();
     overflow_program.instructions.truncate(1);
@@ -374,7 +453,7 @@ fn empty_eltwise_operand_returns_shape_error_instead_of_panicking() {
             BTreeMap::new(),
         ))
         .unwrap_err();
-    assert!(matches!(err, BackendError::ShapeMismatch { .. }));
+    assert!(matches!(err, BackendError::InvalidJob { .. }));
 }
 
 #[test]
@@ -561,7 +640,8 @@ fn rejects_unsupported_or_crossed_run_identity_before_reading() {
             Arc::new(program.clone()),
             shard.clone(),
             HashMap::new(),
-            private
+            private,
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap()
         ),
         Err(BackendError::InvalidJob { .. })
     ));
@@ -572,7 +652,8 @@ fn rejects_unsupported_or_crossed_run_identity_before_reading() {
             Arc::new(program.clone()),
             shard,
             HashMap::new(),
-            wrong_flavor
+            wrong_flavor,
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap()
         ),
         Err(BackendError::InvalidJob { .. })
     ));
@@ -721,7 +802,13 @@ fn rejects_extraneous_inputs_and_zero_dot_dimensions() {
         };
         let shard = whole_shard(&zero);
         assert!(matches!(
-            ZkieIsaCpuWitnessBackend::new(Arc::new(zero), shard, HashMap::new(), run_identity()),
+            ZkieIsaCpuWitnessBackend::new(
+                Arc::new(zero),
+                shard,
+                HashMap::new(),
+                run_identity(),
+                BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap(),
+            ),
             Err(BackendError::ShapeMismatch { .. })
         ));
     }
@@ -742,7 +829,8 @@ fn enforces_domain_input_artifact_and_resource_limits() {
                     n: MAX_CPU_WITNESS_DOMAIN_POINTS + 1,
                 }
             )]),
-            run_identity()
+            run_identity(),
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap()
         ),
         Err(BackendError::Resource { .. })
     ));
@@ -758,7 +846,8 @@ fn enforces_domain_input_artifact_and_resource_limits() {
                     n: 10_000,
                 }
             )]),
-            run_identity()
+            run_identity(),
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap()
         ),
         Err(BackendError::InvalidJob { .. })
     ));
@@ -824,7 +913,8 @@ fn enforces_domain_input_artifact_and_resource_limits() {
             Arc::new(oversized_dot),
             shard,
             HashMap::new(),
-            run_identity()
+            run_identity(),
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap()
         ),
         Err(BackendError::Resource { .. })
     ));
@@ -839,6 +929,7 @@ fn enforces_domain_input_artifact_and_resource_limits() {
         HashMap::new(),
         run_identity(),
         tight,
+        test_boundary_shapes(&program, &whole_shard(&program)),
     )
     .unwrap();
     let limited_input = unique_temp("limited-input");
@@ -885,6 +976,7 @@ fn artifact_record_limit_is_identical_for_construction_generation_and_loading() 
             HashMap::new(),
             run_identity(),
             too_tight,
+            test_boundary_shapes(&program, &whole_shard(&program)),
         ),
         Err(BackendError::Resource { .. })
     ));
@@ -899,6 +991,7 @@ fn artifact_record_limit_is_identical_for_construction_generation_and_loading() 
         HashMap::new(),
         run_identity(),
         exact,
+        test_boundary_shapes(&program, &whole_shard(&program)),
     )
     .unwrap();
     let input = unique_temp("record-boundary-input");
@@ -923,6 +1016,7 @@ fn artifact_record_limit_is_identical_for_construction_generation_and_loading() 
             whole_shard(&long),
             HashMap::new(),
             run_identity(),
+            BoundaryShapeManifest::new(BTreeMap::new(), BTreeMap::new()).unwrap(),
         ),
         Err(BackendError::Resource { .. })
     ));
@@ -938,6 +1032,7 @@ fn artifact_record_limit_is_identical_for_construction_generation_and_loading() 
             HashMap::new(),
             run_identity(),
             operand_tight,
+            test_boundary_shapes(&program, &whole_shard(&program)),
         ),
         Err(BackendError::Resource { .. })
     ));

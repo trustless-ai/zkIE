@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use zkie_compiler::dag::Shard;
 use zkie_compiler::graph_compiler::{CompiledProgram, Register};
 use zkie_compiler::onnx_parser::OnnxParseError;
+use zkie_core::assembler::{AssemblerInstruction, AssemblerProgram, RegisterRef};
 use zkie_core::chips::layer_norm::{rsqrt_f64, RsqrtDomain};
 use zkie_core::chips::lookup::{build_domain, build_domain_from_raw};
 use zkie_core::fixed_point::{requantize_mul, requantize_raw, I18};
@@ -26,7 +27,7 @@ use crate::{
 
 const INPUT_SCHEMA_VERSION: u32 = 1;
 const ARTIFACT_SCHEMA_VERSION: u32 = 1;
-const CIRCUIT_BINDING_VERSION: &[u8] = b"zkie.cpu-witness-circuit-binding.v1\0";
+const CIRCUIT_BINDING_VERSION: &[u8] = b"zkie.cpu-witness-circuit-binding.v3-boundary-shapes\0";
 const SUPPORTED_PROOF_FLAVOR: &str = "halo2-kzg-bn256-shplonk-v1";
 
 pub const MAX_CPU_WITNESS_INPUT_BYTES: usize = 1 << 20;
@@ -223,6 +224,79 @@ impl CpuWitnessArtifact {
     }
 }
 
+/// Versioned, compiler/partition-supplied tensor lengths for every external
+/// value crossing a shard boundary. These are circuit configuration, not
+/// witness data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundaryShapeManifest {
+    graph_inputs: BTreeMap<String, usize>,
+    virtual_inputs: BTreeMap<usize, usize>,
+}
+
+impl BoundaryShapeManifest {
+    pub fn new(
+        graph_inputs: BTreeMap<String, usize>,
+        virtual_inputs: BTreeMap<usize, usize>,
+    ) -> Result<Self, BackendError> {
+        if graph_inputs
+            .values()
+            .chain(virtual_inputs.values())
+            .any(|len| *len == 0)
+        {
+            return Err(BackendError::InvalidJob {
+                message: "boundary tensor lengths must be nonzero".into(),
+            });
+        }
+        Ok(Self {
+            graph_inputs,
+            virtual_inputs,
+        })
+    }
+
+    fn validate_for(
+        self,
+        required_graph_inputs: &BTreeSet<String>,
+        required_virtual_inputs: &BTreeSet<usize>,
+        limits: &CpuWitnessLimits,
+    ) -> Result<HashMap<Register, usize>, BackendError> {
+        if self.graph_inputs.keys().cloned().collect::<BTreeSet<_>>() != *required_graph_inputs
+            || self.virtual_inputs.keys().copied().collect::<BTreeSet<_>>()
+                != *required_virtual_inputs
+        {
+            return Err(BackendError::InvalidJob {
+                message: "boundary shape manifest has missing or extraneous registers".into(),
+            });
+        }
+        let mut total = 0usize;
+        let mut shapes = HashMap::new();
+        for (name, len) in self.graph_inputs {
+            total = total
+                .checked_add(len)
+                .ok_or_else(|| BackendError::Resource {
+                    message: "boundary shape value count overflow".into(),
+                })?;
+            shapes.insert(Register::GraphInput(name), len);
+        }
+        for (index, len) in self.virtual_inputs {
+            total = total
+                .checked_add(len)
+                .ok_or_else(|| BackendError::Resource {
+                    message: "boundary shape value count overflow".into(),
+                })?;
+            shapes.insert(Register::Virtual(index), len);
+        }
+        if shapes.len() > limits.tensor_count
+            || shapes.values().any(|len| *len > limits.values_per_tensor)
+            || total > limits.total_input_values
+        {
+            return Err(BackendError::Resource {
+                message: "boundary shape manifest exceeds configured limits".into(),
+            });
+        }
+        Ok(shapes)
+    }
+}
+
 /// CPU backend for the exact fixed-point subset currently dispatched by `AssemblerChip`.
 pub struct ZkieIsaCpuWitnessBackend {
     program: Arc<CompiledProgram>,
@@ -230,9 +304,11 @@ pub struct ZkieIsaCpuWitnessBackend {
     shard_identity: ShardIdentity,
     run_identity: RunIdentity,
     rms_norm_tables: HashMap<(usize, u64), BTreeMap<i64, I18>>,
+    rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
     weights: HashMap<String, Vec<I18>>,
     required_graph_inputs: BTreeSet<String>,
     required_virtual_inputs: BTreeSet<usize>,
+    boundary_shapes: HashMap<Register, usize>,
     artifact_record_count: usize,
     limits: CpuWitnessLimits,
 }
@@ -243,6 +319,7 @@ impl ZkieIsaCpuWitnessBackend {
         shard: Shard,
         rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
         run_identity: RunIdentity,
+        boundary_shapes: BoundaryShapeManifest,
     ) -> Result<Self, BackendError> {
         Self::with_limits(
             program,
@@ -250,6 +327,7 @@ impl ZkieIsaCpuWitnessBackend {
             rms_norm_domains,
             run_identity,
             CpuWitnessLimits::default(),
+            boundary_shapes,
         )
     }
 
@@ -259,6 +337,7 @@ impl ZkieIsaCpuWitnessBackend {
         rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
         run_identity: RunIdentity,
         limits: CpuWitnessLimits,
+        boundary_shapes: BoundaryShapeManifest,
     ) -> Result<Self, BackendError> {
         CpuWitnessLimits::new(
             limits.input_bytes,
@@ -313,12 +392,18 @@ impl ZkieIsaCpuWitnessBackend {
             }
         }
         let analysis = analyze_program(&program, &shard, &rms_norm_domains, &limits)?;
+        let boundary_shapes = boundary_shapes.validate_for(
+            &analysis.required_graph_inputs,
+            &analysis.required_virtual_inputs,
+            &limits,
+        )?;
         let circuit_digest = derive_circuit_digest(
             &program,
             &shard,
             &rms_norm_domains,
             &analysis.weights,
             &analysis.rms_norm_tables,
+            &boundary_shapes,
         );
         let shard_identity = ShardIdentity::new(
             u64::try_from(shard.id).map_err(|_| BackendError::InvalidJob {
@@ -333,9 +418,11 @@ impl ZkieIsaCpuWitnessBackend {
             shard_identity,
             run_identity,
             rms_norm_tables: analysis.rms_norm_tables,
+            rms_norm_domains,
             weights: analysis.weights,
             required_graph_inputs: analysis.required_graph_inputs,
             required_virtual_inputs: analysis.required_virtual_inputs,
+            boundary_shapes,
             artifact_record_count: analysis.artifact_record_count,
             limits,
         })
@@ -343,6 +430,115 @@ impl ZkieIsaCpuWitnessBackend {
 
     pub fn circuit_digest(&self) -> Digest32 {
         self.shard_identity.circuit_digest()
+    }
+
+    pub fn public_output_indices(&self) -> Vec<usize> {
+        self.public_output_globals()
+            .into_iter()
+            .map(|index| index - self.shard.range.start)
+            .collect()
+    }
+
+    pub fn assembler_input_shapes(&self) -> Vec<usize> {
+        boundary_register_order(&self.program, &self.shard)
+            .into_iter()
+            .map(|register| self.boundary_shapes[&register])
+            .collect()
+    }
+
+    pub fn validate_assembler_template(
+        &self,
+        template: AssemblerProgram,
+        domains: &HashMap<(usize, u64), RsqrtDomain>,
+    ) -> Result<zkie_core::program_circuit::AssemblerCircuit, BackendError> {
+        let mut external = HashMap::<Register, RegisterRef>::new();
+        let mut weights = HashMap::<String, usize>::new();
+        let mut expected_inputs = Vec::new();
+        let mut expected_weights = Vec::new();
+        let mut expected_instructions = Vec::with_capacity(self.shard.range.len());
+        for index in self.shard.range.clone() {
+            let compiled = &self.program.instructions[index];
+            let inputs = compiled
+                .inputs
+                .iter()
+                .map(|register| {
+                    if let Register::Virtual(source) = register {
+                        if *source >= self.shard.range.start {
+                            return Ok(RegisterRef::Virtual(*source - self.shard.range.start));
+                        }
+                    }
+                    if let Some(reference) = external.get(register) {
+                        return Ok(*reference);
+                    }
+                    let reference = match register {
+                        Register::Weight(name) => {
+                            let position = *weights.entry(name.clone()).or_insert_with(|| {
+                                let position = expected_weights.len();
+                                expected_weights.push(self.weights[name].clone());
+                                position
+                            });
+                            RegisterRef::Weight(position)
+                        }
+                        _ => {
+                            let position = expected_inputs.len();
+                            let supplied =
+                                template.input_values.get(position).ok_or_else(|| {
+                                    BackendError::InvalidJob {
+                                        message: "template is missing an external input tensor"
+                                            .into(),
+                                    }
+                                })?;
+                            if supplied.len() != self.boundary_shapes[register] {
+                                return Err(BackendError::InvalidJob {
+                                    message: format!(
+                                        "template boundary tensor {register:?} has {}, expected {} values",
+                                        supplied.len(),
+                                        self.boundary_shapes[register]
+                                    ),
+                                });
+                            }
+                            expected_inputs.push(supplied.clone());
+                            RegisterRef::Input(position)
+                        }
+                    };
+                    external.insert(register.clone(), reference);
+                    Ok(reference)
+                })
+                .collect::<Result<Vec<_>, BackendError>>()?;
+            expected_instructions.push(AssemblerInstruction {
+                instruction: compiled.instruction.clone(),
+                inputs,
+            });
+        }
+        let expected = AssemblerProgram {
+            instructions: expected_instructions,
+            input_values: expected_inputs,
+            weight_values: expected_weights,
+        };
+        if template != expected {
+            return Err(BackendError::InvalidJob {
+                message: "assembler template does not match configured witness shard".into(),
+            });
+        }
+        let output_indices = self.public_output_indices();
+        let configured = zkie_core::program_circuit::AssemblerCircuit::new_with_public_outputs(
+            expected,
+            self.rms_norm_domains.clone(),
+            output_indices.clone(),
+        )
+        .map_err(|message| BackendError::InvalidJob { message })?;
+        let supplied = zkie_core::program_circuit::AssemblerCircuit::new_with_public_outputs(
+            template,
+            domains.clone(),
+            output_indices,
+        )
+        .map_err(|message| BackendError::InvalidJob { message })?;
+        if configured.params().shape_digest() != supplied.params().shape_digest() {
+            return Err(BackendError::InvalidJob {
+                message: "assembler domains do not match configured witness shard".into(),
+            });
+        }
+        Ok(supplied)
     }
 
     pub fn shard_identity(&self) -> &ShardIdentity {
@@ -486,6 +682,20 @@ impl ZkieIsaCpuWitnessBackend {
             return Err(BackendError::InvalidJob {
                 message: "concrete inputs contain extraneous registers".into(),
             });
+        }
+        for (register, expected_len) in &self.boundary_shapes {
+            let actual_len = match register {
+                Register::GraphInput(name) => supplied.graph_inputs[name].len(),
+                Register::Virtual(index) => supplied.virtual_inputs[index].len(),
+                Register::Weight(_) => unreachable!("manifest rejects weight registers"),
+            };
+            if actual_len != *expected_len {
+                return Err(BackendError::InvalidJob {
+                    message: format!(
+                        "boundary tensor {register:?} has {actual_len} values, expected {expected_len}"
+                    ),
+                });
+            }
         }
         validate_tensor_collection(
             supplied
@@ -782,6 +992,85 @@ impl ZkieIsaCpuWitnessBackend {
         self.decode_artifact_wire(wire)
     }
 
+    /// Reconstructs the exact shard circuit from the validated Task 4 artifact.
+    pub fn load_assembler_program(
+        &self,
+        artifact: &WitnessArtifact,
+    ) -> Result<AssemblerProgram, BackendError> {
+        self.load_assembler_program_and_public_values(artifact)
+            .map(|(program, _)| program)
+    }
+
+    /// Returns the shard program and its canonical public values in
+    /// input/weight/virtual program order.
+    pub fn load_assembler_program_and_public_values(
+        &self,
+        artifact: &WitnessArtifact,
+    ) -> Result<(AssemblerProgram, Vec<I18>), BackendError> {
+        let artifact = self.load_artifact(artifact)?;
+        let start = self.shard.range.start;
+        let mut input_values = Vec::new();
+        let mut weight_values = Vec::new();
+        let mut external = HashMap::<Register, RegisterRef>::new();
+        let mut instructions = Vec::with_capacity(self.shard.range.len());
+        for index in self.shard.range.clone() {
+            let compiled = &self.program.instructions[index];
+            let inputs = compiled
+                .inputs
+                .iter()
+                .map(|register| {
+                    if let Register::Virtual(source) = register {
+                        if *source >= start {
+                            return Ok(RegisterRef::Virtual(*source - start));
+                        }
+                    }
+                    if let Some(reference) = external.get(register) {
+                        return Ok(*reference);
+                    }
+                    let reference = match register {
+                        Register::Weight(_) => RegisterRef::Weight(weight_values.len()),
+                        _ => RegisterRef::Input(input_values.len()),
+                    };
+                    {
+                        let values = artifact.inputs.get(register).ok_or_else(|| {
+                            BackendError::MissingRegister {
+                                register: format!("{register:?}"),
+                            }
+                        })?;
+                        match register {
+                            Register::Weight(_) => weight_values.push(values.clone()),
+                            _ => input_values.push(values.clone()),
+                        }
+                    }
+                    external.insert(register.clone(), reference);
+                    Ok(reference)
+                })
+                .collect::<Result<Vec<_>, BackendError>>()?;
+            instructions.push(AssemblerInstruction {
+                instruction: compiled.instruction.clone(),
+                inputs,
+            });
+        }
+        let public_values = input_values
+            .iter()
+            .chain(&weight_values)
+            .flat_map(|tensor| tensor.iter().copied())
+            .chain(
+                self.public_output_globals()
+                    .into_iter()
+                    .flat_map(|index| artifact.virtuals[&index].iter().copied()),
+            )
+            .collect();
+        Ok((
+            AssemblerProgram {
+                instructions,
+                input_values,
+                weight_values,
+            },
+            public_values,
+        ))
+    }
+
     fn decode_artifact_wire(
         &self,
         wire: CpuWitnessArtifactWire,
@@ -909,6 +1198,23 @@ impl ZkieIsaCpuWitnessBackend {
                 Register::Virtual(index) => Some(*index),
                 _ => None,
             })
+            .collect()
+    }
+
+    fn public_output_globals(&self) -> BTreeSet<usize> {
+        self.required_outputs()
+            .into_iter()
+            .chain(
+                self.program
+                    .graph_outputs
+                    .iter()
+                    .filter_map(|(_, register)| {
+                        let Register::Virtual(index) = register else {
+                            return None;
+                        };
+                        self.shard.range.contains(index).then_some(*index)
+                    }),
+            )
             .collect()
     }
 }
@@ -1489,6 +1795,7 @@ fn derive_circuit_digest(
     domains: &HashMap<(usize, u64), RsqrtDomain>,
     weights: &HashMap<String, Vec<I18>>,
     tables: &HashMap<(usize, u64), BTreeMap<i64, I18>>,
+    boundary_shapes: &HashMap<Register, usize>,
 ) -> Digest32 {
     let mut bytes = CIRCUIT_BINDING_VERSION.to_vec();
     encode_usize(&mut bytes, shard.id);
@@ -1497,6 +1804,23 @@ fn derive_circuit_digest(
     encode_usize(&mut bytes, shard.range.end);
     encode_registers(&mut bytes, &shard.inputs);
     encode_registers(&mut bytes, &shard.outputs);
+    bytes.extend_from_slice(b"boundary-shapes-v1\0");
+    let boundary_order = boundary_register_order(program, shard);
+    encode_usize(&mut bytes, boundary_order.len());
+    for register in boundary_order {
+        match &register {
+            Register::GraphInput(name) => {
+                bytes.push(0);
+                encode_text(&mut bytes, name);
+            }
+            Register::Virtual(index) => {
+                bytes.push(1);
+                encode_usize(&mut bytes, *index);
+            }
+            Register::Weight(_) => unreachable!(),
+        }
+        encode_usize(&mut bytes, boundary_shapes[&register]);
+    }
     for (index, compiled) in program.instructions[shard.range.clone()].iter().enumerate() {
         encode_usize(&mut bytes, shard.range.start + index);
         encode_instruction(&mut bytes, &compiled.instruction);
@@ -1541,6 +1865,20 @@ fn derive_circuit_digest(
         }
     }
     Digest32::new(*blake3::hash(&bytes).as_bytes())
+}
+
+fn boundary_register_order(program: &CompiledProgram, shard: &Shard) -> Vec<Register> {
+    let mut seen = HashSet::new();
+    program.instructions[shard.range.clone()]
+        .iter()
+        .flat_map(|instruction| &instruction.inputs)
+        .filter(|register| {
+            !matches!(register, Register::Weight(_))
+                && !matches!(register, Register::Virtual(index) if shard.range.contains(index))
+                && seen.insert((*register).clone())
+        })
+        .cloned()
+        .collect()
 }
 
 fn encode_usize(bytes: &mut Vec<u8>, value: usize) {

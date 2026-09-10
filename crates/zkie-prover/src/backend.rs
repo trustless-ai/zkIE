@@ -248,14 +248,20 @@ pub struct PrepareJob {
     run_identity: RunIdentity,
     shard: ShardIdentity,
     circuit_k: u32,
-    key_identity: KeyIdentity,
+    key_identity: Option<KeyIdentity>,
+    require_production: bool,
 }
 #[derive(Deserialize)]
 struct PrepareJobWire {
     run_identity: RunIdentity,
     shard: ShardIdentity,
     circuit_k: u32,
-    key_identity: KeyIdentity,
+    key_identity: Option<KeyIdentity>,
+    #[serde(default = "default_true")]
+    require_production: bool,
+}
+fn default_true() -> bool {
+    true
 }
 impl PrepareJob {
     pub fn new(
@@ -264,9 +270,35 @@ impl PrepareJob {
         circuit_k: u32,
         key_identity: KeyIdentity,
     ) -> Result<Self, BackendError> {
+        Self::new_with_provenance(run_identity, shard, circuit_k, Some(key_identity), true)
+    }
+    pub fn new_development(
+        run_identity: RunIdentity,
+        shard: ShardIdentity,
+        circuit_k: u32,
+        key_identity: KeyIdentity,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_provenance(run_identity, shard, circuit_k, Some(key_identity), false)
+    }
+    pub fn new_development_generate(
+        run_identity: RunIdentity,
+        shard: ShardIdentity,
+        circuit_k: u32,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_provenance(run_identity, shard, circuit_k, None, false)
+    }
+    fn new_with_provenance(
+        run_identity: RunIdentity,
+        shard: ShardIdentity,
+        circuit_k: u32,
+        key_identity: Option<KeyIdentity>,
+        require_production: bool,
+    ) -> Result<Self, BackendError> {
         if circuit_k == 0
-            || run_identity.proof_flavor != key_identity.proof_flavor
-            || shard.circuit_digest() != key_identity.circuit_digest
+            || key_identity.as_ref().is_some_and(|identity| {
+                run_identity.proof_flavor != identity.proof_flavor
+                    || shard.circuit_digest() != identity.circuit_digest
+            })
         {
             return Err(BackendError::InvalidJob {
                 message: "invalid prepare identity".into(),
@@ -277,6 +309,7 @@ impl PrepareJob {
             shard,
             circuit_k,
             key_identity,
+            require_production,
         })
     }
     pub fn run_identity(&self) -> &RunIdentity {
@@ -288,14 +321,23 @@ impl PrepareJob {
     pub fn circuit_k(&self) -> u32 {
         self.circuit_k
     }
-    pub fn key_identity(&self) -> &KeyIdentity {
-        &self.key_identity
+    pub fn key_identity(&self) -> Option<&KeyIdentity> {
+        self.key_identity.as_ref()
+    }
+    pub fn requires_production(&self) -> bool {
+        self.require_production
     }
 }
 impl TryFrom<PrepareJobWire> for PrepareJob {
     type Error = BackendError;
     fn try_from(w: PrepareJobWire) -> Result<Self, Self::Error> {
-        Self::new(w.run_identity, w.shard, w.circuit_k, w.key_identity)
+        Self::new_with_provenance(
+            w.run_identity,
+            w.shard,
+            w.circuit_k,
+            w.key_identity,
+            w.require_production,
+        )
     }
 }
 impl<'de> Deserialize<'de> for PrepareJob {
@@ -571,6 +613,7 @@ pub struct VerificationExpectation {
     proof_flavor: ProofFlavorId,
     execution_backend: ExecutionBackendId,
     shard: ShardIdentity,
+    witness_artifact_digest: Digest32,
 }
 impl VerificationExpectation {
     pub fn from_proof_job(
@@ -597,6 +640,7 @@ impl VerificationExpectation {
             proof_flavor: job.run_identity.proof_flavor.clone(),
             execution_backend,
             shard: job.shard.clone(),
+            witness_artifact_digest: job.witness.digest(),
         })
     }
 }
@@ -629,6 +673,7 @@ pub struct CryptoVerificationRequest {
     proof: Arc<UnverifiedProof>,
     proof_bytes: Vec<u8>,
     verification_key: KeyIdentity,
+    expected_witness_artifact_digest: Digest32,
 }
 impl CryptoVerificationRequest {
     pub fn proof_bytes(&self) -> &[u8] {
@@ -642,6 +687,9 @@ impl CryptoVerificationRequest {
     }
     pub fn verification_key(&self) -> &KeyIdentity {
         &self.verification_key
+    }
+    pub fn expected_witness_artifact_digest(&self) -> Digest32 {
+        self.expected_witness_artifact_digest
     }
     pub fn circuit_digest(&self) -> Digest32 {
         self.proof.circuit_digest
@@ -680,6 +728,7 @@ impl CryptoVerificationRequest {
             self.proof.verification_key_digest,
             self.proof.run_identity_digest,
             self.verification_key.key_digest,
+            self.expected_witness_artifact_digest,
         ] {
             h.update(d.as_bytes());
         }
@@ -697,12 +746,14 @@ struct CryptoVerificationRequestWire {
     proof: UnverifiedProof,
     proof_bytes: Vec<u8>,
     verification_key: KeyIdentity,
+    expected_witness_artifact_digest: Digest32,
 }
 impl CryptoVerificationRequest {
-    fn new(
+    pub(crate) fn new(
         proof: Arc<UnverifiedProof>,
         proof_bytes: Vec<u8>,
         verification_key: KeyIdentity,
+        expected_witness_artifact_digest: Digest32,
     ) -> Result<Self, BackendError> {
         valid_bytes(&proof_bytes)?;
         if proof_bytes.is_empty()
@@ -719,14 +770,20 @@ impl CryptoVerificationRequest {
             proof,
             proof_bytes,
             verification_key,
+            expected_witness_artifact_digest,
         })
     }
 }
 impl<'de> Deserialize<'de> for CryptoVerificationRequest {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         CryptoVerificationRequestWire::deserialize(d).and_then(|w| {
-            Self::new(Arc::new(w.proof), w.proof_bytes, w.verification_key)
-                .map_err(serde::de::Error::custom)
+            Self::new(
+                Arc::new(w.proof),
+                w.proof_bytes,
+                w.verification_key,
+                w.expected_witness_artifact_digest,
+            )
+            .map_err(serde::de::Error::custom)
         })
     }
 }
@@ -859,6 +916,7 @@ pub fn verify_proof(
             e.verification_key_digest,
         )
         .map_err(|_| VerificationError::MalformedProofArtifact)?,
+        e.witness_artifact_digest,
     )
     .map_err(|_| VerificationError::MalformedProofArtifact)?;
     let binding = pre.request_binding_digest();
@@ -1004,6 +1062,16 @@ pub enum BackendError {
     ShapeMismatch { instruction: usize, message: String },
     #[error("instruction {instruction} arithmetic overflow: {message}")]
     ArithmeticOverflow { instruction: usize, message: String },
+    #[error("private-model proving is unsupported by this backend")]
+    UnsupportedModelVisibility,
+    #[error("missing SRS at {path}")]
+    MissingSrs { path: PathBuf },
+    #[error("SRS source digest mismatch")]
+    SrsDigestMismatch,
+    #[error("development SRS cannot satisfy a production job")]
+    NonProductionSrs,
+    #[error("key metadata mismatch: {message}")]
+    KeyMetadataMismatch { message: String },
 }
 #[non_exhaustive]
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]

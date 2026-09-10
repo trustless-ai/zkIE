@@ -1149,9 +1149,14 @@ name = "zkie-prover"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "halo2_proofs",
+ "libc",
+ "rand_core",
  "serde",
  "serde_json",
  "thiserror",
+ "zkie-compiler",
+ "zkie-core",
  "zkie-types",
 ]
 

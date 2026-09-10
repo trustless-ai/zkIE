@@ -993,6 +993,17 @@ pub enum BackendError {
     MissingKey { identity: KeyIdentity },
     #[error("unsupported instruction: {message}")]
     UnsupportedInstruction { message: String },
+    #[error("missing register {register}")]
+    MissingRegister { register: String },
+    #[error("instruction {instruction} has forward register {register}")]
+    ForwardRegister {
+        instruction: usize,
+        register: String,
+    },
+    #[error("instruction {instruction} shape mismatch: {message}")]
+    ShapeMismatch { instruction: usize, message: String },
+    #[error("instruction {instruction} arithmetic overflow: {message}")]
+    ArithmeticOverflow { instruction: usize, message: String },
 }
 #[non_exhaustive]
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]

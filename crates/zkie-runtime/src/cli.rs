@@ -6,9 +6,12 @@
 
 use thiserror::Error;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::{JobKind, JobRecord, JobState, MemoryLimits, MonitorError, DEFAULT_AGING_SECONDS};
+use crate::{
+    ArtifactStore, JobKind, JobRecord, JobState, KeyStore, MemoryLimits, MonitorError, RunDb,
+    DEFAULT_AGING_SECONDS,
+};
 
 /// One GiB in bytes, exactly as the scheduler and monitor count it.
 pub const GIB: u64 = 1_073_741_824;
@@ -281,4 +284,72 @@ pub fn schedulable_kinds() -> [JobKind; 5] {
 /// Aging window used when the caller does not override it.
 pub fn default_aging_seconds() -> i64 {
     DEFAULT_AGING_SECONDS
+}
+
+/// Result of re-checking every verified object of a run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub verified: usize,
+    pub failures: Vec<String>,
+}
+
+impl VerifyReport {
+    pub fn is_clean(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Re-opens every verified artifact and key of a run and re-derives its identity.
+///
+/// This is the `verify` command: it never trusts the stored row alone, it re-opens the
+/// content-addressed object and re-checks the digest, size, metadata and attestation
+/// against the persisted identity before reporting success.
+pub fn verify_run(run_dir: &Path) -> Result<VerifyReport, String> {
+    let Some(run_id) = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+    else {
+        return Err("run directory must have a name".to_owned());
+    };
+    let database = run_dir.join("run.sqlite");
+    if !database.is_file() {
+        return Err(format!("no run database at {}", database.display()));
+    }
+    let artifact_root = run_dir.join("artifacts");
+    let key_root = run_dir.join("keys");
+    if !artifact_root.is_dir() || !key_root.is_dir() {
+        return Err(format!(
+            "run directory {} is missing its artifact or key store",
+            run_dir.display()
+        ));
+    }
+    let db = RunDb::open(&database, run_id).map_err(|error| error.to_string())?;
+    let artifacts = ArtifactStore::open(&artifact_root).map_err(|error| error.to_string())?;
+    let keys = KeyStore::open(&key_root).map_err(|error| error.to_string())?;
+
+    let mut report = VerifyReport::default();
+    for record in db.jobs().map_err(|error| error.to_string())? {
+        if record.state != JobState::Verified {
+            continue;
+        }
+        let reopened = match record.kind {
+            JobKind::Prepare => db
+                .reopen_key_for_job(&keys, &record.id)
+                .map(|file| file.is_some()),
+            _ => db
+                .reopen_artifact_for_job(&artifacts, &record.id)
+                .map(|file| file.is_some()),
+        };
+        match reopened {
+            Ok(true) => report.verified += 1,
+            Ok(false) => report
+                .failures
+                .push(format!("{} has no stored object", record.logical_job_id)),
+            Err(error) => report
+                .failures
+                .push(format!("{}: {error}", record.logical_job_id)),
+        }
+    }
+    Ok(report)
 }

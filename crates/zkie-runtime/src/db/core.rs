@@ -81,6 +81,11 @@ impl RunDb {
         })
     }
 
+    /// The run this handle is bound to. Every job id is namespaced by it.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     pub fn schema_version(&self) -> Result<u32, DbError> {
         let value: i64 =
             self.connection

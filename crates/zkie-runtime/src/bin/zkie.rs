@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use zkie_runtime::{
-    default_aging_seconds, overall_state, parse_args, render_status, CliCommand, RunConfig, RunDb,
-    WorkerMeasurements, WorkerOutcome, WorkerResult, WorkerSpec,
+    default_aging_seconds, overall_state, parse_args, render_status, verify_run, CliCommand,
+    RunConfig, RunDb, WorkerMeasurements, WorkerOutcome, WorkerResult, WorkerSpec,
 };
 
 fn main() -> ExitCode {
@@ -34,9 +34,10 @@ fn main() -> ExitCode {
 fn execute(command: CliCommand, config: &RunConfig) -> Result<(), String> {
     match command {
         CliCommand::Status => status(config),
+        CliCommand::Verify => verify(config),
         CliCommand::Worker => worker(config),
         other => Err(format!(
-            "`{}` is not wired to the queue engine yet",
+            "`{}` still needs the proving backend registry from zkie-prover",
             other.as_str()
         )),
     }
@@ -73,6 +74,27 @@ fn worker(config: &RunConfig) -> Result<(), String> {
     match result.outcome {
         WorkerOutcome::Succeeded => Ok(()),
         WorkerOutcome::Failed { code } => Err(format!("worker failed: {code}")),
+    }
+}
+
+/// Re-opens every verified object of the run and re-checks it against the database.
+fn verify(config: &RunConfig) -> Result<(), String> {
+    let run_dir = config
+        .run_dir
+        .as_deref()
+        .ok_or_else(|| "verify requires --run-dir".to_owned())?;
+    let report = verify_run(run_dir)?;
+    println!("verified: {}", report.verified);
+    for failure in &report.failures {
+        println!("failure: {failure}");
+    }
+    if report.is_clean() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} object(s) failed re-verification",
+            report.failures.len()
+        ))
     }
 }
 

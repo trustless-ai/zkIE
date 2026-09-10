@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use zkie_types::{ResourceCapacity, ResourceRequest};
 
-use crate::{DbError, JobId, JobState, RunDb};
+use crate::{DbError, JobId, JobState, MemoryAction, RunDb};
 
 pub const DEFAULT_AGING_SECONDS: i64 = 600;
 
@@ -67,6 +67,28 @@ pub struct Scheduler<C> {
 impl<C: SchedulerClock> Scheduler<C> {
     pub fn new(config: SchedulerConfig, clock: C) -> Self {
         Self { config, clock }
+    }
+
+    /// Admission-controlled variant of [`Scheduler::decide`].
+    ///
+    /// While the memory monitor reports a breach of the admission budget the scheduler
+    /// selects no new work; running workers are left untouched, and the next decision
+    /// after memory drops back below the budget resumes normal best-fit selection.
+    pub fn decide_with_memory(
+        &self,
+        db: &mut RunDb,
+        candidates: &[SchedulableJob],
+        available: ResourceCapacity,
+        memory: MemoryAction,
+    ) -> Result<SchedulerDecision, SchedulerError> {
+        if memory != MemoryAction::Admit {
+            return Ok(SchedulerDecision {
+                selected: Vec::new(),
+                remaining: available,
+                reserved_for: None,
+            });
+        }
+        self.decide(db, candidates, available)
     }
 
     pub fn decide(

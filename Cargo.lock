@@ -1121,7 +1121,9 @@ dependencies = [
  "prost-build",
  "protobuf-src",
  "rand_core",
+ "serde_json",
  "zkie-core",
+ "zkie-prover",
 ]
 
 [[package]]

@@ -70,6 +70,19 @@ fn linear_layer_program() -> AssemblerProgram {
     }
 }
 
+fn runtime_public_instances() -> Vec<Vec<Vec<Fr>>> {
+    let program = linear_layer_program();
+    let values = program
+        .input_values
+        .iter()
+        .chain(&program.weight_values)
+        .flat_map(|tensor| tensor.iter().copied())
+        .chain([i18(0.725), i18(-0.2), i18(0.1), i18(0.425)])
+        .map(|value| zkie_core::field_convert::i64_to_fr(value.raw()))
+        .collect();
+    vec![vec![values]]
+}
+
 #[derive(Clone)]
 struct LinearLayerCircuit {
     program: AssemblerProgram,
@@ -159,11 +172,12 @@ fn runtime_assembler_keys_from_unknown_witnesses_prove_the_witnessed_layout() {
         keygen_pk(&params, vk.clone(), &blank).expect("blank circuit keygen_pk should succeed");
 
     let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+    let instances = runtime_public_instances();
     create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
         &params,
         &pk,
         &[circuit],
-        &[vec![]],
+        instances.as_slice(),
         &mut rng,
         &mut transcript,
     )
@@ -178,7 +192,7 @@ fn runtime_assembler_keys_from_unknown_witnesses_prove_the_witnessed_layout() {
             &verifier_params,
             &vk,
             strategy,
-            &[vec![]],
+            instances.as_slice(),
             &mut verifier_transcript,
         )
         .is_ok()

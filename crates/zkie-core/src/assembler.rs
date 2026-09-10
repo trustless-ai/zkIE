@@ -104,7 +104,9 @@ use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNE
 use crate::fixed_point::{requantize_mul, requantize_raw, FixedPointError, I18, SCALE_18};
 use crate::isa::{EltwiseOp, Instruction};
 use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
-use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
+use halo2_proofs::plonk::{
+    Advice, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector,
+};
 use halo2_proofs::poly::Rotation;
 
 /// Identifies where an [`AssemblerInstruction`]'s input value comes from --
@@ -126,7 +128,7 @@ pub enum RegisterRef {
 /// The instruction's own program-order index (implicit -- its position in
 /// [`AssemblerProgram::instructions`]) is what later instructions reference
 /// via `RegisterRef::Virtual`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblerInstruction {
     pub instruction: Instruction,
     pub inputs: Vec<RegisterRef>,
@@ -137,7 +139,7 @@ pub struct AssemblerInstruction {
 /// element weights/inputs (e.g. a whole weight matrix) are represented as a
 /// single flat vector, with `Instruction`-specific shape parameters (e.g.
 /// `DotGeneral`'s `m`/`n`/`k`) determining how the assembler indexes into it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblerProgram {
     pub instructions: Vec<AssemblerInstruction>,
     pub input_values: Vec<Vec<I18>>,
@@ -323,6 +325,7 @@ pub struct AssemblerConfig {
     bridge_unshifted: Column<Advice>,
     bridge_shifted: Column<Advice>,
     s_bridge: Selector,
+    pub(crate) public_instance: Option<Column<Instance>>,
 }
 
 /// Default `rsqrt` lookup domain used by [`AssemblerChip::configure`] (which
@@ -375,6 +378,23 @@ impl AssemblerChip {
         meta: &mut ConstraintSystem<Fr>,
         instructions: &[AssemblerInstruction],
         rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
+    ) -> AssemblerConfig {
+        Self::configure_internal(meta, instructions, rms_norm_domains, false)
+    }
+
+    pub fn configure_with_rms_norm_domains_and_public_instances(
+        meta: &mut ConstraintSystem<Fr>,
+        instructions: &[AssemblerInstruction],
+        rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
+    ) -> AssemblerConfig {
+        Self::configure_internal(meta, instructions, rms_norm_domains, true)
+    }
+
+    fn configure_internal(
+        meta: &mut ConstraintSystem<Fr>,
+        instructions: &[AssemblerInstruction],
+        rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
+        expose_public_instances: bool,
     ) -> AssemblerConfig {
         // Shared `bits` column across every composed chip's internal range
         // checks -- safe because `RangeCheckChip::configure` creates a fresh,
@@ -499,6 +519,11 @@ impl AssemblerChip {
         let bridge_shifted = meta.advice_column();
         meta.enable_equality(bridge_unshifted);
         meta.enable_equality(bridge_shifted);
+        let public_instance = expose_public_instances.then(|| {
+            let instance = meta.instance_column();
+            meta.enable_equality(instance);
+            instance
+        });
 
         // shifted == unshifted + SIGNED_SHIFT. Reused (like `RangeCheckChip`'s
         // columns) across every register boundary that needs bridging -- see
@@ -521,6 +546,7 @@ impl AssemblerChip {
             bridge_unshifted,
             bridge_shifted,
             s_bridge,
+            public_instance,
         }
     }
 

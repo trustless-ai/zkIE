@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 blake3 = "1"
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0", features = ["circuit-params"] }
 libc = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive", "rc"] }
@@ -16,5 +17,4 @@ zkie-types = { path = "../zkie-types" }
 
 [dev-dependencies]
 blake3 = "1"
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0", features = ["circuit-params"] }
 serde_json = "1"

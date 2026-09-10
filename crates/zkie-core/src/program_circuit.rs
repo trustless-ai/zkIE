@@ -18,18 +18,21 @@ pub struct AssemblerCircuitParams {
     pub rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
     input_shapes: Vec<usize>,
     weight_shapes: Vec<usize>,
+    public_output_indices: Vec<usize>,
 }
 
 impl AssemblerCircuitParams {
     fn from_program(
         program: &AssemblerProgram,
         rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
+        public_output_indices: Vec<usize>,
     ) -> Self {
         Self {
             instructions: program.instructions.clone(),
             rms_norm_domains,
             input_shapes: program.input_values.iter().map(Vec::len).collect(),
             weight_shapes: program.weight_values.iter().map(Vec::len).collect(),
+            public_output_indices,
         }
     }
 
@@ -40,9 +43,11 @@ impl AssemblerCircuitParams {
     }
 
     fn canonical_shape_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"zkie.assembler-circuit-shape.v1\0".to_vec();
+        let mut bytes = b"zkie.assembler-circuit-shape.v2\0".to_vec();
+        bytes.extend_from_slice(b"public-instances-v1:inputs,weights,selected-outputs\0");
         encode_usizes(&mut bytes, &self.input_shapes);
         encode_usizes(&mut bytes, &self.weight_shapes);
+        encode_usizes(&mut bytes, &self.public_output_indices);
         encode_usize(&mut bytes, self.instructions.len());
         for instruction in &self.instructions {
             encode_instruction(&mut bytes, instruction);
@@ -177,12 +182,39 @@ impl AssemblerCircuit {
         program: AssemblerProgram,
         rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
     ) -> Self {
-        let params = AssemblerCircuitParams::from_program(&program, rms_norm_domains);
-        Self {
+        let public_output_indices = program
+            .instructions
+            .len()
+            .checked_sub(1)
+            .into_iter()
+            .collect();
+        Self::new_with_public_outputs(program, rms_norm_domains, public_output_indices)
+            .expect("default final output layout is valid")
+    }
+
+    pub fn new_with_public_outputs(
+        program: AssemblerProgram,
+        rms_norm_domains: HashMap<(usize, u64), RsqrtDomain>,
+        public_output_indices: Vec<usize>,
+    ) -> Result<Self, String> {
+        if public_output_indices
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || public_output_indices
+                .iter()
+                .any(|index| *index >= program.instructions.len())
+        {
+            return Err(
+                "public output indices must be strictly sorted, unique, and in range".into(),
+            );
+        }
+        let params =
+            AssemblerCircuitParams::from_program(&program, rms_norm_domains, public_output_indices);
+        Ok(Self {
             params,
             program,
             has_known_witnesses: true,
-        }
+        })
     }
 
     pub fn empty() -> Self {
@@ -226,7 +258,7 @@ impl Circuit<Fr> for AssemblerCircuit {
         meta: &mut ConstraintSystem<Fr>,
         params: Self::Params,
     ) -> Self::Config {
-        AssemblerChip::configure_with_rms_norm_domains(
+        AssemblerChip::configure_with_rms_norm_domains_and_public_instances(
             meta,
             &params.instructions,
             &params.rms_norm_domains,
@@ -242,15 +274,33 @@ impl Circuit<Fr> for AssemblerCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
+        let public_instance = config
+            .public_instance
+            .expect("AssemblerCircuit always configures public instances");
         let chip = AssemblerChip::construct(config);
         chip.load_rms_norm_tables(layouter.namespace(|| "assembler rms norm tables"))?;
-        chip.assign_with_cells_with_witnesses(
-            layouter.namespace(|| "assembler program"),
-            &self.program,
-            self.has_known_witnesses,
-        )
-        .map(|_| ())
-        .map_err(|_| ErrorFront::Synthesis)
+        let assigned = chip
+            .assign_with_cells_with_witnesses(
+                layouter.namespace(|| "assembler program"),
+                &self.program,
+                self.has_known_witnesses,
+            )
+            .map_err(|_| ErrorFront::Synthesis)?;
+        let mut offset = 0;
+        for tensor in assigned.inputs.iter().chain(&assigned.weights) {
+            for cell in &tensor.cells {
+                layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                offset += 1;
+            }
+        }
+        for index in &self.params.public_output_indices {
+            let tensor = assigned.virtuals.get(*index).ok_or(ErrorFront::Synthesis)?;
+            for cell in &tensor.cells {
+                layouter.constrain_instance(cell.cell(), public_instance, offset)?;
+                offset += 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -284,13 +334,28 @@ mod tests {
         }
     }
 
+    fn dot_instances(k: usize) -> Vec<Vec<Fr>> {
+        let one = crate::field_convert::i64_to_fr(1_000_000_000_000_000_000);
+        let output =
+            crate::field_convert::i64_to_fr(i64::try_from(k).unwrap() * 1_000_000_000_000_000_000);
+        vec![(0..k)
+            .map(|_| one)
+            .chain((0..k).map(|_| one))
+            .chain([output])
+            .collect()]
+    }
+
     #[test]
     fn runtime_params_configure_distinct_program_shapes() {
         let k2 = AssemblerCircuit::new(dot_program(2), Default::default());
         let k3 = AssemblerCircuit::new(dot_program(3), Default::default());
 
-        MockProver::run(10, &k2, vec![]).unwrap().assert_satisfied();
-        MockProver::run(10, &k3, vec![]).unwrap().assert_satisfied();
+        MockProver::run(10, &k2, dot_instances(2))
+            .unwrap()
+            .assert_satisfied();
+        MockProver::run(10, &k3, dot_instances(3))
+            .unwrap()
+            .assert_satisfied();
         assert_ne!(k2.params().shape_digest(), k3.params().shape_digest());
     }
 
@@ -308,6 +373,37 @@ mod tests {
         assert_eq!(blank.program.input_values[0].len(), 2);
         assert_eq!(blank.program.weight_values.len(), 1);
         assert_eq!(blank.program.weight_values[0].len(), 2);
+    }
+
+    #[test]
+    fn public_output_selection_is_validated_and_shape_bound() {
+        let mut program = dot_program(2);
+        program.instructions.push(AssemblerInstruction {
+            instruction: Instruction::Eltwise {
+                op: crate::isa::EltwiseOp::Add,
+            },
+            inputs: vec![RegisterRef::Virtual(0), RegisterRef::Virtual(0)],
+        });
+        let first =
+            AssemblerCircuit::new_with_public_outputs(program.clone(), Default::default(), vec![0])
+                .unwrap();
+        let second =
+            AssemblerCircuit::new_with_public_outputs(program.clone(), Default::default(), vec![1])
+                .unwrap();
+        assert_ne!(
+            first.params().shape_digest(),
+            second.params().shape_digest()
+        );
+        assert!(AssemblerCircuit::new_with_public_outputs(
+            program.clone(),
+            Default::default(),
+            vec![0, 0]
+        )
+        .is_err());
+        assert!(
+            AssemblerCircuit::new_with_public_outputs(program, Default::default(), vec![2])
+                .is_err()
+        );
     }
 
     #[test]

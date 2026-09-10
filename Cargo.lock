@@ -1124,6 +1124,7 @@ dependencies = [
  "serde_json",
  "zkie-core",
  "zkie-prover",
+ "zkie-types",
 ]
 
 [[package]]

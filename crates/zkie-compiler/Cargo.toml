@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 zkie-core = { path = "../zkie-core" }
+zkie-types = { path = "../zkie-types" }
 prost = "0.13"
 blake3 = "1"
 

@@ -4,6 +4,7 @@ pub mod chips;
 pub mod field_convert;
 pub mod fixed_point;
 pub mod isa;
+pub mod program_circuit;
 pub mod tensor;
 
 #[cfg(test)]

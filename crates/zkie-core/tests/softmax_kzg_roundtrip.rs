@@ -34,6 +34,8 @@ struct SoftmaxCircuit {
 }
 
 impl Circuit<Fr> for SoftmaxCircuit {
+    type Params = ();
+
     type Config = SoftmaxCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

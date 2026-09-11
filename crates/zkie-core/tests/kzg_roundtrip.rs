@@ -28,6 +28,8 @@ struct AddCircuit {
 }
 
 impl Circuit<Fr> for AddCircuit {
+    type Params = ();
+
     type Config = AddCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -70,6 +72,8 @@ struct MulCircuit {
 }
 
 impl Circuit<Fr> for MulCircuit {
+    type Params = ();
+
     type Config = MulCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

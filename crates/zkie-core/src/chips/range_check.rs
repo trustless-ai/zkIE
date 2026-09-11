@@ -111,6 +111,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for TestCircuit {
+        type Params = ();
+
         type Config = TestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -199,6 +201,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for WideTestCircuit {
+        type Params = ();
+
         type Config = WideTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 

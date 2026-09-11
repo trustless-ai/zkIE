@@ -28,6 +28,8 @@ struct DotCircuit {
 }
 
 impl Circuit<Fr> for DotCircuit {
+    type Params = ();
+
     type Config = DotCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

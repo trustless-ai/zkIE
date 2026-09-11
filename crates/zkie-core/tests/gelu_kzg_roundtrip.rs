@@ -37,6 +37,8 @@ struct GeluCircuit {
 }
 
 impl Circuit<Fr> for GeluCircuit {
+    type Params = ();
+
     type Config = GeluCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

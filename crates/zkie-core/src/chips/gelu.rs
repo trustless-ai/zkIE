@@ -235,6 +235,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for GeluTestCircuit {
+        type Params = ();
+
         type Config = GeluTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -311,6 +313,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedOutputCircuit {
+            type Params = ();
+
             type Config = GeluTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

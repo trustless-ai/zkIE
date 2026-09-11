@@ -5,8 +5,10 @@
 
 pub mod linker;
 pub mod model;
+pub mod partition;
 pub mod prover;
 
 pub use linker::{link, LinkError};
-pub use model::{build_dag, BuildDagError, Dag, Edge, EdgeKind, Shard, ShardSpec};
+pub use model::{build_dag, BuildDagError, Dag, Edge, EdgeId, EdgeKind, Shard, ShardSpec};
+pub use partition::*;
 pub use prover::{Commitment, MockProver, Prover, ShardProof, Witness};

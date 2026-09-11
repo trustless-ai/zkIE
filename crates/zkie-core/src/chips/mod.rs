@@ -7,6 +7,7 @@ pub mod layer_norm;
 pub mod lookup;
 pub mod lookup_range_check;
 pub mod patch_embed;
+pub mod poseidon_boundary;
 pub mod range_check;
 pub mod reduce;
 pub mod rms_norm;

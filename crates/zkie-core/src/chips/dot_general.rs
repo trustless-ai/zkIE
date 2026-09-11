@@ -423,6 +423,8 @@ mod tests {
     }
 
     impl Circuit<Fr> for DotTestCircuit {
+        type Params = ();
+
         type Config = DotTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -516,6 +518,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
+            type Params = ();
+
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -569,6 +573,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedDotCircuit {
+            type Params = ();
+
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -683,6 +689,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Params = ();
+
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -849,6 +857,8 @@ mod tests {
         }
 
         impl Circuit<Fr> for OutOfRangeOperandCircuit {
+            type Params = ();
+
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

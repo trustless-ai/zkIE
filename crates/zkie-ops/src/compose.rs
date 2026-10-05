@@ -2683,6 +2683,64 @@ mod tests {
     /// Layernorm, Projection (two outputs), MatMul, Transpose, Softmax (two
     /// outputs), GeluIndex and Add. Reusing the existing builder rather than
     /// hand-rolling a graph means the test tracks the real op set as it grows.
+    /// Where is a proof's size? Reported per granularity, because shard count
+    /// drives both the number of cross-shard bindings and the claim vectors.
+    ///
+    /// Not an assertion about absolute size — the fixture is one small layer.
+    /// It asserts the *accounting* holds and prints the breakdown, so the shape
+    /// is visible and a refactor that moves size between buckets shows up.
+    /// Run with: cargo test -p zkie-ops --lib proof_size_breakdown -- --nocapture
+    #[test]
+    fn proof_size_breakdown_by_granularity() {
+        use crate::proof_size::shard_dag_proof_size;
+        let (store0, ops) = real_layer_graph();
+        println!("\n  ops in graph: {}", ops.len());
+        println!("  {:>10} {:>7} {:>10} {:>10} {:>10} {:>10} {:>12}",
+                 "ops/shard", "shards", "op_fe", "claims_fe", "binds_fe", "cross_fe", "total_bytes");
+        let mut prev_total = 0usize;
+        for per in [ops.len(), 8usize, 4, 2, 1] {
+            let mut store = Store { v: store0.v.clone(), idx: store0.idx.clone() };
+            let mut rng = XorShift64::new(0x5132);
+            let proof = prove_shard_dag(&mut store, &ops, per, &mut rng);
+            let s = shard_dag_proof_size(&proof);
+            println!("  {:>10} {:>7} {:>10} {:>10} {:>10} {:>10} {:>12}",
+                     per, s.shards, s.op_proof_fe, s.claims_fe, s.shard_binds_fe,
+                     s.cross_binds_fe, s.total_bytes());
+            // the accounting must close
+            assert_eq!(s.total_fe(),
+                       s.op_proof_fe + s.claims_fe + s.shard_binds_fe + s.cross_binds_fe);
+            assert!(s.op_proof_fe > 0, "a real graph must have op proofs");
+            assert!(s.claims_fe > 0, "a real graph must emit claims");
+            assert_eq!(s.count_by_op.values().sum::<usize>(), ops.len(),
+                       "every op must be counted exactly once");
+            // MEASURED, and it refuted the guess this test was written to check:
+            // proof size is essentially INVARIANT in granularity. within-shard
+            // `binds` and cross-shard `cross_binds` trade off almost exactly, so
+            // the total moves by ~1%, and one-op shards cost the same as one big
+            // shard. Pinned so a change in that behaviour is visible.
+            if prev_total > 0 {
+                let lo = prev_total.min(s.total_fe()) as f64;
+                let hi = prev_total.max(s.total_fe()) as f64;
+                assert!(hi / lo < 1.05,
+                        "granularity should barely move proof size; got {prev_total} vs {}", s.total_fe());
+            }
+            prev_total = s.total_fe();
+        }
+        // and the per-op view, at the coarsest granularity
+        let mut store = Store { v: store0.v.clone(), idx: store0.idx.clone() };
+        let mut rng = XorShift64::new(0x5132);
+        let proof = prove_shard_dag(&mut store, &ops, ops.len(), &mut rng);
+        let s = shard_dag_proof_size(&proof);
+        println!("\n  per op type, whole graph as one shard:");
+        let mut rows: Vec<_> = s.fe_by_op.iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+        for (name, fe) in rows {
+            let n = s.count_by_op.get(*name).copied().unwrap_or(0);
+            println!("    {:<20} {:>3} ops  {:>9} fe  {:>8} fe/op", name, n, fe,
+                     if n > 0 { fe / n } else { 0 });
+        }
+    }
+
     fn real_layer_graph() -> (Store, Vec<Op>) {
         let mut rng = XorShift64::new(0x09501);
         let (m, d, ffn, heads, shift) = (4usize, 8usize, 16usize, 2usize, 8u32);

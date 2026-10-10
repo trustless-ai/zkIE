@@ -4,9 +4,10 @@
 
 use std::fs;
 
-use zkie_ops::compose::{causal_mask, prove_shard_dag, verify_shard_dag, Op, Store};
+use zkie_ops::compose::{causal_mask, prove_committed_shard_dag, verify_committed_shard_dag, Op, Store};
 use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::{from_i32, to_i32, to_i64};
+use zkie_core::pcs::whir::Whir;
 
 const D: usize = 1024;
 const FFN: usize = 4096;
@@ -14,16 +15,6 @@ const HEADS: usize = 12;
 const DH: usize = 64;
 const LAYERS: usize = 12;
 const N_REAL: usize = 768;
-
-fn peak_rss_kb() -> u64 {
-    let s = fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in s.lines() {
-        if let Some(v) = line.strip_prefix("VmHWM:") {
-            return v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
-        }
-    }
-    0
-}
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -164,7 +155,7 @@ fn build_layer(
 }
 
 fn main() {
-    let (m, shift) = (16usize, 16u32);
+    let (m, shift) = (512usize, 16u32);
     let dir = "models/gpt2/weights";
 
     let exp_table = load_i32("models/gpt2/weights/exp_table_i32.bin");
@@ -197,16 +188,17 @@ fn main() {
     let logits = store.push(vec![]);
     ops.push(Op::MatMul { a: h_final, b: lm_w_t, c: logits, m, k: D, n: 65536 });
 
-    let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));
+    let gt = load_i32(&format!("{dir}/gt_argmax_512_i32.bin"));
 
     // WholeModel (~1 shard) and Layers(1) (176 ops/layer -> 13 shards).
-    for ops_per_shard in [ops.len(), 176usize] {
+    for ops_per_shard in [176usize] {
         let mut rng = XorShift64::new(0xBEEF);
         let t0 = std::time::Instant::now();
-        let proof = prove_shard_dag(&mut store, &ops, ops_per_shard, &mut rng);
+        let whir = Whir::new_testing(19);
+        let proof = prove_committed_shard_dag(&mut store, &ops, ops_per_shard, &whir, &mut rng);
         let prove_t = t0.elapsed();
         let t1 = std::time::Instant::now();
-        assert!(verify_shard_dag(&mut store, &ops, ops_per_shard, &proof), "sharded proof failed");
+        assert!(verify_committed_shard_dag(&mut store, &ops, ops_per_shard, &whir, &proof), "sharded proof failed");
         let verify_t = t1.elapsed();
 
         let logits = store.get(logits);
@@ -227,15 +219,17 @@ fn main() {
         }
 
         println!(
-            "ops_per_shard={} ({} shards, {} cross-binds): prove {:?}, verify {:?}, argmax {}/{}, rss={}kB",
+            "ops_per_shard={} ({} shards, {} cross-binds): prove {:?}, verify {:?}, argmax {}/{}, open_stats={:?}, verify_stats={:?}, global_open={}",
             ops_per_shard,
             proof.shards.len(),
-            proof.cross_tensors.len(),
+            proof.boundary_tensors.len(),
             prove_t,
             verify_t,
             matches,
             m,
-            peak_rss_kb()
+            whir.open_stats(),
+            whir.verify_stats(),
+            zkie_core::pcs::whir::global_open_count(),
         );
     }
 }

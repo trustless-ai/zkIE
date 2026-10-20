@@ -1,0 +1,12 @@
+{
+  "sequence": 1,
+  "width": 1024,
+  "real_width": 768,
+  "hidden": 4096,
+  "heads": 12,
+  "head_width": 64,
+  "layers": 12,
+  "vocabulary": 65536,
+  "gelu_offset": 8388608,
+  "exp_offset": 2097152
+}

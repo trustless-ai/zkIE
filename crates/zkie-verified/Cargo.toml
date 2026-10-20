@@ -1,0 +1,44 @@
+[package]
+name = "zkie-verified"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Bounded fixed-point inference with a witness-independent STARK verifier"
+
+[features]
+default = []
+prover = []
+
+[dependencies]
+p3-air = "=0.7.0"
+p3-challenger = "=0.7.0"
+p3-commit = "=0.7.0"
+p3-dft = { version = "=0.7.0", features = ["parallel"] }
+p3-field = "=0.7.0"
+p3-fri = "=0.7.0"
+p3-goldilocks = "=0.7.0"
+p3-matrix = "=0.7.0"
+p3-merkle-tree = "=0.7.0"
+p3-symmetric = "=0.7.0"
+p3-uni-stark = "=0.7.0"
+p3-whir = "=0.7.0"
+p3-sumcheck = "=0.7.0"
+p3-multilinear-util = "=0.7.0"
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+
+[[bin]]
+name = "zkie-prove"
+path = "src/bin/zkie-prove.rs"
+required-features = ["prover"]
+
+[[bin]]
+name = "zkie-verify"
+path = "src/bin/zkie-verify.rs"
+
+[dev-dependencies]
+p3-security = "=0.7.0"

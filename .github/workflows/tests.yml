@@ -1,4 +1,4 @@
-# Minimal CI: compile the workspace and run the library tests.
+# Compile the legacy libraries and check bounded independent inference acceptance.
 #
 # Scope is deliberately small. It is `--workspace --lib`, not `--workspace`,
 # because `gpt2`, `gemma3` and `timesfm` each ship examples named `prove` and
@@ -27,18 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The workspace crates are edition 2021, but the vendored
-      # crates/zkie-core/vendor/p3-merkle-tree is edition 2024, which needs
-      # Rust >= 1.85. Reading the workspace manifests alone hides that, so it is
-      # checked explicitly rather than left to fail as a confusing parse error.
+      # rust-toolchain.toml pins the reviewed compiler/profile for the new
+      # standalone proof protocol and its dependency set.
       - name: Check toolchain
         run: |
           rustc --version
           cargo --version
-          rustc -vV | grep -q 'release: 1\.\(8[5-9]\|9[0-9]\|[0-9]\{3\}\)' || {
-            echo "::error::Rust >= 1.85 is required (vendored p3-merkle-tree is edition 2024)"
-            exit 1
-          }
 
       # restore/save split, not actions/cache, deliberately: actions/cache only
       # writes on success, so a run that times out saves nothing and the NEXT run
@@ -77,3 +71,20 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+  verified-inference:
+    name: independent verified inference acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check pinned toolchain
+        run: rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: verified-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Numeric, adversarial and separate-process acceptance
+        run: bash scripts/check_verified.sh

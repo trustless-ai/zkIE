@@ -38,6 +38,18 @@ with no re-run, is the open design item tracked in #15. Weights and activations
 are public: the current route targets correctness and succinctness rather than
 witness hiding.
 
+## Authenticated integer inference in this fork
+
+The separate `zkie-verified` crate now includes a GPT-2 integer-graph compiler,
+model-pinned commitments, bounded rounding/range constraints and a verifier-only
+CLI that does not execute the forward pass or read weight files. Complete
+small-architecture Transformer acceptance passes against an independent integer
+reference. Actual GPT-2 weights and full-size performance have not been validated.
+See [the protocol, commands, evidence and limits](docs/security/gpt2-verified.md).
+Run the bounded suite with `bash scripts/check_verified.sh`; it downloads no model.
+
+The forward-recomputing verifier described above belongs to the legacy route.
+
 ## How it works
 
 1. **Algorithms.** The stack is built on established high-performance proving
@@ -91,6 +103,19 @@ stays on the CPU.
 | GELU / non-linear | LogUp fractional lookup |
 | Lookup | LogUp fractional sumcheck |
 | Affine (fixed-point rounding) | rounding range check (LogUp) |
+
+## Verified small-network baseline
+
+`crates/zkie-verified` is a separate, bounded 2→2→2 fixed-point/ReLU STARK
+baseline with serialized proofs and a verifier-only binary. It binds the public
+model identity, request, input and output without a forward-pass re-run. It is
+not the proof path used by the Transformer examples or benchmarks below, and is
+not a production-security claim for the legacy GKR implementation.
+
+Run `bash scripts/check_verified.sh` for bounded numeric/adversarial tests and
+independent-process acceptance. See [the crate README](crates/zkie-verified/README.md),
+[protocol](docs/security/small-network-protocol.md) and
+[acceptance report](docs/security/acceptance-report.md).
 
 ## Usage
 

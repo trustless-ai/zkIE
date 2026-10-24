@@ -22,6 +22,7 @@ pub struct BatchCacheMetadata {
 }
 
 impl BatchCacheMetadata {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model_id: String,
         group_id: String,

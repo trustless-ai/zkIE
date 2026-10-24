@@ -7,7 +7,7 @@
 use std::fs;
 use std::sync::Arc;
 
-use zkie_core::common::field::{Goldilocks, XorShift64};
+use zkie_core::common::field::Goldilocks;
 use zkie_core::common::fixed_point::{from_i32, from_i64, to_i32};
 use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{causal_mask, Op, Store};
@@ -70,9 +70,9 @@ pub fn build_layer(
     let ln1_b = load_i32(&format!("{dir}/L{layer}_ln1_b_i32.bin"));
     let ln2_w = load_i32(&format!("{dir}/L{layer}_ln2_w_i32.bin"));
     let ln2_b = load_i32(&format!("{dir}/L{layer}_ln2_b_i32.bin"));
-    let fc_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_fc_w_i32.bin")).unwrap());
+    let fc_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_fc_w_i32.bin")).unwrap());
     let fc_b = load_i32(&format!("{dir}/L{layer}_fc_b_i32.bin"));
-    let proj_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_proj_w_i32.bin")).unwrap());
+    let proj_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_proj_w_i32.bin")).unwrap());
     let proj_b = load_i32(&format!("{dir}/L{layer}_proj_b_i32.bin"));
 
     let table_len = 1usize << 21;
@@ -330,7 +330,7 @@ pub fn build_gpt2(
     let gelu_table = load_i32(&format!("{dir}/gelu_table_i32.bin"));
     let lnf_w = load_i32(&format!("{dir}/ln_f_w_i32.bin"));
     let lnf_b = load_i32(&format!("{dir}/ln_f_b_i32.bin"));
-    let lm_head_w = Arc::new(WeightMmap::open(&format!("{dir}/lm_head_w_i32.bin")).unwrap());
+    let lm_head_w = Arc::new(WeightMmap::open(format!("{dir}/lm_head_w_i32.bin")).unwrap());
 
     // Token ids are a public input; the input embedding is wte[tokens] + pos_emb.
     // wte is tied with the (transposed) lm_head weight, so we reuse lm_head

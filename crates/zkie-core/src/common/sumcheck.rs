@@ -3,6 +3,12 @@
 //! Proves `H = sum_{x in {0,1}^t} f(x) * h(x)`. Each round polynomial has
 //! degree at most two, so the prover sends three coefficients per round.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use crate::common::fixed_point::from_i64;
 use rayon::prelude::*;
@@ -55,11 +61,11 @@ pub fn prove(
             let f1 = f_buf[2 * s + 1];
             let h0 = h_buf[2 * s];
             let h1 = h_buf[2 * s + 1];
-            y0 = y0 + f0 * h0;
-            y1 = y1 + f1 * h1;
+            y0 += f0 * h0;
+            y1 += f1 * h1;
             let f2 = Goldilocks::TWO * f1 - f0;
             let h2 = Goldilocks::TWO * h1 - h0;
-            y2 = y2 + f2 * h2;
+            y2 += f2 * h2;
         }
 
         let c0 = y0;
@@ -187,12 +193,12 @@ pub fn prove3(
             let (f0, f1) = (f_buf[2 * s], f_buf[2 * s + 1]);
             let (g0, g1) = (g_buf[2 * s], g_buf[2 * s + 1]);
             let (h0, h1) = (h_buf[2 * s], h_buf[2 * s + 1]);
-            p0 = p0 + f0 * g0 * h0;
-            p1 = p1 + f1 * g1 * h1;
+            p0 += f0 * g0 * h0;
+            p1 += f1 * g1 * h1;
             let two = Goldilocks::TWO;
-            p2 = p2 + eval_at(f0, f1, two) * eval_at(g0, g1, two) * eval_at(h0, h1, two);
+            p2 += eval_at(f0, f1, two) * eval_at(g0, g1, two) * eval_at(h0, h1, two);
             let three = Goldilocks::from_u64(3);
-            p3 = p3 + eval_at(f0, f1, three) * eval_at(g0, g1, three) * eval_at(h0, h1, three);
+            p3 += eval_at(f0, f1, three) * eval_at(g0, g1, three) * eval_at(h0, h1, three);
         }
         rounds.push(interpolate_cubic(p0, p1, p2, p3));
         fold(&mut f_buf, r);
@@ -243,7 +249,7 @@ pub struct SumcheckProofBatch {
 pub fn prove_sum_of_products(
     weights: &[Vec<Goldilocks>],
     values: &[Vec<Goldilocks>],
-    claimed_sum: Goldilocks,
+    _claimed_sum: Goldilocks,
     #[allow(unused_variables)] challenges: &[Goldilocks],
 ) -> SumcheckProofBatch {
     let n = weights.len();
@@ -265,11 +271,11 @@ pub fn prove_sum_of_products(
             for s in 0..half {
                 let (w0, w1) = (w[2 * s], w[2 * s + 1]);
                 let (v0, v1) = (v[2 * s], v[2 * s + 1]);
-                p0 = p0 + w0 * v0;
-                p1 = p1 + w1 * v1;
+                p0 += w0 * v0;
+                p1 += w1 * v1;
                 let w2 = Goldilocks::TWO * w1 - w0;
                 let v2 = Goldilocks::TWO * v1 - v0;
-                p2 = p2 + w2 * v2;
+                p2 += w2 * v2;
             }
         }
         let c0 = p0;
@@ -378,7 +384,7 @@ pub struct VirtualProof {
 pub fn prove_virtual(
     mles: &[&[Goldilocks]],
     terms: &[(Goldilocks, Vec<usize>)],
-    claimed: Goldilocks,
+    _claimed: Goldilocks,
     challenges: &[Goldilocks],
 ) -> VirtualProof {
     let n = mles[0].len();
@@ -404,9 +410,9 @@ pub fn prove_virtual(
                             let f0 = bufs[j][2 * s];
                             let f1 = bufs[j][2 * s + 1];
                             let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                            prod = prod * fk;
+                            prod *= fk;
                         }
-                        p[k] = p[k] + prod;
+                        p[k] += prod;
                     }
                 }
                 p
@@ -415,7 +421,7 @@ pub fn prove_virtual(
                 || vec![Goldilocks::ZERO; max_deg + 1],
                 |mut a, b| {
                     for i in 0..=max_deg {
-                        a[i] = a[i] + b[i];
+                        a[i] += b[i];
                     }
                     a
                 },
@@ -447,7 +453,7 @@ fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
                 term = term * num * den.inverse();
             }
         }
-        out = out + term;
+        out += term;
     }
     out
 }
@@ -476,9 +482,9 @@ pub fn verify_virtual(
     for (coeff, idxs) in terms {
         let mut prod = *coeff;
         for &j in idxs {
-            prod = prod * final_evals[j];
+            prod *= final_evals[j];
         }
-        final_val = final_val + prod;
+        final_val += prod;
     }
     current == final_val
 }
@@ -522,7 +528,7 @@ mod virtual_tests {
             &proof.final_evals
         ));
         let mut bad = proof.final_evals.clone();
-        bad[0] = bad[0] + Goldilocks::ONE;
+        bad[0] += Goldilocks::ONE;
         assert!(!verify_virtual(&proof, &terms, claimed, &challenges, &bad));
     }
     #[test]

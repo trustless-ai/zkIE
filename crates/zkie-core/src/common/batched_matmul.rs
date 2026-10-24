@@ -16,6 +16,12 @@
 //! reduces to claims on `seg` (at the full challenge) and `w` (at `v || ch`),
 //! plus the public `eq(pos, u)` selector.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::common::mle;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
@@ -48,6 +54,7 @@ fn terms() -> Vec<(Goldilocks, Vec<usize>)> {
 /// `u` fixes the `S` position variables, `v` fixes the `N` output variables, and
 /// `ch` carries `S + K` sumcheck challenges (the `(pos, d)` domain). `S`, `K`,
 /// `N` must be powers of two.
+#[allow(clippy::too_many_arguments)]
 pub fn prove(
     seg: &[Goldilocks],
     w: &[Goldilocks],
@@ -99,13 +106,7 @@ pub fn verify(
         proof.sumcheck.final_evals[1],
         eq_final,
     ];
-    verify_virtual(
-        &proof.sumcheck,
-        &terms(),
-        proof.claimed,
-        ch,
-        &final_evals,
-    )
+    verify_virtual(&proof.sumcheck, &terms(), proof.claimed, ch, &final_evals)
 }
 
 /// Plain per-position matmul forward (also the test oracle).
@@ -121,7 +122,7 @@ pub fn forward(
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for d in 0..k {
-                acc = acc + seg[pos * k + d] * w[pos * k * n + d * n + j];
+                acc += seg[pos * k + d] * w[pos * k * n + d * n + j];
             }
             g[pos * n + j] = acc;
         }
@@ -158,7 +159,7 @@ pub fn gather_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::field::{ChallengeSource, XorShift64};
+    use crate::common::field::XorShift64;
 
     #[test]
     fn batched_matmul_roundtrip() {
@@ -184,15 +185,19 @@ mod tests {
             for j in 0..n {
                 let mut acc = Goldilocks::ZERO;
                 for d in 0..k {
-                    acc = acc + seg[pos * k + d] * w_all[e * k * n + d * n + j];
+                    acc += seg[pos * k + d] * w_all[e * k * n + d * n + j];
                 }
                 reference[pos * n + j] = acc;
             }
         }
         assert_eq!(g, reference);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
         let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
             .map(|_| rng.field())
             .collect();
@@ -207,11 +212,10 @@ mod tests {
 
         // tamper the claimed output value -> reject
         let mut bad = proof;
-        bad.claimed = bad.claimed + Goldilocks::ONE;
+        bad.claimed += Goldilocks::ONE;
         assert!(!verify(&bad, s, k, &u, &ch));
     }
 }
-
 
 /// Stream the `partial_eval(W_gathered, v)` result from the per-expert weights,
 /// without materializing `W_gathered = S x K x N`. This is the memory-friendly
@@ -234,7 +238,7 @@ pub fn gather_w_v(
         for d in 0..k {
             let mut acc = Goldilocks::ZERO;
             for j in 0..n {
-                acc = acc + w_all[base + d * n + j] * eq_v[j];
+                acc += w_all[base + d * n + j] * eq_v[j];
             }
             w_v[pos * k + d] = acc;
         }
@@ -244,11 +248,15 @@ pub fn gather_w_v(
 
 /// `counts[e] = sum_{pos: expert_of[pos]=e} eq(pos, ch_pos)`. Computed by the
 /// verifier from the (already authenticated) `expert_of`.
-pub fn expert_counts(expert_of: &[u32], n_experts: usize, ch_pos: &[Goldilocks]) -> Vec<Goldilocks> {
+pub fn expert_counts(
+    expert_of: &[u32],
+    n_experts: usize,
+    ch_pos: &[Goldilocks],
+) -> Vec<Goldilocks> {
     let eq_pos = mle::eq_evals(ch_pos); // s elements
     let mut counts = vec![Goldilocks::ZERO; n_experts];
     for (pos, &e) in expert_of.iter().enumerate() {
-        counts[e as usize] = counts[e as usize] + eq_pos[pos];
+        counts[e as usize] += eq_pos[pos];
     }
     counts
 }
@@ -280,7 +288,7 @@ pub fn gather_open(counts: &[Goldilocks], table: &[Goldilocks]) -> Goldilocks {
     assert_eq!(counts.len(), table.len());
     let mut acc = Goldilocks::ZERO;
     for i in 0..counts.len() {
-        acc = acc + counts[i] * table[i];
+        acc += counts[i] * table[i];
     }
     acc
 }
@@ -288,7 +296,7 @@ pub fn gather_open(counts: &[Goldilocks], table: &[Goldilocks]) -> Goldilocks {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use crate::common::field::{ChallengeSource, XorShift64};
+    use crate::common::field::XorShift64;
 
     #[test]
     fn gather_opening_linear_combination() {
@@ -300,9 +308,15 @@ mod streaming_tests {
             .collect();
         let expert_of: Vec<u32> = (0..s).map(|i| (i % n_experts) as u32).collect();
 
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch_d: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch_pos: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch_d: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch_pos: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
 
         // materialized reference
         let w_gathered = gather_weights(&expert_of, &w_all, s, n_experts, k, n);
@@ -325,7 +339,6 @@ mod streaming_tests {
     }
 }
 
-
 /// Streaming per-position matmul forward: `g[pos][j] = sum_d seg[pos][d] * W_all[expert_of[pos]][d][j]`,
 /// reading one `K x N` block of `W_all` at a time (no `S x K x N` materialization).
 pub fn gather_matmul_forward(
@@ -346,7 +359,7 @@ pub fn gather_matmul_forward(
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for d in 0..k {
-                acc = acc + seg[pos * k + d] * w_all[base + d * n + j];
+                acc += seg[pos * k + d] * w_all[base + d * n + j];
             }
             g[pos * n + j] = acc;
         }
@@ -356,6 +369,7 @@ pub fn gather_matmul_forward(
 
 /// Streaming prove: same eq-selector sumcheck as `prove`, but `w_v` is computed on
 /// the fly from the per-expert weights instead of a materialized `S x K x N` gather.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_streaming(
     seg: &[Goldilocks],
     expert_of: &[u32],
@@ -389,6 +403,7 @@ pub fn prove_streaming(
 
 /// Streaming verify: the ordinary eq-selector sumcheck, plus the weight claim bound
 /// by the linear combination `final_evals[1] == sum_e counts[e] * table[e]`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_streaming(
     proof: &BatchedMatmulProof,
     expert_of: &[u32],
@@ -417,7 +432,7 @@ pub fn verify_streaming(
 #[cfg(test)]
 mod streaming_matmul_tests {
     use super::*;
-    use crate::common::field::{ChallengeSource, XorShift64};
+    use crate::common::field::XorShift64;
 
     #[test]
     fn streaming_matches_materialized() {
@@ -438,20 +453,31 @@ mod streaming_matmul_tests {
         let g_mat = forward(&seg, &w_gathered, s, k, n);
         assert_eq!(g_stream, g_mat);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
 
-        let proof = prove_streaming(&seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &ch);
-        assert!(verify_streaming(&proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        let proof = prove_streaming(
+            &seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &ch,
+        );
+        assert!(verify_streaming(
+            &proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch
+        ));
 
         // tamper the weight claim -> reject
         let mut bad = proof;
-        bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
-        assert!(!verify_streaming(&bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        bad.sumcheck.final_evals[1] += Goldilocks::ONE;
+        assert!(!verify_streaming(
+            &bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch
+        ));
     }
 }
-
 
 /// Self-contained streaming gather-matmul proof: the eq-selector sumcheck plus the
 /// linear-combination terms that bind the weight claim to the per-expert weights.
@@ -466,6 +492,7 @@ pub struct GatherMatMulProof {
     pub table: Vec<Goldilocks>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prove_gather_matmul(
     seg: &[Goldilocks],
     expert_of: &[u32],
@@ -495,7 +522,7 @@ pub fn prove_gather_matmul(
 
 pub fn verify_gather_matmul(
     proof: &GatherMatMulProof,
-    s: usize,
+    _s: usize,
     k: usize,
     u: &[Goldilocks],
     ch: &[Goldilocks],
@@ -517,7 +544,7 @@ pub fn verify_gather_matmul(
 #[cfg(test)]
 mod gather_matmul_proof_tests {
     use super::*;
-    use crate::common::field::{ChallengeSource, XorShift64};
+    use crate::common::field::XorShift64;
 
     #[test]
     fn gather_matmul_self_contained() {
@@ -532,17 +559,24 @@ mod gather_matmul_proof_tests {
             .collect();
         let g = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
 
-        let proof = prove_gather_matmul(&seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &ch);
+        let proof = prove_gather_matmul(
+            &seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &ch,
+        );
         assert!(verify_gather_matmul(&proof, s, k, &u, &ch));
 
         // tamper the weight claim (final_evals[1]) -> reject
         let mut bad = proof;
-        bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
+        bad.sumcheck.final_evals[1] += Goldilocks::ONE;
         assert!(!verify_gather_matmul(&bad, s, k, &u, &ch));
     }
 }
-

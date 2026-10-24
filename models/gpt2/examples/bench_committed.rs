@@ -21,12 +21,6 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         .collect()
 }
 
-fn round_div(a: i64, b: i64) -> i64 {
-    let q = a.div_euclid(b);
-    let r = a.rem_euclid(b);
-    if r * 2 >= b { q + 1 } else { q }
-}
-
 fn peak_rss_kb() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in s.lines() {
@@ -38,26 +32,39 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = std::env::var("M").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
+    let m = std::env::var("M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16usize);
     let shift = 16u32;
     let dir = "models/gpt2/weights";
 
     let mut store = Store::new();
     let mut ops = Vec::new();
     let (_x0, logits, tokens, t) = build_gpt2(&mut store, &mut ops, dir, m, shift);
-    let gt = load_i32(&format!("{dir}/gt_argmax_{}i32.bin", if m <= 16 { "" } else { "512_" }));
+    let gt = load_i32(&format!(
+        "{dir}/gt_argmax_{}i32.bin",
+        if m <= 16 { "" } else { "512_" }
+    ));
 
     // Boundary tensors are m x D = 512 x 1024 = 2^19.
     let whir = Whir::new_testing(19);
     let mut rng = XorShift64::new(0xBEEF);
 
     let t0 = std::time::Instant::now();
-    let cached =
-        commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/gpt2-model-batches-v2");
+    let cached = commit_model_weights(
+        &store,
+        &ops,
+        // Relative to the repo root (gitignored). The old value was an absolute
+        // /data/jimmyshi/... path, which does not exist elsewhere and cannot be
+        // created on macOS because / is a read-only volume.
+        "target/zkie-cache/gpt2-model-batches-v2",
+    );
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, &mut rng, tokens, t);
+    let proof =
+        prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, &mut rng, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();
@@ -110,7 +117,10 @@ fn main() {
         let mut best_v = to_i64(lg[i * 65536]);
         for j in 1..50257 {
             let v = to_i64(lg[i * 65536 + j]);
-            if v > best_v { best_v = v; best = j; }
+            if v > best_v {
+                best_v = v;
+                best = j;
+            }
         }
         if arg_idx[i] as usize != best {
             n_mismatch += 1;
@@ -129,16 +139,25 @@ fn main() {
         bytes.len()
     );
     let shards_b = bincode::serialize(&proof.shards).unwrap().len();
-    let wbo_b = bincode::serialize(&proof.weight_batch_openings).unwrap().len();
-    let bound_b = bincode::serialize(&(&proof.boundary_commitments, &proof.cross_binds)).unwrap().len();
-    println!("breakdown: shards={} weight_openings={} boundary={}", shards_b, wbo_b, bound_b);
+    let wbo_b = bincode::serialize(&proof.weight_batch_openings)
+        .unwrap()
+        .len();
+    let bound_b = bincode::serialize(&(&proof.boundary_commitments, &proof.cross_binds))
+        .unwrap()
+        .len();
+    println!(
+        "breakdown: shards={} weight_openings={} boundary={}",
+        shards_b, wbo_b, bound_b
+    );
     for (i, wbo) in proof.weight_batch_openings.iter().enumerate() {
         if let Some(p) = &wbo.proof {
-            println!("  group{i}: open={} sumcheck={} evals={} n_claims={}",
+            println!(
+                "  group{i}: open={} sumcheck={} evals={} n_claims={}",
                 bincode::serialize(&p.open).unwrap().len(),
                 bincode::serialize(&p.sumcheck).unwrap().len(),
                 bincode::serialize(&p.evals).unwrap().len(),
-                wbo.table_idxs.len());
+                wbo.table_idxs.len()
+            );
         }
     }
 }

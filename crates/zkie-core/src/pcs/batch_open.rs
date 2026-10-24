@@ -5,6 +5,12 @@
 //! same-point opening (`open_batch_multi`) at a fresh point, so the FRI folding
 //! is paid once instead of N times.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::common::mle;
 use crate::common::sumcheck;
@@ -43,8 +49,8 @@ pub fn batch_open(
         let eq = mle::eq_evals(&points[i]);
         let w: Vec<Goldilocks> = eq.iter().map(|&x| gamma_pow * x).collect();
         weights.push(w);
-        claimed_sum = claimed_sum + gamma_pow * claimed[i];
-        gamma_pow = gamma_pow * gamma;
+        claimed_sum += gamma_pow * claimed[i];
+        gamma_pow *= gamma;
     }
 
     // 4. Sum-check over B = sum_i w_i * f_i.
@@ -63,8 +69,8 @@ pub fn batch_open(
     let mut gamma_pow = Goldilocks::ONE;
     for i in 0..n {
         let eq = mle::eq_poly(&points[i], &challenges);
-        expected = expected + gamma_pow * eq * evals[i];
-        gamma_pow = gamma_pow * gamma;
+        expected += gamma_pow * eq * evals[i];
+        gamma_pow *= gamma;
     }
 
     evals_ok && sumcheck::verify_sum_of_products(&proof, claimed_sum, &challenges, expected)
@@ -95,8 +101,8 @@ pub fn batch_open_committed(
         let eq = mle::eq_evals(&points[i]);
         let w: Vec<Goldilocks> = eq.iter().map(|&x| gamma_pow * x).collect();
         weights.push(w);
-        claimed_sum = claimed_sum + gamma_pow * claimed[i];
-        gamma_pow = gamma_pow * gamma;
+        claimed_sum += gamma_pow * claimed[i];
+        gamma_pow *= gamma;
     }
 
     let challenges: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
@@ -124,8 +130,8 @@ pub fn batch_open_committed(
     let mut gamma_pow = Goldilocks::ONE;
     for i in 0..n {
         let eq = mle::eq_poly(&points[i], &challenges);
-        expected = expected + gamma_pow * eq * evals[table_idxs[i]];
-        gamma_pow = gamma_pow * gamma;
+        expected += gamma_pow * eq * evals[table_idxs[i]];
+        gamma_pow *= gamma;
     }
     evals_ok && sumcheck::verify_sum_of_products(&proof, claimed_sum, &challenges, expected)
 }
@@ -153,12 +159,12 @@ pub fn open_table_multi_point(
     for p in points {
         let eq = mle::eq_evals(p);
         for (wx, &ex) in w.iter_mut().zip(&eq) {
-            *wx = *wx + gamma_pow * ex;
+            *wx += gamma_pow * ex;
         }
         let y = mle::eval(tensor, p);
         claimed.push(y);
-        claimed_sum = claimed_sum + gamma_pow * y;
-        gamma_pow = gamma_pow * gamma;
+        claimed_sum += gamma_pow * y;
+        gamma_pow *= gamma;
     }
 
     let challenges: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
@@ -255,6 +261,7 @@ pub fn prove_batch_open_committed_owned(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prove_batch_open_committed_with_data(
     whir: &Whir,
     commitment: &crate::pcs::whir::Commitment,
@@ -289,8 +296,8 @@ fn prove_batch_open_committed_with_data(
         let eq = mle::eq_evals(&points[i]);
         let w: Vec<Goldilocks> = eq.iter().map(|&x| gamma_pow * x).collect();
         weights.push(w);
-        claimed_sum = claimed_sum + gamma_pow * claimed[i];
-        gamma_pow = gamma_pow * gamma;
+        claimed_sum += gamma_pow * claimed[i];
+        gamma_pow *= gamma;
     }
 
     let sumcheck = sumcheck::prove_sum_of_products(&weights, tensors, claimed_sum, &challenges);
@@ -338,14 +345,15 @@ pub fn verify_batch_open_committed(
     let mut claimed_sum = Goldilocks::ZERO;
     let mut gamma_pow = Goldilocks::ONE;
     for i in 0..n {
-        claimed_sum = claimed_sum + gamma_pow * claimed[i];
-        gamma_pow = gamma_pow * gamma;
+        claimed_sum += gamma_pow * claimed[i];
+        gamma_pow *= gamma;
     }
 
-    let evals = match whir.verify_batch_multi(commitment, &proof.open, protocol, num_tables, &challenges) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    let evals =
+        match whir.verify_batch_multi(commitment, &proof.open, protocol, num_tables, &challenges) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
     if evals != proof.evals {
         return false;
     }
@@ -354,8 +362,8 @@ pub fn verify_batch_open_committed(
     let mut gamma_pow = Goldilocks::ONE;
     for i in 0..n {
         let eq = mle::eq_poly(&points[i], &challenges);
-        expected = expected + gamma_pow * eq * evals[table_idxs[i]];
-        gamma_pow = gamma_pow * gamma;
+        expected += gamma_pow * eq * evals[table_idxs[i]];
+        gamma_pow *= gamma;
     }
 
     sumcheck::verify_sum_of_products(&proof.sumcheck, claimed_sum, &challenges, expected)
@@ -387,7 +395,7 @@ mod tests {
         );
 
         let mut bad = claimed.clone();
-        bad[0] = bad[0] + Goldilocks::ONE;
+        bad[0] += Goldilocks::ONE;
         let mut r2 = XorShift64::new(99);
         assert!(
             !batch_open(&tensors, &points, &bad, &mut r2),
@@ -449,7 +457,8 @@ mod tests {
         };
 
         let table_idxs: Vec<usize> = (0..n).collect();
-        let proof = prove_batch_open_committed(&batch, &table_idxs, &tensors, &points, &claimed).unwrap();
+        let proof =
+            prove_batch_open_committed(&batch, &table_idxs, &tensors, &points, &claimed).unwrap();
         assert!(verify_batch_open_committed(
             &batch.whir,
             &batch.commitment,
@@ -462,7 +471,7 @@ mod tests {
         ));
 
         let mut bad = claimed.clone();
-        bad[0] = bad[0] + Goldilocks::ONE;
+        bad[0] += Goldilocks::ONE;
         assert!(!verify_batch_open_committed(
             &batch.whir,
             &batch.commitment,

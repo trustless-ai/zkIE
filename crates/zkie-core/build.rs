@@ -7,8 +7,13 @@
 //! and the `sppark` crate must be built with `NVCC=off` so it doesn't compile
 //! its own copy of `util/all_gpus.cpp`.
 
+// All three are only touched by the CUDA path; importing them unconditionally
+// warns on the default (CPU-only) build.
+#[cfg(feature = "cuda")]
 use std::env;
+#[cfg(feature = "cuda")]
 use std::path::PathBuf;
+#[cfg(feature = "cuda")]
 use std::process::Command;
 
 fn main() {

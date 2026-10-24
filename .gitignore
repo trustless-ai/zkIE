@@ -5,6 +5,7 @@
 /models/gpt2_graph.txt
 /.spike-test
 /.venv-timesfm
+/.venv-gpt2
 *.log
 
 # zkie-evm-verifier-poc (standalone crate, own workspace; see

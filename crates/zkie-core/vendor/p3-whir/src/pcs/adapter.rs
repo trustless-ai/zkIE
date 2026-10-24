@@ -63,7 +63,7 @@ where
     }
 
     /// Reconstruct prover data from a layout and Merkle data.
-    pub fn from_parts(layout: L, merkle_data: MT::ProverData<DenseMatrix<F>>) -> Self {
+    pub const fn from_parts(layout: L, merkle_data: MT::ProverData<DenseMatrix<F>>) -> Self {
         Self {
             layout,
             merkle_data,

@@ -9,33 +9,42 @@
 //! the degenerate "whole model folded into one g" when `N` is the full depth, and
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
 use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward, prove_layer_norm_centered,
     verify_layer_norm_centered, LayerNormCenteredProof,
 };
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
-use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
-use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
 use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
+use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
-use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
+use crate::topk::{
+    argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk,
+    ArgmaxProof, TopKSelectProof,
+};
 use rayon::prelude::*;
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
-    verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
     prove_fractional_with_challenges, prove_lookup_table, prove_lookup_witness_batch_columns,
     verify_lookup_split, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
-use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
 use zkie_core::common::mle;
 use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
@@ -194,14 +203,12 @@ pub fn verify_projection_chain(
 ) -> bool {
     assert_eq!(proof.steps.len(), steps.len());
     assert_eq!(proof.binds.len(), steps.len().saturating_sub(1));
-    let (ys, rems) = forward(x, steps);
+    let (ys, _rems) = forward(x, steps);
 
-    let mut prev = x;
     for (i, step) in steps.iter().enumerate() {
         if !verify_projection(&proof.steps[i], step.shift) {
             return false;
         }
-        prev = &ys[i];
     }
 
     for i in 1..steps.len() {
@@ -337,6 +344,7 @@ pub struct ResidualChainProof {
     pub same_p: Vec<SamePolyProof>,
 }
 
+#[allow(clippy::type_complexity)]
 fn residual_forward(
     x: &[Goldilocks],
     steps: &[ProjectionStep],
@@ -441,7 +449,7 @@ pub fn verify_residual_chain(
     assert_eq!(proof.adds.len(), steps.len());
     assert_eq!(proof.same_x.len(), steps.len());
     assert_eq!(proof.same_p.len(), steps.len());
-    let (xs, ps, rems) = residual_forward(x, steps);
+    let (xs, ps, _rems) = residual_forward(x, steps);
     let n = steps.len();
 
     for (i, step) in steps.iter().enumerate() {
@@ -821,8 +829,18 @@ pub enum OpProof {
     Argmax(ArgmaxProof),
     Scatter(ScatterProof),
     Gather(ScatterAddProof),
-    BatchedMatMul(BatchedMatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
-    GatherMatMul(bmm::GatherMatMulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
+    BatchedMatMul(
+        BatchedMatmulProof,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    ),
+    GatherMatMul(
+        bmm::GatherMatMulProof,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    ),
     IdxBroadcast,
     CombineIdx,
     PadIdx,
@@ -981,16 +999,33 @@ impl Op {
                 ..
             } => vec![x, w, b, rsqrt_table],
             Op::RmsNorm {
-                x, w, rsqrt_table, limb_table, ..
+                x,
+                w,
+                rsqrt_table,
+                limb_table,
+                ..
             } => vec![x, w, rsqrt_table, limb_table],
-            Op::RoPE { x, cos, sin, range_table, .. } => vec![x, cos, sin, range_table],
+            Op::RoPE {
+                x,
+                cos,
+                sin,
+                range_table,
+                ..
+            } => vec![x, cos, sin, range_table],
             Op::TopKSelect { x, .. } => vec![x],
             Op::Argmax { x, .. } => vec![x],
             Op::ScaleGate { x, gate, .. } => vec![x, gate],
             Op::Scatter { sel, .. } => vec![sel],
-            Op::Gather { weighted, token_id, gate, .. } => vec![weighted, token_id, gate],
+            Op::Gather {
+                weighted,
+                token_id,
+                gate,
+                ..
+            } => vec![weighted, token_id, gate],
             Op::BatchedMatMul { a, w, .. } => vec![a, w],
-            Op::GatherMatMul { a, expert_of, w, .. } => vec![a, expert_of, w],
+            Op::GatherMatMul {
+                a, expert_of, w, ..
+            } => vec![a, expert_of, w],
             Op::IdxBroadcast { base, .. } => vec![base],
             Op::CombineIdx { a, b, .. } => vec![a, b],
             Op::PadIdx { base, .. } => vec![base],
@@ -1242,7 +1277,16 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o = bmm::forward(store.get(a), store.get(w), s, k, n);
                 store.v[c] = TensorData::Owned(o);
             }
-            Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
+            Op::GatherMatMul {
+                a,
+                expert_of,
+                w,
+                c,
+                s,
+                k,
+                n,
+                n_experts,
+            } => {
                 let wv = store.materialize(w);
                 let o = bmm::gather_matmul_forward(
                     store.get(a),
@@ -1284,11 +1328,8 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
             Op::BroadcastScale { x, scale, out, h } => {
                 let xv = store.get(x);
                 let sv = store.get(scale);
-                let o: Vec<Goldilocks> = xv
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &v)| v * sv[i / h])
-                    .collect();
+                let o: Vec<Goldilocks> =
+                    xv.iter().enumerate().map(|(i, &v)| v * sv[i / h]).collect();
                 store.v[out] = TensorData::Owned(o);
             }
             Op::ScaleGate {
@@ -1296,7 +1337,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 gate,
                 col,
                 out,
-                m,
+                m: _,
                 n,
                 h,
                 shift,
@@ -1511,7 +1552,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 w,
                 out,
                 rsqrt_table,
-                limb_table,
+                limb_table: _,
                 m,
                 d,
                 n_real,
@@ -1531,7 +1572,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 cos,
                 sin,
                 out,
-                range_table,
+                range_table: _,
                 m,
                 d,
                 shift,
@@ -1569,8 +1610,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 m,
                 n,
             } => {
-                let (thr_v, sel_v, gate_v, d1_v, d2_v, out_v) =
-                    argmax_forward(store.get(x), m, n);
+                let (thr_v, sel_v, gate_v, d1_v, d2_v, out_v) = argmax_forward(store.get(x), m, n);
                 store.v[thr] = TensorData::Owned(thr_v);
                 store.v[sel] = TensorData::Owned(sel_v);
                 store.v[gate] = TensorData::Owned(gate_v);
@@ -1615,6 +1655,7 @@ pub fn prove_shard_precomputed(
     // (tensor_id, point, eval) claims emitted by each op's proof.
     let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     let mut op_proofs = Vec::with_capacity(ops.len());
+    #[allow(clippy::type_complexity)]
     let mut lookup_by_table: std::collections::BTreeMap<T, Vec<(Vec<u32>, Vec<Goldilocks>)>> =
         std::collections::BTreeMap::new();
 
@@ -1666,10 +1707,26 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::Gather(p));
             }
             Op::BatchedMatMul { a, w, c, s, k, n } => {
-                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let p = bmm::prove(store.get(a), store.get(w), store.get(c), s, k, n, &u, &v, &ch);
+                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let p = bmm::prove(
+                    store.get(a),
+                    store.get(w),
+                    store.get(c),
+                    s,
+                    k,
+                    n,
+                    &u,
+                    &v,
+                    &ch,
+                );
                 claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
                 let mut wp = v.clone();
                 wp.extend_from_slice(&ch);
@@ -1679,10 +1736,25 @@ pub fn prove_shard_precomputed(
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
                 op_proofs.push(OpProof::BatchedMatMul(p, u, v, ch));
             }
-            Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+            Op::GatherMatMul {
+                a,
+                expert_of,
+                w,
+                c,
+                s,
+                k,
+                n,
+                n_experts,
+            } => {
+                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
                 let wv = store.materialize(w);
                 let p = bmm::prove_gather_matmul(
                     store.get(a),
@@ -1793,7 +1865,7 @@ pub fn prove_shard_precomputed(
             Op::Lookup { idx, out, table } => {
                 lookup_by_table
                     .entry(table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((store.idx[idx].clone(), store.get(out).to_vec()));
                 op_proofs.push(OpProof::Lookup);
             }
@@ -1821,7 +1893,7 @@ pub fn prove_shard_precomputed(
                 ));
                 lookup_by_table
                     .entry(table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((store.idx[idx].clone(), store.get(e).to_vec()));
                 op_proofs.push(OpProof::Softmax(p));
             }
@@ -1854,7 +1926,7 @@ pub fn prove_shard_precomputed(
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((ridx, rvals));
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
@@ -1883,7 +1955,7 @@ pub fn prove_shard_precomputed(
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((ridx, rvals));
                 claims.push((
                     x,
@@ -1916,17 +1988,17 @@ pub fn prove_shard_precomputed(
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((ridx, rvals));
                 let idx_lo: Vec<u32> = rem_lo.iter().map(|&v| to_i32(v) as u32).collect();
                 let idx_hi: Vec<u32> = rem_hi.iter().map(|&v| to_i32(v) as u32).collect();
                 lookup_by_table
                     .entry(limb_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((idx_lo, rem_lo));
                 lookup_by_table
                     .entry(limb_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((idx_hi, rem_hi));
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
@@ -1956,11 +2028,11 @@ pub fn prove_shard_precomputed(
                 let idx_s: Vec<u32> = rem_s.iter().map(|&v| to_i32(v) as u32).collect();
                 lookup_by_table
                     .entry(range_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((idx_f, rem_f));
                 lookup_by_table
                     .entry(range_table)
-                    .or_insert(Vec::new())
+                    .or_default()
                     .push((idx_s, rem_s));
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::RoPE(p));
@@ -2020,7 +2092,11 @@ pub fn prove_shard_precomputed(
                 );
                 claims.push((x, p.topk.r.clone(), mle::eval(store.get(x), &p.topk.r)));
                 claims.push((sel, p.topk.r.clone(), mle::eval(store.get(sel), &p.topk.r)));
-                claims.push((gate, p.topk.r.clone(), mle::eval(store.get(gate), &p.topk.r)));
+                claims.push((
+                    gate,
+                    p.topk.r.clone(),
+                    mle::eval(store.get(gate), &p.topk.r),
+                ));
                 op_proofs.push(OpProof::Argmax(p));
             }
         }
@@ -2054,7 +2130,8 @@ pub fn prove_shard_precomputed(
         let beta = rng.field();
         let xs: Vec<&[u32]> = lookups.iter().map(|(x, _)| x.as_slice()).collect();
         let ys: Vec<&[Goldilocks]> = lookups.iter().map(|(_, y)| y.as_slice()).collect();
-        let (proof, x, y, num, _den) = prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, rng);
+        let (proof, x, y, num, _den) =
+            prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, rng);
         let (point, num_leaf, den_leaf) = fractional_leaf(&proof);
         let m = merge_multiplicity(&xs, store.get(*table).len());
         let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, rng);
@@ -2100,7 +2177,11 @@ pub fn verify_shard(tables: &[&[Goldilocks]], ops: &[Op], proof: &OpShardProof) 
 
 /// Verify a shard proof against an already-materialized witness store. Read-only
 /// on `store`, so shards can be verified in parallel.
-pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &OpShardProof) -> bool {
+pub fn verify_shard_precomputed(
+    _tables: &[&[Goldilocks]],
+    ops: &[Op],
+    proof: &OpShardProof,
+) -> bool {
     assert_eq!(proof.ops.len(), ops.len());
     assert_eq!(proof.bound.len(), proof.binds.len());
 
@@ -2111,7 +2192,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
         (neg, vec![1usize]),
     ];
 
-    let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let _claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     for (op, p) in ops.iter().zip(&proof.ops) {
         match (op, p) {
             (Op::Transpose { .. }, OpProof::Transpose) => {
@@ -2126,7 +2207,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
-            (Op::Gather { m, h, .. }, OpProof::Gather(p)) => {
+            (Op::Gather { m: _, h: _, .. }, OpProof::Gather(p)) => {
                 if !verify_scatter_add(p) {
                     return false;
                 }
@@ -2147,10 +2228,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::BroadcastScale { .. }, OpProof::BroadcastScale) => {}
             (Op::ScaleGate { .. }, OpProof::ScaleGate) => {}
             (Op::Relu { .. }, OpProof::Relu) => {}
-            (
-                Op::MatMul { .. },
-                OpProof::MatMul(mp, _, _, ch),
-            ) => {
+            (Op::MatMul { .. }, OpProof::MatMul(mp, _, _, ch)) => {
                 if !matmul_verify(mp, ch) {
                     return false;
                 }
@@ -2192,10 +2270,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
-            (
-                Op::LayerNormCentered { n_real, .. },
-                OpProof::LayerNormCentered(lp),
-            ) => {
+            (Op::LayerNormCentered { n_real, .. }, OpProof::LayerNormCentered(lp)) => {
                 if !verify_layer_norm_centered(lp, *n_real) {
                     return false;
                 }
@@ -2242,7 +2317,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
     if bound_claims.len() != proof.binds.len() {
         return false;
     }
-    for (i, &t) in proof.bound.iter().enumerate() {
+    for (i, &_t) in proof.bound.iter().enumerate() {
         if verify_same_poly(&proof.binds[i], &bound_claims[i]).is_none() {
             return false;
         }
@@ -2286,11 +2361,7 @@ fn absorb_statement(t: &mut Transcript, ops: &[Op], ops_per_shard: usize) {
     }
 }
 
-pub fn prove_shard_dag(
-    store: &mut Store,
-    ops: &[Op],
-    ops_per_shard: usize,
-) -> ShardDagProof {
+pub fn prove_shard_dag(store: &mut Store, ops: &[Op], ops_per_shard: usize) -> ShardDagProof {
     let ranges = shard_ranges(ops.len(), ops_per_shard);
 
     // Materialize every op output once, then prove each shard's sumchecks in
@@ -2394,7 +2465,7 @@ pub fn verify_shard_dag(
     }
 
     let mut expected_cross: Vec<T> = Vec::new();
-    for (t, _) in &by_tensor {
+    for t in by_tensor.keys() {
         if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
             expected_cross.push(*t);
         }
@@ -2485,11 +2556,7 @@ pub fn verify_committed_cross_bind(
     let whir = zkie_core::pcs::whir::Whir::with_params(committed.arity, 90, 17);
     let protocol = whir.opening_protocol(committed.arity, 1);
     for ((pt, expected), (open, opened)) in claims.iter().zip(proof.openings.iter()) {
-        if whir
-            .verify(&committed.commitment, open, &protocol, pt)
-            .ok()
-            != Some(*opened)
-        {
+        if whir.verify(&committed.commitment, open, &protocol, pt).ok() != Some(*opened) {
             return false;
         }
         if *opened != *expected {
@@ -2511,10 +2578,8 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
     let mut weights = std::collections::BTreeSet::new();
     for op in ops {
         match op {
-            Op::MatMul { b, .. } => {
-                if !written.contains(b) {
-                    weights.insert(*b);
-                }
+            Op::MatMul { b, .. } if !written.contains(b) => {
+                weights.insert(*b);
             }
             Op::Projection { w, bias, .. } => {
                 weights.insert(*w);
@@ -2560,11 +2625,7 @@ pub struct CachedWeightBatch {
 /// Phase 1 (offline, once): commit every weight group and stream the Merkle
 /// prover data to a cache file. Returns only commitment + rebuild params; the
 /// heavy WHIR commitment (RS encoding + FFT + Merkle) is paid exactly once here.
-pub fn commit_model_weights(
-    store: &Store,
-    ops: &[Op],
-    cache_dir: &str,
-) -> Vec<CachedWeightBatch> {
+pub fn commit_model_weights(store: &Store, ops: &[Op], cache_dir: &str) -> Vec<CachedWeightBatch> {
     // Borrowed from feature/batch-pcs: 90-bit security + pow_bits=17 (enough for
     // packed codewords up to 2^26), instead of the low-security testing params.
     const SECURITY: usize = 90;
@@ -2605,14 +2666,11 @@ pub fn commit_model_weights(
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
             let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v)| v.as_slice()).collect();
             let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
-            let (commitment, prover_data, _protocol, batch_whir) =
-                base_whir.commit_batch(&refs);
+            let (commitment, prover_data, _protocol, batch_whir) = base_whir.commit_batch(&refs);
             let num_vars = batch_whir.num_variables();
             let table_ids: Vec<T> = ids.iter().map(|(t, _)| *t).collect();
-            let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
-                "weight-a{arity}-g{}.bin",
-                batches.len()
-            ));
+            let cache_path = std::path::PathBuf::from(cache_dir)
+                .join(format!("weight-a{arity}-g{}.bin", batches.len()));
             let file = std::fs::File::create(&cache_path).expect("create weight cache");
             let mut writer = std::io::BufWriter::new(file);
             bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
@@ -2757,7 +2815,6 @@ pub struct SelOpening {
     pub openings: Vec<zkie_core::pcs::whir::Proof>,
 }
 
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CommittedShardDagProof {
     pub shards: Vec<OpShardProof>,
@@ -2783,6 +2840,7 @@ pub struct CommittedShardDagProof {
     pub gather_indep_batches: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prove_committed_shard_dag(
     store: &mut Store,
     ops: &[Op],
@@ -2948,7 +3006,8 @@ pub fn prove_committed_shard_dag(
     let mut identity_tables: std::collections::BTreeSet<T> = std::collections::BTreeSet::new();
     for shard in &shards {
         for tc in &shard.table_columns {
-            if !global_table_commits.contains_key(&tc.table) && !identity_tables.contains(&tc.table) {
+            if !global_table_commits.contains_key(&tc.table) && !identity_tables.contains(&tc.table)
+            {
                 let raw_table = store.get(tc.table);
                 if is_identity_table(raw_table) {
                     identity_tables.insert(tc.table);
@@ -3004,16 +3063,35 @@ pub fn prove_committed_shard_dag(
             witness_groups.push(WitnessGroup {
                 arity,
                 cols,
-                x_ctx: zkie_core::pcs::committed::BatchCtx { commitment: cx, prover_data: px, protocol: prx, whir: wx, num_tables },
-                y_ctx: zkie_core::pcs::committed::BatchCtx { commitment: cy, prover_data: py, protocol: pry, whir: wy, num_tables },
-                num_ctx: zkie_core::pcs::committed::BatchCtx { commitment: cnum, prover_data: pnum, protocol: prnum, whir: wnum, num_tables },
+                x_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: cx,
+                    prover_data: px,
+                    protocol: prx,
+                    whir: wx,
+                    num_tables,
+                },
+                y_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: cy,
+                    prover_data: py,
+                    protocol: pry,
+                    whir: wy,
+                    num_tables,
+                },
+                num_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: cnum,
+                    prover_data: pnum,
+                    protocol: prnum,
+                    whir: wnum,
+                    num_tables,
+                },
             });
         }
     }
 
     // Commit the per-lookup multiplicity columns `m`.
     let mut t_arities: Vec<Vec<usize>> = Vec::with_capacity(shards.len());
-    let mut t_cms: Vec<Vec<zkie_core::pcs::committed::Committed>> = Vec::with_capacity(shards.len());
+    let mut t_cms: Vec<Vec<zkie_core::pcs::committed::Committed>> =
+        Vec::with_capacity(shards.len());
     for shard in &shards {
         let mut t_arity = Vec::new();
         let mut t_cm = Vec::new();
@@ -3164,14 +3242,29 @@ pub fn prove_committed_shard_dag(
             };
         }
         let x_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            x_ctx, &table_idxs, &xs_tensors, &points, &xs_claimed,
-        ).expect("honest witness x batch-open");
+            x_ctx,
+            &table_idxs,
+            &xs_tensors,
+            &points,
+            &xs_claimed,
+        )
+        .expect("honest witness x batch-open");
         let y_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            y_ctx, &table_idxs, &ys_tensors, &points, &ys_claimed,
-        ).expect("honest witness y batch-open");
+            y_ctx,
+            &table_idxs,
+            &ys_tensors,
+            &points,
+            &ys_claimed,
+        )
+        .expect("honest witness y batch-open");
         let num_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            num_ctx, &table_idxs, &nums_tensors, &points, &nums_claimed,
-        ).expect("honest witness num batch-open");
+            num_ctx,
+            &table_idxs,
+            &nums_tensors,
+            &points,
+            &nums_claimed,
+        )
+        .expect("honest witness num batch-open");
         witness_batch_openings.push(WitnessBatchOpening {
             table_idxs: table_idxs.clone(),
             points: points.clone(),
@@ -3199,12 +3292,17 @@ pub fn prove_committed_shard_dag(
             let (full_r, cs) = &t_challs[gid];
             let alpha = w_alphas[gid];
             let beta = w_betas[gid];
-            let (num_t, den_t) = build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
+            let (num_t, den_t) =
+                build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
             let new_proof = prove_fractional_with_challenges(num_t, den_t, full_r, cs);
             let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], 90);
             let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], 90, pow_bits);
-            let (open, ev) = bw.open(t_cms[si][i].prover_data.clone(), &t_cms[si][i].protocol, &point);
+            let (open, ev) = bw.open(
+                t_cms[si][i].prover_data.clone(),
+                &t_cms[si][i].protocol,
+                &point,
+            );
             assert_eq!(ev, num_leaf);
             let is_ident = identity_tables.contains(&tc.table);
             let (table_commitment, table_opening, table_eval) = if is_ident {
@@ -3221,7 +3319,11 @@ pub fn prove_committed_shard_dag(
                     &table_committed.protocol,
                     &point,
                 );
-                (Some(table_committed.commitment.clone()), Some(open_table), ev_table)
+                (
+                    Some(table_committed.commitment.clone()),
+                    Some(open_table),
+                    ev_table,
+                )
             };
             tc.proof = new_proof;
             tc.point = point.clone();
@@ -3252,7 +3354,17 @@ pub fn prove_committed_shard_dag(
     let sel_ranges = shard_ranges(ops.len(), ops_per_shard);
     for (si, &(s, e)) in sel_ranges.iter().enumerate() {
         for (op, op_proof) in ops[s..e].iter().zip(shards[si].ops.iter_mut()) {
-            if let (Op::Argmax { sel: sel_t, out: out_t, m, n, .. }, OpProof::Argmax(ap)) = (op, op_proof) {
+            if let (
+                Op::Argmax {
+                    sel: sel_t,
+                    out: out_t,
+                    m,
+                    n,
+                    ..
+                },
+                OpProof::Argmax(ap),
+            ) = (op, op_proof)
+            {
                 let sel_vec = store.get(*sel_t);
                 let total = sel_vec.len().next_power_of_two();
                 let arity = total.trailing_zeros() as usize;
@@ -3276,7 +3388,9 @@ pub fn prove_committed_shard_dag(
                 let mut openings = Vec::with_capacity(*m);
                 for (i, point) in points.iter().enumerate() {
                     let data = if i + 1 == *m {
-                        prover_data.take().expect("last Argmax opening owns prover data")
+                        prover_data
+                            .take()
+                            .expect("last Argmax opening owns prover data")
                     } else {
                         prover_data.as_ref().expect("Argmax prover data").clone()
                     };
@@ -3300,7 +3414,8 @@ pub fn prove_committed_shard_dag(
     // by arity across all Scatter ops (same-shape vertical batch).
     let mut perm_batches: Vec<ColumnBatchCommit> = Vec::new();
     let mut perm_batch_openings: Vec<ColumnBatchOpening> = Vec::new();
-    let mut perm_locations: Vec<PermLocation> = Vec::new();
+    // Filled in below from `perm_locations_slots`, once every Scatter op's
+    // group id is known; the compiler rejects a dead `Vec::new()` seed here.
 
     let mut perm_ops: Vec<(usize, usize, usize)> = Vec::new(); // (si, li, arity)
     {
@@ -3309,7 +3424,9 @@ pub fn prove_committed_shard_dag(
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let Op::Scatter { .. } = op {
                     let arity = match &shards[si].ops[li] {
-                        OpProof::Scatter(p) => p.perm.a.len().next_power_of_two().trailing_zeros() as usize,
+                        OpProof::Scatter(p) => {
+                            p.perm.a.len().next_power_of_two().trailing_zeros() as usize
+                        }
                         _ => unreachable!(),
                     };
                     perm_ops.push((si, li, arity));
@@ -3317,7 +3434,8 @@ pub fn prove_committed_shard_dag(
             }
         }
     }
-    let mut perm_gid: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    let mut perm_gid: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
     for (gid, &(si, li, _)) in perm_ops.iter().enumerate() {
         perm_gid.insert((si, li), gid);
     }
@@ -3331,7 +3449,8 @@ pub fn prove_committed_shard_dag(
     }
     let mut perm_groups: Vec<PermGroup> = Vec::new();
     {
-        let mut by_arity: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = std::collections::BTreeMap::new();
+        let mut by_arity: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
         for &(si, li, arity) in &perm_ops {
             by_arity.entry(arity).or_default().push((si, li));
         }
@@ -3370,9 +3489,27 @@ pub fn prove_committed_shard_dag(
             perm_groups.push(PermGroup {
                 arity,
                 ops: ops_,
-                a_ctx: zkie_core::pcs::committed::BatchCtx { commitment: ca, prover_data: pa, protocol: pra, whir: wa, num_tables },
-                b_ctx: zkie_core::pcs::committed::BatchCtx { commitment: cb, prover_data: pb, protocol: prb, whir: wb, num_tables },
-                num_ctx: zkie_core::pcs::committed::BatchCtx { commitment: cn, prover_data: pn, protocol: prn, whir: wn, num_tables },
+                a_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: ca,
+                    prover_data: pa,
+                    protocol: pra,
+                    whir: wa,
+                    num_tables,
+                },
+                b_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: cb,
+                    prover_data: pb,
+                    protocol: prb,
+                    whir: wb,
+                    num_tables,
+                },
+                num_ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: cn,
+                    prover_data: pn,
+                    protocol: prn,
+                    whir: wn,
+                    num_tables,
+                },
             });
         }
     }
@@ -3385,14 +3522,27 @@ pub fn prove_committed_shard_dag(
         perm_ts.absorb(&bincode::serialize(&g.num_ctx.commitment).unwrap());
     }
     let mut perm_alphas: Vec<Goldilocks> = Vec::new();
-    let mut perm_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut perm_challs: Vec<(
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    )> = Vec::new();
     for &(_, _, arity) in &perm_ops {
         perm_alphas.push(perm_ts.field());
-        perm_challs.push((perm_ts.field_vec(arity), perm_ts.field_vec(arity), perm_ts.field_vec(arity), perm_ts.field_vec(arity)));
+        perm_challs.push((
+            perm_ts.field_vec(arity),
+            perm_ts.field_vec(arity),
+            perm_ts.field_vec(arity),
+            perm_ts.field_vec(arity),
+        ));
     }
 
     for g in &perm_groups {
-        let num_vars = (g.ops.len() * (1usize << g.arity)).next_power_of_two().trailing_zeros() as usize;
+        let num_vars = (g.ops.len() * (1usize << g.arity))
+            .next_power_of_two()
+            .trailing_zeros() as usize;
         let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
         for ctx in [&g.a_ctx, &g.b_ctx, &g.num_ctx] {
             perm_batches.push(ColumnBatchCommit {
@@ -3405,7 +3555,8 @@ pub fn prove_committed_shard_dag(
     }
 
     let total_perm_ops = perm_ops.len();
-    let mut perm_locations_slots: Vec<Option<PermLocation>> = (0..total_perm_ops).map(|_| None).collect();
+    let mut perm_locations_slots: Vec<Option<PermLocation>> =
+        (0..total_perm_ops).map(|_| None).collect();
     for (g_idx, g) in perm_groups.into_iter().enumerate() {
         let PermGroup {
             arity,
@@ -3440,8 +3591,8 @@ pub fn prove_committed_shard_dag(
             let (num_b, den_b) = build_perm_num_den(&b, alpha);
             let new_a = prove_fractional_with_challenges(num_a, den_a, full_r_a, cs_a);
             let new_b = prove_fractional_with_challenges(num_b, den_b, full_r_b, cs_b);
-            let (point_a, num_leaf_a, den_leaf_a) = fractional_leaf(&new_a);
-            let (point_b, num_leaf_b, den_leaf_b) = fractional_leaf(&new_b);
+            let (point_a, num_leaf_a, _den_leaf_a) = fractional_leaf(&new_a);
+            let (point_b, num_leaf_b, _den_leaf_b) = fractional_leaf(&new_b);
             sp.perm.a_side = new_a;
             sp.perm.b_side = new_b;
             sp.perm.alpha = alpha;
@@ -3477,15 +3628,53 @@ pub fn prove_committed_shard_dag(
                 num_table: ti,
             });
         }
-        let a_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(a_ctx, &table_idxs, &a_tensors, &points_a, &a_claimed).expect("honest perm a batch-open");
-        let b_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(b_ctx, &table_idxs, &b_tensors, &points_b, &b_claimed).expect("honest perm b batch-open");
-        let num_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(num_ctx, &num_idxs, &num_tensors, &num_points, &num_claimed).expect("honest perm num batch-open");
-        perm_batch_openings.push(ColumnBatchOpening { table_idxs: table_idxs.clone(), points: points_a, claimed: a_claimed, proof: a_proof });
-        perm_batch_openings.push(ColumnBatchOpening { table_idxs: table_idxs.clone(), points: points_b, claimed: b_claimed, proof: b_proof });
-        perm_batch_openings.push(ColumnBatchOpening { table_idxs: num_idxs, points: num_points, claimed: num_claimed, proof: num_proof });
+        let a_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+            a_ctx,
+            &table_idxs,
+            &a_tensors,
+            &points_a,
+            &a_claimed,
+        )
+        .expect("honest perm a batch-open");
+        let b_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+            b_ctx,
+            &table_idxs,
+            &b_tensors,
+            &points_b,
+            &b_claimed,
+        )
+        .expect("honest perm b batch-open");
+        let num_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+            num_ctx,
+            &num_idxs,
+            &num_tensors,
+            &num_points,
+            &num_claimed,
+        )
+        .expect("honest perm num batch-open");
+        perm_batch_openings.push(ColumnBatchOpening {
+            table_idxs: table_idxs.clone(),
+            points: points_a,
+            claimed: a_claimed,
+            proof: a_proof,
+        });
+        perm_batch_openings.push(ColumnBatchOpening {
+            table_idxs: table_idxs.clone(),
+            points: points_b,
+            claimed: b_claimed,
+            proof: b_proof,
+        });
+        perm_batch_openings.push(ColumnBatchOpening {
+            table_idxs: num_idxs,
+            points: num_points,
+            claimed: num_claimed,
+            proof: num_proof,
+        });
     }
-    perm_locations = perm_locations_slots.into_iter().map(|x| x.unwrap()).collect();
-
+    let perm_locations: Vec<PermLocation> = perm_locations_slots
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect();
 
     // Commit + open each Gather histogram witness, grouped by (arity, type).
     // den_source/den_target depend on the Fiat-Shamir alpha, so they are rebuilt
@@ -3494,7 +3683,7 @@ pub fn prove_committed_shard_dag(
     // differed from the committed-path alpha.
     let mut gather_batches: Vec<ColumnBatchCommit> = Vec::new();
     let mut gather_batch_openings: Vec<ColumnBatchOpening> = Vec::new();
-    let mut gather_locations: Vec<GatherLocation> = Vec::new();
+    // Same deferred initialisation as `perm_locations` above.
 
     // type ids: 0=num_source 1=den_source 2=weighted 3=num_target 4=den_target
     //           5=out 6=gate 7=token_id
@@ -3513,7 +3702,8 @@ pub fn prove_committed_shard_dag(
             }
         }
     }
-    let mut gather_gid: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    let mut gather_gid: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
     for (gid, &(si, li, _, _, _, _, _)) in gather_ops.iter().enumerate() {
         gather_gid.insert((si, li), gid);
     }
@@ -3536,34 +3726,63 @@ pub fn prove_committed_shard_dag(
     // Phase A: commit the six alpha-independent columns.
     {
         let indep = [0usize, 2, 3, 5, 6, 7];
-        let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = std::collections::BTreeMap::new();
+        let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
         for &(si, li, arity_src, arity_tgt, arity_gate, _, _) in &gather_ops {
             for &ty in &indep {
-                let ar = match ty { 0 | 2 => arity_src, 3 | 5 => arity_tgt, _ => arity_gate };
+                let ar = match ty {
+                    0 | 2 => arity_src,
+                    3 | 5 => arity_tgt,
+                    _ => arity_gate,
+                };
                 by_key.entry((ar, ty)).or_default().push((si, li));
             }
         }
         for ((arity, ty), ops_) in by_key {
             let mut cols = Vec::with_capacity(ops_.len());
             for &(si, li) in &ops_ {
-                let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+                let sp = match &shards[si].ops[li] {
+                    OpProof::Gather(p) => p,
+                    _ => unreachable!(),
+                };
                 let col = match ty {
                     0 => pad(&sp.num_source, arity),
                     2 => pad(&sp.weighted, arity),
                     3 => pad(&sp.num_target, arity),
                     5 => pad(&sp.out, arity),
                     6 => pad(&sp.gate, arity),
-                    _ => { let g: Vec<Goldilocks> = sp.token_id.iter().map(|&t| Goldilocks::from_u64(t as u64)).collect(); pad(&g, arity) }
+                    _ => {
+                        let g: Vec<Goldilocks> = sp
+                            .token_id
+                            .iter()
+                            .map(|&t| Goldilocks::from_u64(t as u64))
+                            .collect();
+                        pad(&g, arity)
+                    }
                 };
                 cols.push(col);
             }
             let num_tables = ops_.len();
-            let num_vars = (num_tables * (1usize << arity)).next_power_of_two().trailing_zeros() as usize;
+            let num_vars = (num_tables * (1usize << arity))
+                .next_power_of_two()
+                .trailing_zeros() as usize;
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
             let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
             let refs: Vec<&[Goldilocks]> = cols.iter().map(|v| v.as_slice()).collect();
             let (c, p, pr, w) = base_whir.commit_batch(&refs);
-            gather_groups.push(GatherGroup { arity, ty, ops: ops_, cols, ctx: zkie_core::pcs::committed::BatchCtx { commitment: c, prover_data: p, protocol: pr, whir: w, num_tables } });
+            gather_groups.push(GatherGroup {
+                arity,
+                ty,
+                ops: ops_,
+                cols,
+                ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: c,
+                    prover_data: p,
+                    protocol: pr,
+                    whir: w,
+                    num_tables,
+                },
+            });
         }
     }
 
@@ -3586,7 +3805,10 @@ pub fn prove_committed_shard_dag(
     let mut op_den_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     for (gid, &(si, li, arity_src, arity_tgt, _, h, m)) in gather_ops.iter().enumerate() {
         let alpha = gather_alphas[gid];
-        let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+        let sp = match &shards[si].ops[li] {
+            OpProof::Gather(p) => p,
+            _ => unreachable!(),
+        };
         let mut dsrc = vec![alpha; 1usize << arity_src];
         for pos in 0..sp.token_id.len() {
             for d in 0..h {
@@ -3604,7 +3826,8 @@ pub fn prove_committed_shard_dag(
     }
     {
         let den_tys = [1usize, 4];
-        let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = std::collections::BTreeMap::new();
+        let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
         for &(si, li, arity_src, arity_tgt, _, _, _) in &gather_ops {
             for &ty in &den_tys {
                 let ar = if ty == 1 { arity_src } else { arity_tgt };
@@ -3615,16 +3838,34 @@ pub fn prove_committed_shard_dag(
             let mut cols = Vec::with_capacity(ops_.len());
             for &(si, li) in &ops_ {
                 let gid = gather_gid[&(si, li)];
-                let col = if ty == 1 { op_den_src[gid].clone() } else { op_den_tgt[gid].clone() };
+                let col = if ty == 1 {
+                    op_den_src[gid].clone()
+                } else {
+                    op_den_tgt[gid].clone()
+                };
                 cols.push(col);
             }
             let num_tables = ops_.len();
-            let num_vars = (num_tables * (1usize << arity)).next_power_of_two().trailing_zeros() as usize;
+            let num_vars = (num_tables * (1usize << arity))
+                .next_power_of_two()
+                .trailing_zeros() as usize;
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
             let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
             let refs: Vec<&[Goldilocks]> = cols.iter().map(|v| v.as_slice()).collect();
             let (c, p, pr, w) = base_whir.commit_batch(&refs);
-            gather_groups.push(GatherGroup { arity, ty, ops: ops_, cols, ctx: zkie_core::pcs::committed::BatchCtx { commitment: c, prover_data: p, protocol: pr, whir: w, num_tables } });
+            gather_groups.push(GatherGroup {
+                arity,
+                ty,
+                ops: ops_,
+                cols,
+                ctx: zkie_core::pcs::committed::BatchCtx {
+                    commitment: c,
+                    prover_data: p,
+                    protocol: pr,
+                    whir: w,
+                    num_tables,
+                },
+            });
         }
     }
 
@@ -3632,14 +3873,27 @@ pub fn prove_committed_shard_dag(
     for g in gather_groups.iter().skip(6) {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
     }
-    let mut gather_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut gather_challs: Vec<(
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    )> = Vec::new();
     for &(_, _, arity_src, arity_tgt, _, _, _) in &gather_ops {
-        gather_challs.push((ts.field_vec(arity_src), ts.field_vec(arity_src), ts.field_vec(arity_tgt), ts.field_vec(arity_tgt)));
+        gather_challs.push((
+            ts.field_vec(arity_src),
+            ts.field_vec(arity_src),
+            ts.field_vec(arity_tgt),
+            ts.field_vec(arity_tgt),
+        ));
     }
 
     // Record verifier-side batches (8 groups, in the same order).
     for g in &gather_groups {
-        let num_vars = (g.ops.len() * (1usize << g.arity)).next_power_of_two().trailing_zeros() as usize;
+        let num_vars = (g.ops.len() * (1usize << g.arity))
+            .next_power_of_two()
+            .trailing_zeros() as usize;
         let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
         gather_batches.push(ColumnBatchCommit {
             commitment: g.ctx.commitment.clone(),
@@ -3656,10 +3910,23 @@ pub fn prove_committed_shard_dag(
         let (full_r_src, cs_src, full_r_tgt, cs_tgt) = &gather_challs[gid];
         let alpha = gather_alphas[gid];
         let gamma = gather_gammas[gid].clone();
-        let sp = match &mut shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
-        let new_src = prove_fractional_with_challenges(sp.num_source.clone(), op_den_src[gid].clone(), full_r_src, cs_src);
+        let sp = match &mut shards[si].ops[li] {
+            OpProof::Gather(p) => p,
+            _ => unreachable!(),
+        };
+        let new_src = prove_fractional_with_challenges(
+            sp.num_source.clone(),
+            op_den_src[gid].clone(),
+            full_r_src,
+            cs_src,
+        );
         let (point_src, _, _) = fractional_leaf(&new_src);
-        let new_tgt = prove_fractional_with_challenges(sp.num_target.clone(), op_den_tgt[gid].clone(), full_r_tgt, cs_tgt);
+        let new_tgt = prove_fractional_with_challenges(
+            sp.num_target.clone(),
+            op_den_tgt[gid].clone(),
+            full_r_tgt,
+            cs_tgt,
+        );
         let (point_tgt, _, _) = fractional_leaf(&new_tgt);
         sp.source_side = new_src;
         sp.target_side = new_tgt;
@@ -3672,11 +3939,13 @@ pub fn prove_committed_shard_dag(
     }
 
     // Batch-open each group and fill locations in global order.
-    let mut group_idx_of: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    let mut group_idx_of: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
     for (gi, g) in gather_groups.iter().enumerate() {
         group_idx_of.insert((g.arity, g.ty), gi);
     }
-    let mut gather_locations_slots: Vec<Option<GatherLocation>> = (0..gather_ops.len()).map(|_| None).collect();
+    let mut gather_locations_slots: Vec<Option<GatherLocation>> =
+        (0..gather_ops.len()).map(|_| None).collect();
     for (g_idx, g) in gather_groups.into_iter().enumerate() {
         let GatherGroup {
             arity: _,
@@ -3693,46 +3962,118 @@ pub fn prove_committed_shard_dag(
             let gid = gather_gid[&(si, li)];
             let (_, _, _, _, _, h, _) = gather_ops[gid];
             let h_log = h.trailing_zeros() as usize;
-            let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+            let sp = match &shards[si].ops[li] {
+                OpProof::Gather(p) => p,
+                _ => unreachable!(),
+            };
             let (pt, cl) = match ty {
-                0 => (op_point_src[gid].clone(), mle::eval(&cols[ti], &op_point_src[gid])),
-                1 => (op_point_src[gid].clone(), mle::eval(&cols[ti], &op_point_src[gid])),
-                2 => (sp.r_prod_source.clone(), mle::eval(&cols[ti], &sp.r_prod_source)),
-                3 => (op_point_tgt[gid].clone(), mle::eval(&cols[ti], &op_point_tgt[gid])),
-                4 => (op_point_tgt[gid].clone(), mle::eval(&cols[ti], &op_point_tgt[gid])),
-                5 => (sp.r_prod_target.clone(), mle::eval(&cols[ti], &sp.r_prod_target)),
-                6 => (sp.r_prod_source[h_log..].to_vec(), mle::eval(&cols[ti], &sp.r_prod_source[h_log..].to_vec())),
-                _ => (op_point_src[gid][h_log..].to_vec(), mle::eval(&cols[ti], &op_point_src[gid][h_log..].to_vec())),
+                0 => (
+                    op_point_src[gid].clone(),
+                    mle::eval(&cols[ti], &op_point_src[gid]),
+                ),
+                1 => (
+                    op_point_src[gid].clone(),
+                    mle::eval(&cols[ti], &op_point_src[gid]),
+                ),
+                2 => (
+                    sp.r_prod_source.clone(),
+                    mle::eval(&cols[ti], &sp.r_prod_source),
+                ),
+                3 => (
+                    op_point_tgt[gid].clone(),
+                    mle::eval(&cols[ti], &op_point_tgt[gid]),
+                ),
+                4 => (
+                    op_point_tgt[gid].clone(),
+                    mle::eval(&cols[ti], &op_point_tgt[gid]),
+                ),
+                5 => (
+                    sp.r_prod_target.clone(),
+                    mle::eval(&cols[ti], &sp.r_prod_target),
+                ),
+                6 => (
+                    sp.r_prod_source[h_log..].to_vec(),
+                    mle::eval(&cols[ti], &sp.r_prod_source[h_log..]),
+                ),
+                _ => (
+                    op_point_src[gid][h_log..].to_vec(),
+                    mle::eval(&cols[ti], &op_point_src[gid][h_log..]),
+                ),
             };
             points.push(pt);
             claimed.push(cl);
             let loc = gather_locations_slots[gid].get_or_insert(GatherLocation {
-                num_source_batch: 0, num_source_table: 0,
-                den_source_batch: 0, den_source_table: 0,
-                weighted_batch: 0, weighted_table: 0,
-                num_target_batch: 0, num_target_table: 0,
-                den_target_batch: 0, den_target_table: 0,
-                out_batch: 0, out_table: 0,
-                gate_batch: 0, gate_table: 0,
-                token_id_batch: 0, token_id_table: 0,
+                num_source_batch: 0,
+                num_source_table: 0,
+                den_source_batch: 0,
+                den_source_table: 0,
+                weighted_batch: 0,
+                weighted_table: 0,
+                num_target_batch: 0,
+                num_target_table: 0,
+                den_target_batch: 0,
+                den_target_table: 0,
+                out_batch: 0,
+                out_table: 0,
+                gate_batch: 0,
+                gate_table: 0,
+                token_id_batch: 0,
+                token_id_table: 0,
             });
             match ty {
-                0 => { loc.num_source_batch = g_idx; loc.num_source_table = ti; }
-                1 => { loc.den_source_batch = g_idx; loc.den_source_table = ti; }
-                2 => { loc.weighted_batch = g_idx; loc.weighted_table = ti; }
-                3 => { loc.num_target_batch = g_idx; loc.num_target_table = ti; }
-                4 => { loc.den_target_batch = g_idx; loc.den_target_table = ti; }
-                5 => { loc.out_batch = g_idx; loc.out_table = ti; }
-                6 => { loc.gate_batch = g_idx; loc.gate_table = ti; }
-                _ => { loc.token_id_batch = g_idx; loc.token_id_table = ti; }
+                0 => {
+                    loc.num_source_batch = g_idx;
+                    loc.num_source_table = ti;
+                }
+                1 => {
+                    loc.den_source_batch = g_idx;
+                    loc.den_source_table = ti;
+                }
+                2 => {
+                    loc.weighted_batch = g_idx;
+                    loc.weighted_table = ti;
+                }
+                3 => {
+                    loc.num_target_batch = g_idx;
+                    loc.num_target_table = ti;
+                }
+                4 => {
+                    loc.den_target_batch = g_idx;
+                    loc.den_target_table = ti;
+                }
+                5 => {
+                    loc.out_batch = g_idx;
+                    loc.out_table = ti;
+                }
+                6 => {
+                    loc.gate_batch = g_idx;
+                    loc.gate_table = ti;
+                }
+                _ => {
+                    loc.token_id_batch = g_idx;
+                    loc.token_id_table = ti;
+                }
             }
         }
         let proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            ctx, &table_idxs, &cols, &points, &claimed,
-        ).expect("honest gather batch-open");
-        gather_batch_openings.push(ColumnBatchOpening { table_idxs, points, claimed, proof });
+            ctx,
+            &table_idxs,
+            &cols,
+            &points,
+            &claimed,
+        )
+        .expect("honest gather batch-open");
+        gather_batch_openings.push(ColumnBatchOpening {
+            table_idxs,
+            points,
+            claimed,
+            proof,
+        });
         for &(si, li) in &group_ops {
-            let sp = match &mut shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+            let sp = match &mut shards[si].ops[li] {
+                OpProof::Gather(p) => p,
+                _ => unreachable!(),
+            };
             match ty {
                 0 => sp.num_source.clear(),
                 1 => sp.den_source.clear(),
@@ -3745,8 +4086,10 @@ pub fn prove_committed_shard_dag(
             }
         }
     }
-    gather_locations = gather_locations_slots.into_iter().map(|x| x.unwrap()).collect();
-
+    let gather_locations: Vec<GatherLocation> = gather_locations_slots
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect();
 
     CommittedShardDagProof {
         shards,
@@ -3849,18 +4192,31 @@ pub fn verify_committed_shard_dag(
         let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(to.arity, 90);
         let bw = zkie_core::pcs::whir::Whir::with_params(to.arity, 90, pow_bits);
         let protocol = bw.opening_protocol(to.arity, 1);
-        if bw.verify(&to.commitment, &to.opening, &protocol, &to.point).ok() != Some(to.claimed) {
+        if bw
+            .verify(&to.commitment, &to.opening, &protocol, &to.point)
+            .ok()
+            != Some(to.claimed)
+        {
             return false;
         }
         let mut eval_idx = Goldilocks::ZERO;
         for (k, &pk) in to.point.iter().enumerate() {
-            eval_idx = eval_idx + Goldilocks::from_u64(1u64 << k) * pk;
+            eval_idx += Goldilocks::from_u64(1u64 << k) * pk;
         }
         let table_eval = if to.is_identity {
             eval_idx
         } else {
             let (tc, to2) = (&to.table_commitment, &to.table_opening);
-            if bw.verify(tc.as_ref().unwrap(), to2.as_ref().unwrap(), &protocol, &to.point).ok() != Some(to.table_eval) {
+            if bw
+                .verify(
+                    tc.as_ref().unwrap(),
+                    to2.as_ref().unwrap(),
+                    &protocol,
+                    &to.point,
+                )
+                .ok()
+                != Some(to.table_eval)
+            {
                 return false;
             }
             to.table_eval
@@ -3924,11 +4280,7 @@ pub fn verify_committed_shard_dag(
         let bw = zkie_core::pcs::whir::Whir::with_params(so.arity, 90, pow_bits);
         let protocol = bw.opening_protocol(so.arity, 1);
         for (opening, point) in so.openings.iter().zip(&so.points) {
-            if bw
-                .verify(&so.commitment, opening, &protocol, point)
-                .ok()
-                != Some(Goldilocks::ONE)
-            {
+            if bw.verify(&so.commitment, opening, &protocol, point).ok() != Some(Goldilocks::ONE) {
                 return false;
             }
         }
@@ -3937,7 +4289,16 @@ pub fn verify_committed_shard_dag(
         return false;
     }
     {
-        let total: usize = proof.shards.iter().map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count()).sum();
+        let total: usize = proof
+            .shards
+            .iter()
+            .map(|s| {
+                s.ops
+                    .iter()
+                    .filter(|o| matches!(o, OpProof::Scatter(_)))
+                    .count()
+            })
+            .sum();
         if proof.perm_locations.len() != total {
             return false;
         }
@@ -3974,11 +4335,13 @@ pub fn verify_committed_shard_dag(
                     let eval_a = proof.perm_batch_openings[loc.a_batch].claimed[loc.a_table];
                     let eval_b = proof.perm_batch_openings[loc.b_batch].claimed[loc.b_table];
                     let nl_a = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table];
-                    let nl_b = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table + 1];
+                    let nl_b =
+                        proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table + 1];
                     if nl_a != num_leaf_a || nl_b != num_leaf_b {
                         return false;
                     }
-                    if den_leaf_a != sp.perm.alpha - eval_a || den_leaf_b != sp.perm.alpha - eval_b {
+                    if den_leaf_a != sp.perm.alpha - eval_a || den_leaf_b != sp.perm.alpha - eval_b
+                    {
                         return false;
                     }
                     gid += 1;
@@ -3990,7 +4353,16 @@ pub fn verify_committed_shard_dag(
         return false;
     }
     {
-        let total: usize = proof.shards.iter().map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count()).sum();
+        let total: usize = proof
+            .shards
+            .iter()
+            .map(|s| {
+                s.ops
+                    .iter()
+                    .filter(|o| matches!(o, OpProof::Gather(_)))
+                    .count()
+            })
+            .sum();
         if proof.gather_locations.len() != total {
             return false;
         }
@@ -4022,8 +4394,10 @@ pub fn verify_committed_shard_dag(
             for op in &shard.ops {
                 if let OpProof::Gather(sp) = op {
                     let loc = &proof.gather_locations[gid];
-                    let den_source = proof.gather_batch_openings[loc.den_source_batch].claimed[loc.den_source_table];
-                    let token_id = proof.gather_batch_openings[loc.token_id_batch].claimed[loc.token_id_table];
+                    let den_source = proof.gather_batch_openings[loc.den_source_batch].claimed
+                        [loc.den_source_table];
+                    let token_id =
+                        proof.gather_batch_openings[loc.token_id_batch].claimed[loc.token_id_table];
                     if den_source != sp.alpha - token_id {
                         return false;
                     }
@@ -4132,7 +4506,9 @@ pub fn verify_committed_shard_dag(
                     let cs_a = ts.field_vec(arity);
                     let full_r_b = ts.field_vec(arity);
                     let cs_b = ts.field_vec(arity);
-                    if sp.perm.a_side.full_r != full_r_a || sp.perm.a_side.layers.len() != cs_a.len() {
+                    if sp.perm.a_side.full_r != full_r_a
+                        || sp.perm.a_side.layers.len() != cs_a.len()
+                    {
                         return false;
                     }
                     for (layer, &c) in sp.perm.a_side.layers.iter().zip(cs_a.iter()) {
@@ -4140,7 +4516,9 @@ pub fn verify_committed_shard_dag(
                             return false;
                         }
                     }
-                    if sp.perm.b_side.full_r != full_r_b || sp.perm.b_side.layers.len() != cs_b.len() {
+                    if sp.perm.b_side.full_r != full_r_b
+                        || sp.perm.b_side.layers.len() != cs_b.len()
+                    {
                         return false;
                     }
                     for (layer, &c) in sp.perm.b_side.layers.iter().zip(cs_b.iter()) {
@@ -4542,7 +4920,13 @@ mod tests {
     use super::*;
     use zkie_core::common::field::PrimeCharacteristicRing;
 
-    fn step(m: usize, k: usize, n: usize, shift: u32, rng: &mut impl ChallengeSource) -> ProjectionStep {
+    fn step(
+        m: usize,
+        k: usize,
+        n: usize,
+        shift: u32,
+        rng: &mut impl ChallengeSource,
+    ) -> ProjectionStep {
         let w: Vec<Goldilocks> = (0..k * n)
             .map(|_| from_i64((rng.next_u64() % 50) as i64))
             .collect();
@@ -4586,7 +4970,7 @@ mod tests {
         // verifier recomputes the forward pass from `steps`, so a single altered
         // weight propagates a wrong witness and the affected projection fails.
         let mut bad_steps = steps.clone();
-        bad_steps[1].w[0] = bad_steps[1].w[0] + Goldilocks::ONE;
+        bad_steps[1].w[0] += Goldilocks::ONE;
         // tamper test removed: plain path is store-free
     }
 
@@ -4607,7 +4991,7 @@ mod tests {
 
         // A single altered weight in the middle breaks the affected shard.
         let mut bad_steps = steps.clone();
-        bad_steps[3].w[0] = bad_steps[3].w[0] + Goldilocks::ONE;
+        bad_steps[3].w[0] += Goldilocks::ONE;
         // tamper test removed: plain path is store-free
         let _ = &bad_steps;
 
@@ -4637,7 +5021,7 @@ mod tests {
 
         // Tampering with a residual output must break the chain.
         let mut bad_steps = steps.clone();
-        bad_steps[1].w[0] = bad_steps[1].w[0] + Goldilocks::ONE;
+        bad_steps[1].w[0] += Goldilocks::ONE;
         // tamper test removed: plain path is store-free
     }
 
@@ -5050,12 +5434,19 @@ mod tests {
         let cached = commit_model_weights(&store, &ops, "/tmp/zkie-test-cache");
         let tokens_t = store.push_idx(vec![]);
         let argmax_t = store.push_idx(vec![]);
-        let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 2, &whir, &cached, &mut rng, tokens_t, argmax_t);
+        let mut proof = prove_committed_shard_dag(
+            &mut store, &ops, 2, &whir, &cached, &mut rng, tokens_t, argmax_t,
+        );
         assert_eq!(proof.boundary_tensors.len(), 1);
         assert_eq!(proof.boundary_commitments.len(), 1);
         assert_eq!(proof.cross_binds.len(), 1);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+        assert!(verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            2,
+            &whir,
+            &proof
+        ));
 
         // Serialization roundtrip through the root-only bytes entry.
         let bytes = bincode::serialize(&proof).unwrap();
@@ -5071,10 +5462,16 @@ mod tests {
         let bt = proof.boundary_tensors[0];
         for shard in proof.shards.iter_mut() {
             if let Some((_, _, ev)) = shard.claims.iter_mut().find(|(t, _, _)| *t == bt) {
-                *ev = *ev + Goldilocks::ONE;
+                *ev += Goldilocks::ONE;
             }
         }
-        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            2,
+            &whir,
+            &proof
+        ));
     }
 
     #[test]
@@ -5169,8 +5566,7 @@ mod tests {
             &whir
         ));
 
-        proof.sel_openings[0].points[0][0] =
-            proof.sel_openings[0].points[0][0] + Goldilocks::ONE;
+        proof.sel_openings[0].points[0][0] += Goldilocks::ONE;
         assert!(!verify_committed_shard_dag(
             &store.owned_slices(),
             &ops,
@@ -5185,14 +5581,27 @@ mod tests {
         let mut rng = XorShift64::new(0x2020);
         let (m, k, n) = (4usize, 8usize, 8usize);
         let mut store = Store::new();
-        let a = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
-        let b = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let a = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
         let c = store.push(vec![]);
         let ops = vec![Op::MatMul { a, b, c, m, k, n }];
         let proof = prove_shard_dag(&mut store, &ops, 1);
         assert!(verify_shard_dag(&store.owned_slices(), &ops, 1, &proof));
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 1));
+        assert!(verify_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1
+        ));
     }
 
     #[test]
@@ -5223,7 +5632,6 @@ mod tests {
         // tamper test removed: plain path is store-free; soundness is in the committed path
     }
 
-
     #[test]
     fn op_shard_batched_matmul_roundtrip() {
         use zkie_core::common::batched_matmul;
@@ -5249,8 +5657,6 @@ mod tests {
         let expected = batched_matmul::forward(store.get(a), store.get(w), s, k, n);
         assert_eq!(store.get(c), expected.as_slice());
     }
-
-
 
     #[test]
     fn op_shard_expert_major_moe_roundtrip() {
@@ -5352,18 +5758,16 @@ mod tests {
                     for j in 0..p {
                         let mut acc = Goldilocks::ZERO;
                         for d in 0..h {
-                            acc = acc
-                                + store.get(x_t)[t * h + d] * store.get(w_all_t)[e * h * p + d * p + j];
+                            acc += store.get(x_t)[t * h + d]
+                                * store.get(w_all_t)[e * h * p + d * p + j];
                         }
-                        reference[t * p + j] = reference[t * p + j] + acc;
+                        reference[t * p + j] += acc;
                     }
                 }
             }
         }
         assert_eq!(store.get(out_t), reference.as_slice());
     }
-
-
 
     #[test]
     fn op_shard_gate_weighted_moe_roundtrip() {
@@ -5386,7 +5790,7 @@ mod tests {
         let gate_mn: Vec<Goldilocks> = (0..m * n_experts)
             .map(|i| Goldilocks::from_u64((i as u64 % 3) + 1))
             .collect();
-        let gate_pos: Vec<Goldilocks> = (0..s)
+        let _gate_pos: Vec<Goldilocks> = (0..s)
             .map(|pos| gate_mn[token_id[pos] as usize * n_experts + expert_of[pos] as usize])
             .collect();
 
@@ -5428,7 +5832,7 @@ mod tests {
 
         // idx_gate = token_id*n + expert_of, then gather gate
         let idx_gate: Vec<u32> = (0..s)
-            .map(|pos| (token_id[pos] * n_experts as u32 + expert_of[pos]) as u32)
+            .map(|pos| token_id[pos] * n_experts as u32 + expert_of[pos])
             .collect();
         let idx_gate_t = store.push_idx(idx_gate);
         let gate_pos_t = store.push(vec![]);
@@ -5494,19 +5898,16 @@ mod tests {
                     for j in 0..p {
                         let mut acc = Goldilocks::ZERO;
                         for d in 0..h {
-                            acc = acc
-                                + store.get(x_t)[t * h + d] * store.get(w_all_t)[e * h * p + d * p + j];
+                            acc += store.get(x_t)[t * h + d]
+                                * store.get(w_all_t)[e * h * p + d * p + j];
                         }
-                        reference[t * p + j] =
-                            reference[t * p + j] + acc * gate_mn[t * n_experts + e];
+                        reference[t * p + j] += acc * gate_mn[t * n_experts + e];
                     }
                 }
             }
         }
         assert_eq!(store.get(out_t), reference.as_slice());
     }
-
-
 
     #[test]
     fn op_shard_moe_with_padding_roundtrip() {
@@ -5580,17 +5981,69 @@ mod tests {
                 m,
                 n,
             },
-            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad },
-            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad },
-            Op::IdxBroadcast { base: token_id_pad, out: idx_seg, b: h },
-            Op::Lookup { idx: idx_seg, out: seg, table: x_t },
-            Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h },
-            Op::IdxBroadcast { base: expert_of_pad, out: idx_w, b: h * p },
-            Op::Lookup { idx: idx_w, out: w_g, table: w_all_t },
-            Op::BatchedMatMul { a: seg_z, w: w_g, c: g, s: s_pad, k: h, n: p },
-            Op::CombineIdx { a: token_id_pad, b: expert_of_pad, out: idx_gate, scale: n },
-            Op::Lookup { idx: idx_gate, out: gate_pos, table: gate_t },
-            Op::Gather { weighted: g, token_id: token_id_pad, gate: gate_pos, out, m, h: p },
+            Op::PadIdx {
+                base: token_id_t,
+                out: token_id_pad,
+                len: s_pad,
+            },
+            Op::PadIdx {
+                base: expert_of_t,
+                out: expert_of_pad,
+                len: s_pad,
+            },
+            Op::IdxBroadcast {
+                base: token_id_pad,
+                out: idx_seg,
+                b: h,
+            },
+            Op::Lookup {
+                idx: idx_seg,
+                out: seg,
+                table: x_t,
+            },
+            Op::BroadcastScale {
+                x: seg,
+                scale: mask_t,
+                out: seg_z,
+                h,
+            },
+            Op::IdxBroadcast {
+                base: expert_of_pad,
+                out: idx_w,
+                b: h * p,
+            },
+            Op::Lookup {
+                idx: idx_w,
+                out: w_g,
+                table: w_all_t,
+            },
+            Op::BatchedMatMul {
+                a: seg_z,
+                w: w_g,
+                c: g,
+                s: s_pad,
+                k: h,
+                n: p,
+            },
+            Op::CombineIdx {
+                a: token_id_pad,
+                b: expert_of_pad,
+                out: idx_gate,
+                scale: n,
+            },
+            Op::Lookup {
+                idx: idx_gate,
+                out: gate_pos,
+                table: gate_t,
+            },
+            Op::Gather {
+                weighted: g,
+                token_id: token_id_pad,
+                gate: gate_pos,
+                out,
+                m,
+                h: p,
+            },
         ];
 
         let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
@@ -5604,19 +6057,16 @@ mod tests {
                     for j in 0..p {
                         let mut acc = Goldilocks::ZERO;
                         for d in 0..h {
-                            acc = acc
-                                + store.get(x_t)[t * h + d] * store.get(w_all_t)[e * h * p + d * p + j];
+                            acc += store.get(x_t)[t * h + d]
+                                * store.get(w_all_t)[e * h * p + d * p + j];
                         }
-                        reference[t * p + j] =
-                            reference[t * p + j] + acc * gate_mn[t * n + e];
+                        reference[t * p + j] += acc * gate_mn[t * n + e];
                     }
                 }
             }
         }
         assert_eq!(store.get(out), reference.as_slice());
     }
-
-
 
     #[test]
     fn op_shard_streaming_moe_roundtrip() {
@@ -5680,11 +6130,32 @@ mod tests {
                 m,
                 n,
             },
-            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad },
-            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad },
-            Op::IdxBroadcast { base: token_id_pad, out: idx_seg, b: h },
-            Op::Lookup { idx: idx_seg, out: seg, table: x_t },
-            Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h },
+            Op::PadIdx {
+                base: token_id_t,
+                out: token_id_pad,
+                len: s_pad,
+            },
+            Op::PadIdx {
+                base: expert_of_t,
+                out: expert_of_pad,
+                len: s_pad,
+            },
+            Op::IdxBroadcast {
+                base: token_id_pad,
+                out: idx_seg,
+                b: h,
+            },
+            Op::Lookup {
+                idx: idx_seg,
+                out: seg,
+                table: x_t,
+            },
+            Op::BroadcastScale {
+                x: seg,
+                scale: mask_t,
+                out: seg_z,
+                h,
+            },
             Op::GatherMatMul {
                 a: seg_z,
                 expert_of: expert_of_pad,
@@ -5695,9 +6166,25 @@ mod tests {
                 n: p,
                 n_experts: n,
             },
-            Op::CombineIdx { a: token_id_pad, b: expert_of_pad, out: idx_gate, scale: n },
-            Op::Lookup { idx: idx_gate, out: gate_pos, table: gate_t },
-            Op::Gather { weighted: g, token_id: token_id_pad, gate: gate_pos, out, m, h: p },
+            Op::CombineIdx {
+                a: token_id_pad,
+                b: expert_of_pad,
+                out: idx_gate,
+                scale: n,
+            },
+            Op::Lookup {
+                idx: idx_gate,
+                out: gate_pos,
+                table: gate_t,
+            },
+            Op::Gather {
+                weighted: g,
+                token_id: token_id_pad,
+                gate: gate_pos,
+                out,
+                m,
+                h: p,
+            },
         ];
 
         let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
@@ -5710,18 +6197,16 @@ mod tests {
                     for j in 0..p {
                         let mut acc = Goldilocks::ZERO;
                         for d in 0..h {
-                            acc = acc
-                                + store.get(x_t)[t * h + d] * store.get(w_all_t)[e * h * p + d * p + j];
+                            acc += store.get(x_t)[t * h + d]
+                                * store.get(w_all_t)[e * h * p + d * p + j];
                         }
-                        reference[t * p + j] =
-                            reference[t * p + j] + acc * gate_mn[t * n + e];
+                        reference[t * p + j] += acc * gate_mn[t * n + e];
                     }
                 }
             }
         }
         assert_eq!(store.get(out), reference.as_slice());
     }
-
 
     #[test]
     fn op_shard_transpose_matmul_roundtrip() {
@@ -6630,7 +7115,7 @@ mod tests {
                 }
                 let mut s1 = clone_store(&pre);
                 let mut tampered = s1.get(cand).to_vec();
-                tampered[0] = tampered[0] + Goldilocks::ONE;
+                tampered[0] += Goldilocks::ONE;
                 s1.v[cand] = TensorData::Owned(tampered);
                 forward_ops(&mut s1, std::slice::from_ref(op)); // ONLY op i
                 for (j, &t) in writes.iter().enumerate() {
@@ -6685,7 +7170,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// This is the check that makes the coarse-step choice decidable rather than
     /// a judgement call: halving the step doubles the index range consumed, so a
     /// step that is correct for one model can silently run a larger one off the
@@ -6722,6 +7206,7 @@ mod tests {
         check_rsqrt_table(&superseded, 1 << 20);
     }
 
+    #[test]
     fn rsqrt_index_piecewise() {
         // Below the fine boundary: raw index = round(var / 2^18).
         assert_eq!(rsqrt_index(0), 0);

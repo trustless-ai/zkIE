@@ -1,7 +1,9 @@
 //! same_poly: prove a set of claims (r_i, y_i) are all evaluations of the SAME
 //! MLE f (f(r_i)=y_i), and merge them into one claim at a fresh point. This is
 //! the claim-merging primitive for reduction chaining (DeepProve iop/same_poly).
-use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+#[cfg(test)]
+use crate::common::field::XorShift64;
+use crate::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SamePolyProof {
@@ -28,7 +30,7 @@ pub fn prove_same_poly(
     let mut claimed = Goldilocks::from_u64(0);
     for (i, (_, y_i)) in claims.iter().enumerate() {
         terms.push((coeffs[i], vec![0usize, i + 1]));
-        claimed = claimed + coeffs[i] * *y_i;
+        claimed += coeffs[i] * *y_i;
     }
     let mut mles: Vec<&[Goldilocks]> = vec![f];
     for e in &eqs {
@@ -52,7 +54,7 @@ pub fn verify_same_poly(
     let mut claimed = Goldilocks::from_u64(0);
     for (i, (_, y_i)) in claims.iter().enumerate() {
         terms.push((proof.coeffs[i], vec![0usize, i + 1]));
-        claimed = claimed + proof.coeffs[i] * *y_i;
+        claimed += proof.coeffs[i] * *y_i;
     }
     if verify_virtual(
         &proof.proof,
@@ -91,7 +93,7 @@ mod tests {
             crate::common::mle::eval(&f, &proof.merged_point)
         );
         let mut bad = claims.clone();
-        bad[0].1 = bad[0].1 + Goldilocks::from_u64(1);
+        bad[0].1 += Goldilocks::from_u64(1);
         assert!(verify_same_poly(&proof, &bad).is_none());
     }
 }

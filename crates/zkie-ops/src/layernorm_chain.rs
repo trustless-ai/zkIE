@@ -3,11 +3,12 @@
 //! (affine). This is the last op type: a reduction + a lookup + an affine, the
 //! same shape as softmax, wired as one chain with virtual intermediates.
 
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
-};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
+#[cfg(test)]
+use zkie_core::common::fixed_point::from_i64;
+use zkie_core::common::fixed_point::to_i64;
 use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
@@ -103,7 +104,13 @@ pub fn verify_layernorm_chain(proof: &LayernormChainProof) -> bool {
         (Goldilocks::ONE, vec![2usize]),
         (neg, vec![3usize]),
     ];
-    verify_virtual(&proof.out, &terms, Goldilocks::ZERO, &proof.r_out, &proof.out.final_evals)
+    verify_virtual(
+        &proof.out,
+        &terms,
+        Goldilocks::ZERO,
+        &proof.r_out,
+        &proof.out.final_evals,
+    )
 }
 
 #[cfg(test)]
@@ -124,7 +131,8 @@ mod tests {
             .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
             .collect();
         let rsqrt_table: Vec<Goldilocks> = (0..(1usize << 8)).map(|_| rng.field()).collect();
-        let (proof, _ridx, _rvals) = prove_layernorm_chain(&x, &w, &b, &rsqrt_table, m, d, &mut rng);
+        let (proof, _ridx, _rvals) =
+            prove_layernorm_chain(&x, &w, &b, &rsqrt_table, m, d, &mut rng);
         assert!(verify_layernorm_chain(&proof));
     }
 }

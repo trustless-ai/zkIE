@@ -30,25 +30,32 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = std::env::var("GEMMA_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
+    let m = std::env::var("GEMMA_SEQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16usize);
     let shift = 16u32;
     let dir = "models/gemma3/weights";
 
     let mut store = Store::new();
     let mut ops = Vec::new();
     let (_x0, logits, tokens, t) = build_gemma3(&mut store, &mut ops, dir, m, shift);
-    let gt = load_i32(&format!("{dir}/gt_argmax_{}i32.bin", if m <= 16 { "" } else { "512_" }));
+    let gt = load_i32(&format!(
+        "{dir}/gt_argmax_{}i32.bin",
+        if m <= 16 { "" } else { "512_" }
+    ));
 
     // Boundary tensors are seq x H_PAD = 16 x 1024 = 2^14.
     let whir = Whir::new_testing(14);
     let mut rng = XorShift64::new(0xBEEF);
 
     let t0 = std::time::Instant::now();
-    let cached = commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/gemma3-model-batches-v2");
+    let cached = commit_model_weights(&store, &ops, "target/zkie-cache/gemma3-model-batches-v2");
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 53, &whir, &cached, &mut rng, tokens, t);
+    let proof =
+        prove_committed_shard_dag(&mut store, &ops, 53, &whir, &cached, &mut rng, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();

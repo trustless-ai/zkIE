@@ -79,6 +79,14 @@ impl Transcript {
         u64::from_le_bytes(digest[..8].try_into().unwrap())
     }
 }
+impl crate::common::field::ChallengeSource for Transcript {
+    fn field(&mut self) -> Goldilocks {
+        Transcript::field(self)
+    }
+    fn next_u64(&mut self) -> u64 {
+        Transcript::next_u64(self)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -109,13 +117,5 @@ mod tests {
         for _ in 0..1000 {
             assert!(t.field().as_canonical_u64() < P);
         }
-    }
-}
-impl crate::common::field::ChallengeSource for Transcript {
-    fn field(&mut self) -> Goldilocks {
-        Transcript::field(self)
-    }
-    fn next_u64(&mut self) -> u64 {
-        Transcript::next_u64(self)
     }
 }

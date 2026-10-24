@@ -10,7 +10,7 @@ fn matmul(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> V
         for j in 0..n {
             let mut acc = from_i64(0);
             for kk in 0..k {
-                acc = acc + a[i * k + kk] * b[kk * n + j];
+                acc += a[i * k + kk] * b[kk * n + j];
             }
             h[i * n + j] = acc;
         }

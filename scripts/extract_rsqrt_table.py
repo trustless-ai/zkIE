@@ -15,9 +15,16 @@ Quantization:
   * `eps` (1e-6) is absorbed into the table entries; at 2^14 it is < 1/2 index
     unit, so it does not shift the index.
 
-Usage: .venv-timesfm/bin/python scripts/extract_rsqrt_table.py
+SUPERSEDED: `compose::check_rsqrt_table` rejects this uniform table (its index
+range is too small for GPT-2 / Gemma 3 variances). Use
+`extract_rsqrt_piecewise.py`, which writes `rsqrt_table_i32.bin` into
+`models/<model>/weights/`. This script writes its output under a distinct name
+(`rsqrt_table_uniform_i32.bin`) so it can never overwrite that table.
+
+Usage: python scripts/extract_rsqrt_table.py [model]
 """
 import os
+import sys
 
 import numpy as np
 
@@ -27,13 +34,24 @@ RSTD_SCALE = 1 << 16
 EPS = 1e-6
 
 
+def model_out_dir() -> str:
+    model = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODEL", "gpt2")
+    path = os.path.join("models", model, "weights")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def main() -> None:
+    print(
+        "WARNING: the uniform rsqrt table is superseded - the prover needs the "
+        "one from scripts/extract_rsqrt_piecewise.py. Writing this one as "
+        "rsqrt_table_uniform_i32.bin so it cannot overwrite rsqrt_table_i32.bin.",
+        file=sys.stderr,
+    )
     s = np.arange(TABLE_SIZE, dtype=np.float64) / INDEX_SCALE + EPS
     rstd = 1.0 / np.sqrt(s)
     table = np.clip(np.round(rstd * RSTD_SCALE), 0, 2**31 - 1).astype(np.int32)
-    out_dir = "models"
-    os.makedirs(out_dir, exist_ok=True)
-    path = f"{out_dir}/rsqrt_table_i32.bin"
+    path = os.path.join(model_out_dir(), "rsqrt_table_uniform_i32.bin")
     table.tofile(path)
     print(f"wrote {TABLE_SIZE} entries (max s = {TABLE_SIZE / INDEX_SCALE:.1f}) to {path}")
 

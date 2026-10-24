@@ -1,7 +1,9 @@
 //! Expert-major scatter: reorder tokens into dense per-expert segments and
 //! prove the reordering is a correct permutation (LogUp multiset equality).
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::logup_gkr::{prove_permutation, verify_permutation, PermutationProof};
 
 #[derive(serde::Serialize, serde::Deserialize)]

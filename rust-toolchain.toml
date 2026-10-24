@@ -9,8 +9,12 @@
 #   feature `edition2024` is required
 #   ... not stabilized in this version of Cargo (1.79.0 ...)
 #
-# Pinning `stable` here means the failure mode is "rustup selects a suitable
-# toolchain" instead of a confusing manifest parse error on an old default.
-# Keep the floor in sync with the check in .github/workflows/tests.yml.
+# The floor is higher than that in practice: p3-util 0.7.0 calls
+# `MaybeUninit::assume_init_ref` on a slice, which is still unstable on
+# 1.90 (`error[E0658]: use of unstable library feature
+# `maybe_uninit_slice``) and only compiles on newer releases. 1.95.0 is used
+# here because it is the oldest toolchain verified to build the whole graph.
+#
+# Keep this in sync with the check in .github/workflows/tests.yml.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"

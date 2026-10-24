@@ -5,7 +5,7 @@
 use std::fs;
 use std::sync::Arc;
 
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i32, from_i64};
 use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{Op, Store};
@@ -86,7 +86,7 @@ fn build_layer(
     exp_t: usize,
     rsqrt_t: usize,
     limb_t: usize,
-    silu_t: usize,
+    _silu_t: usize,
     q_scale_t: usize,
     mask_t: usize,
 ) -> usize {
@@ -95,9 +95,9 @@ fn build_layer(
     let qkv_b = load_i32(&format!("{dir}/L{layer}_qkv_b_i32.bin"));
     let o_w = load_i32(&format!("{dir}/L{layer}_o_proj_w_i32.bin"));
     let o_b = load_i32(&format!("{dir}/L{layer}_o_proj_b_i32.bin"));
-    let gate_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
+    let gate_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
     let gate_b = load_i32(&format!("{dir}/L{layer}_gate_b_i32.bin"));
-    let down_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
+    let down_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
     let down_b = load_i32(&format!("{dir}/L{layer}_down_b_i32.bin"));
     let lnw = load_i32(&format!("{dir}/L{layer}_lnw_i32.bin"));
     let mlp_w = load_i32(&format!("{dir}/L{layer}_mlp_w_i32.bin"));
@@ -352,7 +352,11 @@ pub fn build_timesfm(store: &mut Store, ops: &mut Vec<Op>, dir: &str, shift: u32
 
     let exp_t = store.push(exp_table);
     let rsqrt_t = store.push(rsqrt_table);
-    let limb_t = store.push((0..(1usize << 16)).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>());
+    let limb_t = store.push(
+        (0..(1usize << 16))
+            .map(|j| Goldilocks::from_u64(j as u64))
+            .collect::<Vec<_>>(),
+    );
     let silu_t = store.push(silu_table);
     let q_scale_t = store.push(q_scale);
     let mask_t = store.push(mask);

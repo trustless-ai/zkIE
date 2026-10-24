@@ -21,7 +21,7 @@ fn main() {
         for j in 0..n {
             let mut acc = from_i64(0);
             for kk in 0..k {
-                acc = acc + x[i * k + kk] * w[kk * n + j];
+                acc += x[i * k + kk] * w[kk * n + j];
             }
             h[i * n + j] = acc;
         }

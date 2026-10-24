@@ -1,6 +1,6 @@
 //! Microbenchmark: N separate opens at DIFFERENT points vs one multi-point batch_open.
 use std::time::Instant;
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::mle;
 use zkie_core::pcs::batch_open::batch_open;
 use zkie_core::pcs::whir::Whir;

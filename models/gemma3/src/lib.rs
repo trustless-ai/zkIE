@@ -3,6 +3,12 @@
 //! using the op primitives from `zkie-ops`. Weights/tables are read from
 //! `models/gemma3/weights/` (i32 fixed-point `.bin` files).
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use std::fs;
 use std::sync::Arc;
 
@@ -73,12 +79,12 @@ fn build_layer(
 ) -> usize {
     let dir = "models/gemma3/weights";
     let q_w = load_i32(&format!("{dir}/L{layer}_q_w_i32.bin"));
-    let k_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_k_w_i32.bin")).unwrap());
-    let v_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_v_w_i32.bin")).unwrap());
+    let k_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_k_w_i32.bin")).unwrap());
+    let v_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_v_w_i32.bin")).unwrap());
     let o_w = load_i32(&format!("{dir}/L{layer}_o_w_i32.bin"));
-    let gate_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
-    let up_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_up_w_i32.bin")).unwrap());
-    let down_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
+    let gate_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
+    let up_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_up_w_i32.bin")).unwrap());
+    let down_w = Arc::new(WeightMmap::open(format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
     let in_norm = load_i32(&format!("{dir}/L{layer}_in_norm_i32.bin"));
     let post_attn_norm = load_i32(&format!("{dir}/L{layer}_post_attn_norm_i32.bin"));
     let pre_ffn_norm = load_i32(&format!("{dir}/L{layer}_pre_ffn_norm_i32.bin"));
@@ -429,7 +435,7 @@ pub fn build_gemma3(
     let exp_table = load_i32("models/gpt2/weights/exp_table_i32.bin");
     let rsqrt_table = load_i32("models/gpt2/weights/rsqrt_table_i32.bin");
     let gelu_table = load_i32("models/gpt2/weights/gelu_table_i32.bin");
-    let lm_head = Arc::new(WeightMmap::open(&format!("{dir}/lm_head_i32.bin")).unwrap());
+    let lm_head = Arc::new(WeightMmap::open(format!("{dir}/lm_head_i32.bin")).unwrap());
     let tokens_raw = load_i32(&format!("{dir}/tokens_i32.bin"));
     let tokens = store.push_idx(tokens_raw.iter().map(|&v| to_i32(v) as u32).collect());
     let emb_idx: Vec<u32> = (0..m)
@@ -455,7 +461,11 @@ pub fn build_gemma3(
     let x0_t = token_emb;
     let exp_t = store.push(exp_table);
     let rsqrt_t = store.push(rsqrt_table);
-    let limb_t = store.push((0..(1usize << 16)).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>());
+    let limb_t = store.push(
+        (0..(1usize << 16))
+            .map(|j| Goldilocks::from_u64(j as u64))
+            .collect::<Vec<_>>(),
+    );
     let gelu_t = store.push(gelu_table);
     let mask_t = store.push(causal_mask(m));
     let cos_local_t = store.push(cos_local);
@@ -471,7 +481,8 @@ pub fn build_gemma3(
             (cos_local_t, sin_local_t)
         };
         x_cur = build_layer(
-            store, ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, limb_t, mask_t, cos_t, sin_t,
+            store, ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, limb_t, mask_t, cos_t,
+            sin_t,
         );
     }
 

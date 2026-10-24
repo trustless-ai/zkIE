@@ -14,6 +14,7 @@ pub struct MatmulProof {
     pub sumcheck: SumcheckProof,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prove(
     at: &[Goldilocks],
     b: &[Goldilocks],
@@ -67,6 +68,7 @@ pub struct MatmulChainProof {
     pub step2: MatmulProof,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prove_chain(
     at: &[Goldilocks], // A^T (k x m)
     b: &[Goldilocks],  // B (k x n)
@@ -102,11 +104,7 @@ pub fn prove_chain(
     }
 }
 
-pub fn verify_chain(
-    proof: &MatmulChainProof,
-    ch_n: &[Goldilocks],
-    ch_k: &[Goldilocks],
-) -> bool {
+pub fn verify_chain(proof: &MatmulChainProof, ch_n: &[Goldilocks], ch_k: &[Goldilocks]) -> bool {
     if !verify(&proof.step2, ch_k) {
         return false;
     }
@@ -124,7 +122,7 @@ mod tests {
             for j in 0..n {
                 let mut acc = Goldilocks::ZERO;
                 for kk in 0..k {
-                    acc = acc + a[i * k + kk] * b[kk * n + j];
+                    acc += a[i * k + kk] * b[kk * n + j];
                 }
                 c[i * n + j] = acc;
             }
@@ -168,16 +166,16 @@ mod tests {
 
         let mut p_ak = ch_k.clone();
         p_ak.extend_from_slice(&u);
-        let a_eval = crate::common::mle::eval(&a, &p_ak); // A[u][ch_k]
+        let _a_eval = crate::common::mle::eval(&a, &p_ak); // A[u][ch_k]
         let mut p_b = ch_n.clone();
         p_b.extend_from_slice(&ch_k);
-        let b_eval = crate::common::mle::eval(&b, &p_b); // B[ch_k][ch_n]
+        let _b_eval = crate::common::mle::eval(&b, &p_b); // B[ch_k][ch_n]
         let mut p_d = l_pt.clone();
         p_d.extend_from_slice(&ch_n);
-        let d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
+        let _d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
 
         assert!(verify_chain(&proof, &ch_n, &ch_k));
-        proof.step2.claimed = proof.step2.claimed + Goldilocks::ONE;
+        proof.step2.claimed += Goldilocks::ONE;
         assert!(!verify_chain(&proof, &ch_n, &ch_k));
     }
 }

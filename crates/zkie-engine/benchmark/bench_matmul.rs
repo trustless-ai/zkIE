@@ -28,10 +28,10 @@ fn main() {
 
     let mut f_point = u.clone();
     f_point.extend_from_slice(&challenges);
-    let f_eval = mle::eval(&at, &f_point);
+    let _f_eval = mle::eval(&at, &f_point);
     let mut h_point = v.clone();
     h_point.extend_from_slice(&challenges);
-    let h_eval = mle::eval(&b, &h_point);
+    let _h_eval = mle::eval(&b, &h_point);
     assert!(matmul::verify(&proof, &challenges));
 
     let gkr_field_ops = m * k + k * n + 6 * k;
@@ -53,7 +53,7 @@ fn dense(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Ve
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for w in 0..k {
-                acc = acc + a[i * k + w] * b[w * n + j];
+                acc += a[i * k + w] * b[w * n + j];
             }
             c[i * n + j] = acc;
         }

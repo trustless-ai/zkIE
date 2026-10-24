@@ -3,6 +3,12 @@
 //! Conventions: variable `0` is the least-significant bit of the flattened
 //! index; `partial_eval` fixes the *first* `fix.len()` variables.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 
 pub fn eval(values: &[Goldilocks], point: &[Goldilocks]) -> Goldilocks {
@@ -48,7 +54,7 @@ pub fn eq_evals(r: &[Goldilocks]) -> Vec<Goldilocks> {
     for j in 0..d {
         let one_minus = Goldilocks::ONE - r[j];
         for i in 0..n {
-            eq[i] = eq[i] * if (i >> j) & 1 == 1 { r[j] } else { one_minus };
+            eq[i] *= if (i >> j) & 1 == 1 { r[j] } else { one_minus };
         }
     }
     eq

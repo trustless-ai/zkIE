@@ -64,7 +64,7 @@ pub fn commit_weight_batches(
 ) -> Vec<WeightBatch> {
     assert!(group_size > 0);
     let cache_dir = std::env::var("ZKIE_VERTICAL_CACHE_DIR")
-        .unwrap_or_else(|_| format!("/data/jimmyshi/zkie-cache/{model_id}-model-batches-v2"));
+        .unwrap_or_else(|_| format!("target/zkie-cache/{model_id}-model-batches-v2"));
     fs::create_dir_all(&cache_dir).expect("create vertical cache dir");
 
     let mut seen = HashSet::new();

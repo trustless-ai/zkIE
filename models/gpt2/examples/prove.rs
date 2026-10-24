@@ -1,7 +1,6 @@
 //! End-to-end GPT-2 prove (prove + argmax sanity). Verify is optional
 //! (it clones the full store and needs ~2x memory).
 
-
 use zkie_core::common::fixed_point::{to_i32, to_i64};
 use zkie_models_gpt2::{build_gpt2, load_i32};
 use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
@@ -29,7 +28,10 @@ fn main() {
     let mut ops = Vec::new();
     let (_x0, logits, _tokens, _t) = build_gpt2(&mut store, &mut ops, dir, m, 16);
 
-    let gt = load_i32(&format!("{dir}/gt_argmax_{}i32.bin", if m <= 16 { "" } else { "512_" }));
+    let gt = load_i32(&format!(
+        "{dir}/gt_argmax_{}i32.bin",
+        if m <= 16 { "" } else { "512_" }
+    ));
     let t0 = std::time::Instant::now();
     let proof = prove_shard_dag(&mut store, &ops, 176);
     let prove_t = t0.elapsed();

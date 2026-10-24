@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use super::ffi::{cudaFree, cudaMalloc, CUDART_OK};

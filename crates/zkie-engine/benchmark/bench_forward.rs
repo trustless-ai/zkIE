@@ -29,7 +29,7 @@ fn main() {
 
     for run in 0..3 {
         let t = Instant::now();
-        let c = mm_par(&a, &lm_head_w, m, k, n, 64);
+        let _c = mm_par(&a, &lm_head_w, m, k, n, 64);
         let dt = t.elapsed();
         println!("lm_head mm_par (field) run {}: {:?}", run, dt);
     }

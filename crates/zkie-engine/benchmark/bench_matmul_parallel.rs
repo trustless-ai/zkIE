@@ -11,7 +11,7 @@ fn mm_naive(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) ->
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for kk in 0..k {
-                acc = acc + a[i * k + kk] * b[kk * n + j];
+                acc += a[i * k + kk] * b[kk * n + j];
             }
             c[i * n + j] = acc;
         }
@@ -28,7 +28,7 @@ fn mm_parallel(
     threads: usize,
 ) -> Vec<Goldilocks> {
     let mut c = vec![Goldilocks::ZERO; m * n];
-    let chunk = (m + threads - 1) / threads;
+    let chunk = m.div_ceil(threads);
     std::thread::scope(|s| {
         for (t, rows) in c.chunks_mut(chunk * n).enumerate() {
             s.spawn(move || {
@@ -41,7 +41,7 @@ fn mm_parallel(
                     for j in 0..n {
                         let mut acc = Goldilocks::ZERO;
                         for kk in 0..k {
-                            acc = acc + a[i * k + kk] * b[kk * n + j];
+                            acc += a[i * k + kk] * b[kk * n + j];
                         }
                         cij[j] = acc;
                     }

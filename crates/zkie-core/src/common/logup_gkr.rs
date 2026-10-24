@@ -1,6 +1,14 @@
 //! logUp GKR: prove sum_i num[i]/den[i] == C via the fraction-addition tree
 //! with eq-weighted virtual sumchecks (DeepProve "fractional sumcheck").
-use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+use crate::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
+#[cfg(test)]
+use crate::common::field::{Field, XorShift64};
 use crate::common::fixed_point::from_i64;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -97,9 +105,6 @@ pub fn verify_fractional(
             .collect();
         let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
         let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&layer.r);
-        let mles: Vec<&[Goldilocks]> = vec![
-            &eq, &next_num, &next_den, num_low, num_high, den_low, den_high,
-        ];
         let terms = build_terms(layer.c);
         let final_evals = vec![
             crate::common::mle::eval(&eq, &layer.r),
@@ -293,7 +298,11 @@ pub fn build_lookup_table_num_den(
     let mut num = vec![Goldilocks::from_u64(0); total];
     let mut den = vec![Goldilocks::from_u64(0); total];
     for j in 0..total {
-        num[j] = if j < t { Goldilocks::from_u64(m[j]) } else { Goldilocks::ZERO };
+        num[j] = if j < t {
+            Goldilocks::from_u64(m[j])
+        } else {
+            Goldilocks::ZERO
+        };
         let tj = if j < t { table[j] } else { Goldilocks::ZERO };
         den[j] = alpha + Goldilocks::from_u64(j as u64) + beta * tj;
     }
@@ -343,7 +352,13 @@ pub fn prove_lookup_witness_batch_columns(
     alpha: Goldilocks,
     beta: Goldilocks,
     rng: &mut impl ChallengeSource,
-) -> (FractionalProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
+) -> (
+    FractionalProof,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+) {
     assert_eq!(xs.len(), ys.len());
     let n: usize = xs.iter().map(|x| x.len()).sum();
     // WHIR folding factor 5 needs arity >= 5; pad tiny witnesses to 2^5.
@@ -598,7 +613,7 @@ mod tests {
             &proof, &x, &y, &table, alpha, beta
         ));
         let mut bad_y = y.clone();
-        bad_y[0] = bad_y[0] + Goldilocks::from_u64(1);
+        bad_y[0] += Goldilocks::from_u64(1);
         let proof_bad = prove_lookup_fractional(&x, &bad_y, &table, alpha, beta, &mut rng);
         assert!(!verify_lookup_fractional(
             &proof_bad, &x, &bad_y, &table, alpha, beta
@@ -646,17 +661,26 @@ mod tests {
         let y: Vec<Goldilocks> = x.iter().map(|&i| table[i as usize]).collect();
         let alpha = rng.field();
         let beta = rng.field();
-        let (proof, num, den) = prove_lookup_fractional_columns(&x, &y, &table, alpha, beta, &mut rng);
+        let (proof, num, den) =
+            prove_lookup_fractional_columns(&x, &y, &table, alpha, beta, &mut rng);
         let (full_r, num_leaf, den_leaf) = fractional_leaf(&proof);
         let arity = num.len().trailing_zeros() as usize;
         let whir = Whir::new_testing(arity);
         let c_num = commit(&whir, &num);
         let (open_num, ev_num) = whir.open(c_num.prover_data.clone(), &c_num.protocol, &full_r);
-        assert_eq!(whir.verify(&c_num.commitment, &open_num, &c_num.protocol, &full_r).unwrap(), ev_num);
+        assert_eq!(
+            whir.verify(&c_num.commitment, &open_num, &c_num.protocol, &full_r)
+                .unwrap(),
+            ev_num
+        );
         assert_eq!(ev_num, num_leaf);
         let c_den = commit(&whir, &den);
         let (open_den, ev_den) = whir.open(c_den.prover_data.clone(), &c_den.protocol, &full_r);
-        assert_eq!(whir.verify(&c_den.commitment, &open_den, &c_den.protocol, &full_r).unwrap(), ev_den);
+        assert_eq!(
+            whir.verify(&c_den.commitment, &open_den, &c_den.protocol, &full_r)
+                .unwrap(),
+            ev_den
+        );
         assert_eq!(ev_den, den_leaf);
     }
     #[test]
@@ -670,7 +694,9 @@ mod tests {
         let alpha = rng.field();
         let beta = rng.field();
         let mut proof = prove_lookup_fractional(&x, &y, &table, alpha, beta, &mut rng);
-        assert!(verify_lookup_fractional(&proof, &x, &y, &table, alpha, beta));
+        assert!(verify_lookup_fractional(
+            &proof, &x, &y, &table, alpha, beta
+        ));
         assert!(verify_lookup_fractional_chain(&proof));
         proof.layers[0].proof.final_evals[3] += Goldilocks::from_u64(1);
         assert!(!verify_lookup_fractional_chain(&proof));
@@ -686,7 +712,9 @@ mod tests {
         let alpha = rng.field();
         let beta = rng.field();
         let merged = prove_lookup_fractional(&x, &y, &table, alpha, beta, &mut rng);
-        assert!(verify_lookup_fractional(&merged, &x, &y, &table, alpha, beta));
+        assert!(verify_lookup_fractional(
+            &merged, &x, &y, &table, alpha, beta
+        ));
         let m = lookup_multiplicity(&x, t);
         let witness = prove_lookup_witness(&x, &y, alpha, beta, &mut rng);
         let table_proof = prove_lookup_table(&m, &table, alpha, beta, &mut rng);
@@ -698,7 +726,11 @@ mod tests {
         let t = 64usize;
         let table: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
         let xs: Vec<Vec<u32>> = (0..4)
-            .map(|_| (0..16).map(|_| (rng.next_u64() % t as u64) as u32).collect())
+            .map(|_| {
+                (0..16)
+                    .map(|_| (rng.next_u64() % t as u64) as u32)
+                    .collect()
+            })
             .collect();
         let ys: Vec<Vec<Goldilocks>> = xs
             .iter()
@@ -709,7 +741,9 @@ mod tests {
         let xrefs: Vec<&[u32]> = xs.iter().map(|v| v.as_slice()).collect();
         let yrefs: Vec<&[Goldilocks]> = ys.iter().map(|v| v.as_slice()).collect();
         let merged = prove_lookup_fractional_batch(&xrefs, &yrefs, &table, alpha, beta, &mut rng);
-        assert!(verify_lookup_fractional_batch(&merged, &xrefs, &yrefs, &table, alpha, beta));
+        assert!(verify_lookup_fractional_batch(
+            &merged, &xrefs, &yrefs, &table, alpha, beta
+        ));
         let m = merge_multiplicity(&xrefs, t);
         let witness = prove_lookup_witness_batch(&xrefs, &yrefs, alpha, beta, &mut rng);
         let table_proof = prove_lookup_table(&m, &table, alpha, beta, &mut rng);
@@ -751,11 +785,19 @@ mod tests {
         let whir = Whir::new_testing(arity);
         let c_m = commit(&whir, &m_pad);
         let (open_m, ev_m) = whir.open(c_m.prover_data.clone(), &c_m.protocol, &full_r);
-        assert_eq!(whir.verify(&c_m.commitment, &open_m, &c_m.protocol, &full_r).unwrap(), ev_m);
+        assert_eq!(
+            whir.verify(&c_m.commitment, &open_m, &c_m.protocol, &full_r)
+                .unwrap(),
+            ev_m
+        );
         assert_eq!(ev_m, num_leaf);
         let c_t = commit(&whir, &table_pad);
         let (open_t, ev_t) = whir.open(c_t.prover_data.clone(), &c_t.protocol, &full_r);
-        assert_eq!(whir.verify(&c_t.commitment, &open_t, &c_t.protocol, &full_r).unwrap(), ev_t);
+        assert_eq!(
+            whir.verify(&c_t.commitment, &open_t, &c_t.protocol, &full_r)
+                .unwrap(),
+            ev_t
+        );
         let j_mle: Vec<Goldilocks> = (0..total).map(|j| Goldilocks::from_u64(j as u64)).collect();
         let expected_den = alpha + crate::common::mle::eval(&j_mle, &full_r) + beta * ev_t;
         assert_eq!(den_leaf, expected_den);
@@ -790,7 +832,6 @@ mod tests {
         assert_eq!(ev, crate::common::mle::eval(&y, &r));
     }
 }
-
 
 /// LogUp permutation argument: prove two same-length multisets `a` and `b` are
 /// equal as multisets (i.e. `b` is a permutation of `a`) via the fractional
@@ -852,20 +893,22 @@ mod permutation_tests {
         let mut rng = XorShift64::new(0xABCD);
         let a: Vec<Goldilocks> = vec![1, 2, 3, 4]
             .into_iter()
-            .map(|v| Goldilocks::from_u64(v))
+            .map(Goldilocks::from_u64)
             .collect();
         // b is a permutation of a
         let b: Vec<Goldilocks> = vec![3, 1, 4, 2]
             .into_iter()
-            .map(|v| Goldilocks::from_u64(v))
+            .map(Goldilocks::from_u64)
             .collect();
         let proof = prove_permutation(&a, &b, &mut rng);
-        assert!(verify_permutation(&proof, &a, &b));
-        // a non-permutation must reject
+        assert!(verify_permutation(&proof));
+        // A non-permutation must reject: prove against a multiset whose
+        // fractional sum differs, then check the verifier refuses it.
         let bad: Vec<Goldilocks> = vec![3, 1, 4, 5]
             .into_iter()
-            .map(|v| Goldilocks::from_u64(v))
+            .map(Goldilocks::from_u64)
             .collect();
-        assert!(!verify_permutation(&proof, &a, &bad));
+        let bad_proof = prove_permutation(&a, &bad, &mut rng);
+        assert!(!verify_permutation(&bad_proof));
     }
 }

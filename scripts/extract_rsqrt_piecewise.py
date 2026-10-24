@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the piecewise LayerNorm rsqrt lookup table (shared with GPT-2).
+"""Generate the piecewise LayerNorm rsqrt lookup table.
 
 LayerNorm needs `rstd = 1/sqrt(var + eps)`. The index is piecewise:
 - indices below 2^20 are full resolution (step 1, index scale 2^14);
@@ -7,8 +7,14 @@ LayerNorm needs `rstd = 1/sqrt(var + eps)`. The index is piecewise:
 - raw >= 2^30 are quantized with step 2^16 (rsqrt is nearly flat there).
 This covers GPT-2's ~13294 variance and Gemma 3's much larger ~1e6 variance.
 
-Usage: python scripts/extract_rsqrt_piecewise.py
+The table is per-model: it is written to `models/<model>/weights/`. Pass the
+model name as the first argument or via `MODEL=...`; it defaults to gpt2.
+
+Usage: python scripts/extract_rsqrt_piecewise.py [model]
 """
+import os
+import sys
+
 import numpy as np
 
 SCALE = 65536.0
@@ -19,6 +25,13 @@ COARSE_STEP = 1 << 8
 COARSE = 1 << 22        # coarse-1 entries (step 2^8)
 COARSE_STEP2 = 1 << 16
 COARSE2 = 1 << 21       # coarse-2 entries (step 2^16)
+
+
+def model_out_dir() -> str:
+    model = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODEL", "gpt2")
+    path = os.path.join("models", model, "weights")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def main() -> None:
@@ -39,9 +52,10 @@ def main() -> None:
 
     table = np.concatenate([fine_rstd, coarse_rstd, coarse2_rstd])
     table = np.clip(np.round(table * SCALE), 0, 2**31 - 1).astype(np.int32)
-    table.tofile("models/gpt2/weights/rsqrt_table_i32.bin")
+    path = os.path.join(model_out_dir(), "rsqrt_table_i32.bin")
+    table.tofile(path)
     max_var = (coarse2_start + (COARSE2 - 1) * COARSE_STEP2) / INDEX_SCALE
-    print(f"wrote {len(table)} piecewise rsqrt entries; max var = {max_var:.1f}")
+    print(f"wrote {len(table)} piecewise rsqrt entries; max var = {max_var:.1f} to {path}")
 
 
 if __name__ == "__main__":

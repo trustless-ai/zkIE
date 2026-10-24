@@ -34,27 +34,6 @@ impl XorShift64 {
         Goldilocks::from_u64(self.next_u64())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inverse_of_two() {
-        assert_eq!(
-            Goldilocks::TWO * Goldilocks::from_u64((P + 1) / 2),
-            Goldilocks::ONE
-        );
-    }
-
-    #[test]
-    fn xorshift_produces_canonical_elements() {
-        let mut rng = XorShift64::new(1);
-        for _ in 0..1000 {
-            assert!(rng.field().as_canonical_u64() < P);
-        }
-    }
-}
 /// A deterministic challenge source (Fiat-Shamir). Both the test PRNG
 /// `XorShift64` and the SHA-256 `Transcript` implement this, so prove/verify
 /// can be generic over the challenge source.
@@ -72,5 +51,26 @@ impl ChallengeSource for XorShift64 {
     }
     fn next_u64(&mut self) -> u64 {
         XorShift64::next_u64(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_of_two() {
+        assert_eq!(
+            Goldilocks::TWO * Goldilocks::from_u64(P.div_ceil(2)),
+            Goldilocks::ONE
+        );
+    }
+
+    #[test]
+    fn xorshift_produces_canonical_elements() {
+        let mut rng = XorShift64::new(1);
+        for _ in 0..1000 {
+            assert!(rng.field().as_canonical_u64() < P);
+        }
     }
 }

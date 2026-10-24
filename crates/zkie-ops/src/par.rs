@@ -2,6 +2,12 @@
 //! global work-stealing pool so nested parallelism (parallel proof across layers
 //! calling parallel matmul inside) does not oversubscribe.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 use rayon::prelude::*;
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
@@ -23,7 +29,7 @@ pub fn mm_par(
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for kk in 0..k {
-                acc = acc + a[i * k + kk] * b[kk * n + j];
+                acc += a[i * k + kk] * b[kk * n + j];
             }
             cij[j] = acc;
         }

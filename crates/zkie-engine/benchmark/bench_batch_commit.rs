@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::pcs::whir::Whir;
 
 fn run(rng: &mut XorShift64, whir: &Whir, size: usize, n: usize, label: &str) {

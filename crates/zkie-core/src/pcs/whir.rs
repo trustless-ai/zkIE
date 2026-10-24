@@ -7,6 +7,12 @@
 //! matmul verifier needs for the two sum-check evaluations it would otherwise
 //! recompute in `O(k)`.
 
+// Loop bodies in this module index several buffers from one loop counter
+// (bit-indexing, `pos * h + d` layouts, interleaved field arithmetic). The
+// iterator rewrites this lint suggests read worse here and, in the FFT/logUp
+// kernels, would reorder field operations; the indexed form is deliberate.
+#![allow(clippy::needless_range_loop)]
+
 /// Global count of FRI opening proofs across all Whir instances (batch Whirs are
 /// transient, so per-instance stats do not accumulate). Used for telemetry.
 static GLOBAL_OPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -29,7 +35,9 @@ use p3_sumcheck::layout::{Layout as _, SuffixProver, Table};
 use p3_sumcheck::{OpeningBatch, PointSchedule, PrescribedPointPcs, TableShape, TableSpec};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_whir::fiat_shamir::domain_separator::DomainSeparator;
-use p3_whir::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig, WhirConfigError};
+use p3_whir::parameters::{
+    FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig, WhirConfigError,
+};
 use p3_whir::pcs::prover::WhirProver;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -802,6 +810,25 @@ fn to_ef_point(point: &[Goldilocks]) -> Point<EF> {
     Point::new(point.iter().rev().map(|&c| EF::from(c)).collect())
 }
 
+impl serde::Serialize for Whir {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = serializer.serialize_tuple(3)?;
+        t.serialize_element(&self.num_variables)?;
+        t.serialize_element(&self.security_level)?;
+        t.serialize_element(&self.pow_bits)?;
+        t.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Whir {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (num_variables, security_level, pow_bits) =
+            <(usize, usize, usize)>::deserialize(deserializer)?;
+        Ok(Whir::with_params(num_variables, security_level, pow_bits))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,7 +863,15 @@ mod tests {
         let mut rng = XorShift64::new(0x5eed);
         let d = 6;
         let evals: Vec<Goldilocks> = (0..(1 << d)).map(|_| rng.field()).collect();
-        let whir = Whir::new(d);
+        // Fast instance on purpose. `Whir::new` is the production one (90-bit
+        // security, `pow_bits = 32`), and the prover grinds ~2^32 transcript
+        // hashes per opening for that PoW budget — minutes per test, which is
+        // what used to make `cargo test -p zkie-core` look hung. Nothing here
+        // exercises PoW or the security level: the test asserts that the
+        // prescribed-point open/verify roundtrip returns the MLE evaluation.
+        // The production parameters themselves are covered by
+        // `new_and_new_testing_expose_their_parameters` below.
+        let whir = Whir::new_testing(d);
 
         let point: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
         let (commitment, prover_data, protocol) = whir.commit(&evals);
@@ -845,6 +880,20 @@ mod tests {
 
         assert_eq!(opened, verified);
         assert_eq!(verified, mle::eval(&evals, &point));
+    }
+
+    /// The two constructors differ only in parameters; assert the values here
+    /// instead of paying for a 2^32-hash grind in every other test.
+    #[test]
+    fn new_and_new_testing_expose_their_parameters() {
+        let production = Whir::new(8);
+        assert_eq!(production.security_level(), 90);
+        assert_eq!(production.pow_bits(), 32);
+        assert_eq!(production.num_variables(), 8);
+
+        let testing = Whir::new_testing(8);
+        assert_eq!(testing.security_level(), 32);
+        assert_eq!(testing.pow_bits(), 10);
     }
 
     #[test]
@@ -904,24 +953,3 @@ mod tests {
         assert_eq!(verified.len(), num_tables);
     }
 }
-
-
-impl serde::Serialize for Whir {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeTuple;
-        let mut t = serializer.serialize_tuple(3)?;
-        t.serialize_element(&self.num_variables)?;
-        t.serialize_element(&self.security_level)?;
-        t.serialize_element(&self.pow_bits)?;
-        t.end()
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Whir {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (num_variables, security_level, pow_bits) =
-            <(usize, usize, usize)>::deserialize(deserializer)?;
-        Ok(Whir::with_params(num_variables, security_level, pow_bits))
-    }
-}
-

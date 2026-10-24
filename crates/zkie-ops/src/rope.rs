@@ -12,12 +12,10 @@
 //! `cos`/`sin` are `[m, d/2]` fixed-point tables shared across heads. The
 //! output keeps the natural layout, so it can feed the attention matmul.
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
-use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
-};
-use zkie_core::common::mle;
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
 fn round_div(a: i64, b: i64) -> i64 {
@@ -40,7 +38,7 @@ pub struct RoPEProof {
 }
 
 fn heads_of(x_len: usize, m: usize, d: usize) -> usize {
-    assert!(d % 2 == 0, "head dim must be even");
+    assert!(d.is_multiple_of(2), "head dim must be even");
     assert_eq!(x_len % (m * d), 0, "tensor not divisible into heads");
     x_len / (m * d)
 }

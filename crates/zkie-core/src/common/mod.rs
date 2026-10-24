@@ -1,5 +1,5 @@
-pub mod claim;
 pub mod batched_matmul;
+pub mod claim;
 pub mod field;
 pub mod fixed_point;
 pub mod logup_gkr;

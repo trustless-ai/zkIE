@@ -319,7 +319,7 @@ pub fn autotune(model: &Model, granularities: &[Granularity]) -> TuningResult {
     for &g in granularities {
         for &sched in &schedules {
             let r = estimate(model, g, sched);
-            if best.as_ref().map_or(true, |b| r.total_s < b.total_s) {
+            if best.as_ref().is_none_or(|b| r.total_s < b.total_s) {
                 best = Some(r);
             }
         }
@@ -344,7 +344,7 @@ where
     for &g in granularities {
         for &sched in schedules {
             let r = measure(g, sched);
-            if best.as_ref().map_or(true, |b| r.total_s < b.total_s) {
+            if best.as_ref().is_none_or(|b| r.total_s < b.total_s) {
                 best = Some(r);
             }
         }

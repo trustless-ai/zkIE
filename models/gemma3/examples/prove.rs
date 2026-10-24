@@ -26,7 +26,7 @@ fn main() {
     let mut ops = Vec::new();
     let (_x0, logits, _tokens, _t) = build_gemma3(&mut store, &mut ops, dir, m, 16);
 
-    let mut rng = XorShift64::new(0xC0FFEE);
+    let _rng = XorShift64::new(0xC0FFEE);
     let t0 = std::time::Instant::now();
     let proof = prove_shard_dag(&mut store, &ops, 53);
     let prove_t = t0.elapsed();

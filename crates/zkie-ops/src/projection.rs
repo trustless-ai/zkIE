@@ -3,11 +3,12 @@
 //! affine rounding as an arithmetic constraint, and the range check as a logUp
 //! lookup. This is the first reusable integration building block for the full
 //! GPT-2 layer circuit.
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i32};
 use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
-    FractionalProof,
+    prove_lookup_fractional, verify_lookup_fractional_chain, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
@@ -41,6 +42,7 @@ fn transpose(x: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     }
     wt
 }
+#[allow(clippy::too_many_arguments)]
 pub fn prove_projection(
     x: &[Goldilocks],
     w: &[Goldilocks],

@@ -32,11 +32,13 @@ fn main() {
     let mut rng = XorShift64::new(0xBEEF);
 
     let t0 = std::time::Instant::now();
-    let cached = commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/timesfm-model-batches-v2");
+    let cached = commit_model_weights(&store, &ops, "target/zkie-cache/timesfm-model-batches-v2");
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 108, &whir, &cached, &mut rng, tokens, argmax);
+    let proof = prove_committed_shard_dag(
+        &mut store, &ops, 108, &whir, &cached, &mut rng, tokens, argmax,
+    );
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();

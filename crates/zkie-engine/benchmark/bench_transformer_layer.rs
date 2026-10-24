@@ -13,7 +13,7 @@ fn mm(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<G
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for kk in 0..k {
-                acc = acc + a[i * k + kk] * b[kk * n + j];
+                acc += a[i * k + kk] * b[kk * n + j];
             }
             c[i * n + j] = acc;
         }

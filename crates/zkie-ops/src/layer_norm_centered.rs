@@ -4,11 +4,10 @@
 //! remainders are witness values (not yet range-checked — soundness TODO).
 
 use crate::compose::{check_rsqrt_table, rsqrt_index};
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
-};
 use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
@@ -258,10 +257,7 @@ pub fn prove_layer_norm_centered(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_layer_norm_centered(
-    proof: &LayerNormCenteredProof,
-    n_real: usize,
-) -> bool {
+pub fn verify_layer_norm_centered(proof: &LayerNormCenteredProof, n_real: usize) -> bool {
     let d_f = Goldilocks::from_u64(n_real as u64);
     let half_d = Goldilocks::from_u64((n_real / 2) as u64);
     let half32 = Goldilocks::from_u64(1u64 << 31);
@@ -350,7 +346,8 @@ mod tests {
         let rsqrt_table: Vec<Goldilocks> = (0..(1usize << 20))
             .map(|j| from_i64((j % 1000 + 1) as i64))
             .collect();
-        let (proof, _ridx, _rvals) = prove_layer_norm_centered(&x, &w, &b, &rsqrt_table, m, d, d, &mut rng);
+        let (proof, _ridx, _rvals) =
+            prove_layer_norm_centered(&x, &w, &b, &rsqrt_table, m, d, d, &mut rng);
         assert!(verify_layer_norm_centered(&proof, d));
     }
 }

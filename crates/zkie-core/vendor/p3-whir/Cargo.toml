@@ -141,6 +141,28 @@ version = "0.1.44"
 features = ["attributes"]
 default-features = false
 
+# `cargo vendor` starts from the manifest crates.io publishes, and publishing
+# drops dev-dependencies that only had a `path` requirement (upstream's
+# Plonky3 monorepo siblings). The test modules under src/ still import them, so
+# without these entries `cargo test --workspace --lib` fails with
+# `unresolved import p3_baby_bear`. The published 0.7.0 releases are the same
+# code, so pin them back at that version. See Cargo.toml.orig for the original
+# path-based declaration.
+[dev-dependencies.p3-baby-bear]
+version = "0.7.0"
+
+[dev-dependencies.p3-blake3]
+version = "0.7.0"
+
+[dev-dependencies.p3-fri]
+version = "0.7.0"
+
+[dev-dependencies.p3-keccak]
+version = "0.7.0"
+
+[dev-dependencies.p3-koala-bear]
+version = "0.7.0"
+
 [dev-dependencies.clap]
 version = "4.6.1"
 features = ["derive"]

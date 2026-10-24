@@ -9,11 +9,12 @@
 //!   d1 = sel*(x - thr) and d2 = (1-sel)*(thr - x), both in [0, 2^16)
 //!   sum_e sel[t,e] = k for every row  (exactly k selected)
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
-    FractionalProof,
+    prove_lookup_fractional, verify_lookup_fractional_chain, FractionalProof,
 };
 use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
@@ -38,6 +39,7 @@ pub struct TopKSelectProof {
 }
 
 /// `(thr, sel, gate, d1, d2)`.
+#[allow(clippy::type_complexity)]
 pub fn topk_forward(
     x: &[Goldilocks],
     m: usize,
@@ -104,7 +106,7 @@ pub fn prove_topk(
     // threshold broadcast to [m, n]
     let thr_b: Vec<Goldilocks> = thr
         .iter()
-        .flat_map(|&v| std::iter::repeat(v).take(n))
+        .flat_map(|&v| std::iter::repeat_n(v, n))
         .collect();
 
     // d1 = sel*(x - thr)  =>  sel*x - sel*thr - d1 = 0
@@ -132,7 +134,7 @@ pub fn prove_topk(
     let eq_row = mle::eq_evals(&r_row);
     let eq_b: Vec<Goldilocks> = eq_row
         .iter()
-        .flat_map(|&v| std::iter::repeat(v).take(n))
+        .flat_map(|&v| std::iter::repeat_n(v, n))
         .collect();
     let row_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
     let row_sum = prove_virtual(&[sel, &eq_b], &row_terms, from_i64(k as i64), &r);
@@ -170,8 +172,8 @@ pub fn prove_topk(
         a_d1,
         b_d1,
         range_bits,
-            sel: sel.to_vec(),
-}
+        sel: sel.to_vec(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,7 +259,6 @@ mod tests {
     }
 }
 
-
 /// Argmax (top-1) per row of an m x n matrix. Reuses TopKSelect's range/one-hot
 /// proof with k=1, and binds the public index vector `out` to the one-hot `sel`
 /// (checking sel[i][out[i]] == 1 for every row).
@@ -269,6 +270,7 @@ pub struct ArgmaxProof {
 }
 
 /// `(thr, sel, gate, d1, d2, out)`.
+#[allow(clippy::type_complexity)]
 pub fn argmax_forward(
     x: &[Goldilocks],
     m: usize,
@@ -338,7 +340,6 @@ pub fn verify_argmax(proof: &ArgmaxProof, m: usize, n: usize) -> bool {
     true
 }
 
-
 #[cfg(test)]
 mod argmax_tests {
     use super::*;
@@ -367,7 +368,6 @@ mod argmax_tests {
         assert!(!verify_argmax(&bad, m, n));
     }
 }
-
 
 /// 48-bit range decomposition: prove each value is in [0, 2^48) by splitting it
 /// into three 16-bit limbs, range-checking each limb against a 2^16 table, and

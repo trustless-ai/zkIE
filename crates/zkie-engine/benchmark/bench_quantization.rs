@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use zkie_core::common::field::{PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::field::XorShift64;
 use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_ops::par::mm_par;
 use zkie_ops::projection::{prove_projection, verify_projection};

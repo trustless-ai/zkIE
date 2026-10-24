@@ -29,7 +29,6 @@ impl Claim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::field::PrimeCharacteristicRing;
 
     #[test]
     fn claim_evaluates_tensor_at_point() {

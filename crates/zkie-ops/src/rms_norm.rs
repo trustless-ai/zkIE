@@ -4,12 +4,10 @@
 //! actually-verified chain: ms truncation + rsqrt lookup + out affine.
 
 use crate::compose::{check_rsqrt_table, rsqrt_index};
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
-use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional_batch, verify_lookup_fractional_batch, FractionalProof,
-};
-use zkie_core::common::mle;
+#[cfg(test)]
+use zkie_core::common::field::XorShift64;
+use zkie_core::common::field::{ChallengeSource, Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
 fn round_div(a: i64, b: i64) -> i64 {
@@ -98,7 +96,13 @@ pub fn prove_rms_norm(
     d: usize,
     n_real: usize,
     rng: &mut impl ChallengeSource,
-) -> (RmsNormProof, Vec<u32>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
+) -> (
+    RmsNormProof,
+    Vec<u32>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+) {
     let (ms, s_index, rstd, out, rem_out, rem_lo, rem_hi, sum_sq, rem_s) =
         rms_norm_forward(x, w, rsqrt_table, m, d, n_real);
 
@@ -242,7 +246,8 @@ mod tests {
         let rsqrt_table: Vec<Goldilocks> = (0..64).map(|_| from_i64(65536)).collect();
         let (ms, _s_index, _rstd, out, _rem_out, _rem_lo, _rem_hi, _sum_sq, _rem_s) =
             rms_norm_forward(&x, &w, &rsqrt_table, m, d, n_real);
-        let (proof, _ridx, _rvals, _rem_lo, _rem_hi) = prove_rms_norm(&x, &w, &rsqrt_table, m, d, n_real, &mut rng);
+        let (proof, _ridx, _rvals, _rem_lo, _rem_hi) =
+            prove_rms_norm(&x, &w, &rsqrt_table, m, d, n_real, &mut rng);
         assert!(verify_rms_norm(&proof, n_real));
         assert_eq!(ms.len(), m);
         assert_eq!(out.len(), m * d);

@@ -5,8 +5,7 @@ use zkie_core::common::fixed_point::{from_i32, to_i32, to_i64};
 use zkie_core::pcs::whir::Whir;
 use zkie_models_deepseek_v2_lite::{build_deepseek, VOCAB, VOCAB_PAD};
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes,
-    verify_sequence_shift, Store,
+    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes, Store,
 };
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -28,26 +27,32 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = std::env::var("M").ok().and_then(|s| s.parse().ok()).unwrap_or(16usize);
+    let m = std::env::var("M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
     let dir = "models/deepseek-v2-lite/weights";
 
     let mut store = Store::new();
     let mut ops = Vec::new();
     let (_x0, logits, tokens, t) = build_deepseek(&mut store, &mut ops, dir, m, 16);
     println!("seq={m} total ops: {}", ops.len());
-    let gt = load_i32(&format!("{dir}/gt_argmax_{}i32.bin", if m <= 16 { "" } else { "512_" }));
+    let gt = load_i32(&format!(
+        "{dir}/gt_argmax_{}i32.bin",
+        if m <= 16 { "" } else { "512_" }
+    ));
 
     // Boundaries build a per-tensor Whir internally; this is a placeholder.
     let whir = Whir::new_testing(5);
     let mut rng = XorShift64::new(0xD5EED);
 
     let t0 = std::time::Instant::now();
-    let cached =
-        commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/deepseek-model-batches-v2");
+    let cached = commit_model_weights(&store, &ops, "target/zkie-cache/deepseek-model-batches-v2");
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 718, &whir, &cached, &mut rng, tokens, t);
+    let proof =
+        prove_committed_shard_dag(&mut store, &ops, 718, &whir, &cached, &mut rng, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();

@@ -1,4 +1,3 @@
-
 extern "C" {
     // goldilocks_ntt.cu
     pub fn zkie_cuda_device_count() -> i32;

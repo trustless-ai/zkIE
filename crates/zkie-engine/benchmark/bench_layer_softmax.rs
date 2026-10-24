@@ -22,7 +22,7 @@ fn main() {
         .collect();
     let indices: Vec<u32> = scores
         .iter()
-        .map(|&v| ((to_i32(v) as i64 + offset as i64).clamp(0, table_size as i64 - 1) as u32))
+        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, table_size as i64 - 1) as u32)
         .collect();
     let e: Vec<Goldilocks> = indices.iter().map(|&i| exp_table[i as usize]).collect();
     let sum: Vec<Goldilocks> = (0..seq)

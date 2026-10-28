@@ -19,6 +19,7 @@
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::common::mle;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use rayon::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BatchedMatmulProof {
@@ -340,18 +341,22 @@ pub fn gather_matmul_forward(
     assert_eq!(seg.len(), s * k);
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
-    let mut g = vec![Goldilocks::ZERO; s * n];
-    for pos in 0..s {
-        let base = expert_of[pos] as usize * k * n;
-        for j in 0..n {
-            let mut acc = Goldilocks::ZERO;
-            for d in 0..k {
-                acc = acc + seg[pos * k + d] * w_all[base + d * n + j];
-            }
-            g[pos * n + j] = acc;
-        }
-    }
-    g
+    let seg_ref = seg;
+    let w_ref = w_all;
+    let expert_ref = expert_of;
+    (0..s)
+        .into_par_iter()
+        .flat_map_iter(|pos| {
+            let base = expert_ref[pos] as usize * k * n;
+            (0..n).map(move |j| {
+                let mut acc = Goldilocks::ZERO;
+                for d in 0..k {
+                    acc = acc + seg_ref[pos * k + d] * w_ref[base + d * n + j];
+                }
+                acc
+            })
+        })
+        .collect()
 }
 
 /// Streaming prove: same eq-selector sumcheck as `prove`, but `w_v` is computed on
@@ -493,6 +498,86 @@ pub fn prove_gather_matmul(
     }
 }
 
+/// Memory-streaming variant of [`prove_gather_matmul`] for the full 552B
+/// MoE: instead of requiring the whole `n_experts * k * n` weight stack to be
+/// materialized at once, it pulls each expert on demand through `mat_expert`.
+/// The eq-selector sumcheck only ever needs the *selected* experts (cached), and
+/// the per-expert `table[e]` evals materialize one expert at a time, so peak
+/// memory stays at a single expert plus the selected-expert cache.
+pub fn prove_gather_matmul_streaming<F>(
+    seg: &[Goldilocks],
+    expert_of: &[u32],
+    mat_expert: F,
+    g: &[Goldilocks],
+    s: usize,
+    k: usize,
+    n: usize,
+    n_experts: usize,
+    u: &[Goldilocks],
+    v: &[Goldilocks],
+    ch: &[Goldilocks],
+) -> GatherMatMulProof
+where
+    F: Fn(usize) -> Vec<Goldilocks>,
+{
+    assert_eq!(seg.len(), s * k);
+    assert_eq!(expert_of.len(), s);
+    assert_eq!(g.len(), s * n);
+
+    // gather_w_v over only the experts actually selected, materializing each
+    // unique selected expert once.
+    let eq_v = mle::eq_evals(v);
+    let mut cache: Vec<Option<Vec<Goldilocks>>> = (0..n_experts).map(|_| None).collect();
+    let mut w_v = vec![Goldilocks::ZERO; s * k];
+    for pos in 0..s {
+        let e = expert_of[pos] as usize;
+        if cache[e].is_none() {
+            let w = mat_expert(e);
+            assert_eq!(w.len(), k * n);
+            cache[e] = Some(w);
+        }
+        let w = cache[e].as_ref().unwrap();
+        for d in 0..k {
+            let mut acc = Goldilocks::ZERO;
+            for j in 0..n {
+                acc = acc + w[d * n + j] * eq_v[j];
+            }
+            w_v[pos * k + d] = acc;
+        }
+    }
+    drop(cache);
+
+    let eq_u = mle::eq_evals(u);
+    let eq_b = broadcast_eq(&eq_u, k);
+    let mut gp = v.to_vec();
+    gp.extend_from_slice(u);
+    let claimed = mle::eval(g, &gp);
+    let mles: [&[Goldilocks]; 3] = [seg, &w_v, &eq_b];
+    let sumcheck = prove_virtual(&mles, &terms(), claimed, ch);
+
+    let k_bits = k.trailing_zeros() as usize;
+    let ch_d = &ch[..k_bits];
+    let ch_pos = &ch[k_bits..];
+    let counts = expert_counts(expert_of, n_experts, ch_pos);
+
+    // expert_table_evals, one expert materialized at a time.
+    let mut point = v.to_vec();
+    point.extend_from_slice(ch_d);
+    let mut table = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let w = mat_expert(e);
+        assert_eq!(w.len(), k * n);
+        table.push(mle::eval(&w, &point));
+    }
+
+    GatherMatMulProof {
+        claimed,
+        sumcheck,
+        counts,
+        table,
+    }
+}
+
 pub fn verify_gather_matmul(
     proof: &GatherMatMulProof,
     s: usize,
@@ -518,6 +603,40 @@ pub fn verify_gather_matmul(
 mod gather_matmul_proof_tests {
     use super::*;
     use crate::common::field::{ChallengeSource, XorShift64};
+
+    #[test]
+    fn gather_matmul_parallel_matches_sequential() {
+        use rayon::prelude::*;
+        let mut rng = XorShift64::new(0x9191);
+        let (s, k, n, n_experts) = (32usize, 64usize, 64usize, 8usize);
+        let seg: Vec<Goldilocks> = (0..s * k)
+            .map(|_| Goldilocks::from_u64(rng.next_u64() % (1 << 20)))
+            .collect();
+        let w_all: Vec<Goldilocks> = (0..n_experts * k * n)
+            .map(|_| Goldilocks::from_u64(rng.next_u64() % (1 << 20)))
+            .collect();
+        let expert_of: Vec<u32> = (0..s)
+            .map(|_| (rng.next_u64() % n_experts as u64) as u32)
+            .collect();
+        let seq = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
+        let seg_ref = seg.as_slice();
+        let w_ref = w_all.as_slice();
+        let expert_ref = expert_of.as_slice();
+        let par: Vec<Goldilocks> = (0..s)
+            .into_par_iter()
+            .flat_map_iter(|pos| {
+                let base = expert_ref[pos] as usize * k * n;
+                (0..n).map(move |j| {
+                    let mut acc = Goldilocks::ZERO;
+                    for d in 0..k {
+                        acc = acc + seg_ref[pos * k + d] * w_ref[base + d * n + j];
+                    }
+                    acc
+                })
+            })
+            .collect();
+        assert_eq!(seq, par);
+    }
 
     #[test]
     fn gather_matmul_self_contained() {

@@ -10,7 +10,7 @@
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward, prove_layer_norm_centered,
@@ -20,23 +20,32 @@ use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, Laye
 use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
-use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
+use crate::rms_norm::{
+    prove_rms_norm, prove_rsqrt, rms_norm_forward, rsqrt_forward, verify_rms_norm, verify_rsqrt,
+    RmsNormProof, RsqrtProof,
+};
+use crate::scale::{prove_scale, prove_scale_vec, verify_scale, verify_scale_vec, ScaleProof, ScaleVecProof};
+use crate::gelu_index::{prove_gelu_index, verify_gelu_index, GeluIndexProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
-use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
+use crate::softmax_scaled::{
+    prove_softmax_bias, prove_softmax_rounded, softmax_bias_forward, verify_softmax_bias,
+    verify_softmax_rounded, SoftmaxBiasProof, SoftmaxRoundedProof,
+};
 use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+use zkie_core::common::fixed_point::{from_i128, from_i64, to_i128, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
     prove_fractional_with_challenges, prove_lookup_table, prove_lookup_witness_batch_columns,
-    verify_lookup_split, FractionalProof,
+    verify_lookup_split, prove_permutation, verify_permutation, PermutationProof, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
 use zkie_core::common::mle;
+use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
 use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use zkie_core::common::transcript::Transcript;
@@ -108,6 +117,59 @@ fn round_div(a: i64, b: i64) -> i64 {
     } else {
         q
     }
+}
+
+fn round_div_i128(a: i128, b: i128) -> i128 {
+    let q = a.div_euclid(b);
+    let r = a.rem_euclid(b);
+    if r * 2 >= b {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Minimal counting semaphore used to bound the in-flight weight-group
+/// materializations during the streaming commitment. Rayon's pool bounds the
+/// number of *tasks*, but a single `commit_batch` fans out into its own nested
+/// rayon work, so the peak resident memory is bounded by a permit count rather
+/// than the thread count.
+struct Semaphore {
+    state: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Semaphore { state: Mutex::new(n), cv: Condvar::new() }
+    }
+
+    fn acquire(&self) -> Permit<'_> {
+        let mut n = self.state.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit(self)
+    }
+
+    fn release(&self) {
+        let mut n = self.state.lock().unwrap();
+        *n += 1;
+        self.cv.notify_one();
+    }
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 fn projection_fwd(x: &[Goldilocks], step: &ProjectionStep) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
@@ -507,6 +569,16 @@ pub fn verify_residual_chain(
 /// Tensor id in the shard's tensor store.
 pub type T = usize;
 
+/// One expert's packed FP4 weight plus its E8M0 scale, materialized on demand.
+#[derive(Clone)]
+pub struct QuantizedExpert {
+    pub file: Arc<SafetensorFile>,
+    pub weight: String,
+    pub scale: String,
+    pub logical_cols: usize,
+    pub block_size: usize,
+}
+
 /// A tensor datum: owned (activations, small weights) or a memory-mapped i32
 /// weight slice that is converted to Goldilocks on demand.
 #[derive(Clone)]
@@ -517,6 +589,49 @@ pub enum TensorData {
         start: usize,
         len: usize,
     },
+    /// A quantized safetensors weight plus its block scale, materialized on
+    /// demand into fixed-point Goldilocks. `weight` and `scale` are tensor names
+    /// in `file`; `dtype` selects FP8-E4M3 or packed FP4-E2M1.
+    Quantized {
+        file: Arc<SafetensorFile>,
+        weight: String,
+        scale: String,
+        dtype: QuantDtype,
+        logical_cols: usize,
+        block_size: usize,
+    },
+    /// A stack of `[n_experts, k, n]` packed-FP4 expert weights, materialized
+    /// lazily. The forward pass dequantizes only the selected experts; the
+    /// commitment path materializes the full stack in `commit_model_weights`.
+    ExpertStack {
+        experts: Arc<Vec<QuantizedExpert>>,
+        k: usize,
+        n: usize,
+    },
+}
+
+/// Dequantize one packed-FP4 expert weight into its `[k, n]` layout (input dim
+/// x output dim), matching `GatherMatMul`'s weight indexing.
+fn materialize_expert(expert: &QuantizedExpert) -> Vec<Goldilocks> {
+    let w = expert.file.read_fp4_weight(
+        &expert.weight,
+        &expert.scale,
+        expert.logical_cols,
+        expert.block_size,
+    );
+    let info = expert
+        .file
+        .tensor(&expert.weight)
+        .expect("missing expert weight");
+    let rows_pad = info.shape[0].next_power_of_two();
+    let cols_pad = expert.logical_cols.next_power_of_two();
+    let mut out = vec![Goldilocks::ZERO; cols_pad * rows_pad];
+    for r in 0..rows_pad {
+        for c in 0..cols_pad {
+            out[c * rows_pad + r] = w[r * cols_pad + c];
+        }
+    }
+    out
 }
 
 /// A shard's tensor store: `v[id]` is a Goldilocks tensor; `idx[id]` is an
@@ -541,27 +656,150 @@ impl Store {
         self.v.push(TensorData::Mmap { mmap, start, len });
         id
     }
+    pub fn push_quantized(
+        &mut self,
+        file: Arc<SafetensorFile>,
+        weight: String,
+        scale: String,
+        dtype: QuantDtype,
+        logical_cols: usize,
+        block_size: usize,
+    ) -> T {
+        let id = self.v.len();
+        self.v.push(TensorData::Quantized {
+            file,
+            weight,
+            scale,
+            dtype,
+            logical_cols,
+            block_size,
+        });
+        id
+    }
     pub fn push_idx(&mut self, t: Vec<u32>) -> T {
         let id = self.idx.len();
         self.idx.push(t);
+        id
+    }
+    pub fn push_expert_stack(
+        &mut self,
+        experts: Vec<QuantizedExpert>,
+        k: usize,
+        n: usize,
+    ) -> T {
+        let id = self.v.len();
+        self.v.push(TensorData::ExpertStack {
+            experts: Arc::new(experts),
+            k,
+            n,
+        });
         id
     }
     pub fn get(&self, id: T) -> &[Goldilocks] {
         match &self.v[id] {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get() on mmap-backed tensor; use materialize()"),
+            TensorData::Quantized { .. } => {
+                panic!("get() on quantized tensor; use materialize()")
+            }
+            TensorData::ExpertStack { .. } => {
+                panic!("get() on expert stack; use materialize() or materialize_expert_rows()")
+            }
         }
     }
     pub fn materialize(&self, id: T) -> Cow<'_, [Goldilocks]> {
         match &self.v[id] {
             TensorData::Owned(v) => Cow::Borrowed(v),
             TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
+            TensorData::Quantized {
+                file,
+                weight,
+                scale,
+                dtype,
+                logical_cols,
+                block_size,
+            } => {
+                let out = match dtype {
+                    QuantDtype::Fp8E4M3 => {
+                        file.read_fp8_weight(weight, scale, *block_size)
+                    }
+                    QuantDtype::Int8 => file.read_fp4_weight(
+                        weight,
+                        scale,
+                        *logical_cols,
+                        *block_size,
+                    ),
+                    _ => panic!("unsupported quantized weight dtype {dtype:?}"),
+                };
+                Cow::Owned(out)
+            }
+            TensorData::ExpertStack { experts, .. } => {
+                let out = experts
+                    .iter()
+                    .flat_map(materialize_expert)
+                    .collect::<Vec<_>>();
+                Cow::Owned(out)
+            }
+        }
+    }
+    pub fn len(&self, id: T) -> usize {
+        match &self.v[id] {
+            TensorData::Owned(v) => v.len(),
+            TensorData::Mmap { len, .. } => *len,
+            TensorData::Quantized {
+                file,
+                weight,
+                dtype,
+                logical_cols,
+                ..
+            } => {
+                let info = file
+                    .tensor(weight)
+                    .unwrap_or_else(|| panic!("quantized tensor {weight} not found"));
+                let (rows, cols) = match dtype {
+                    QuantDtype::Fp8E4M3 => (info.shape[0], info.shape[1]),
+                    QuantDtype::Int8 => (info.shape[0], *logical_cols),
+                    _ => panic!("unsupported quantized weight dtype {dtype:?}"),
+                };
+                rows.next_power_of_two() * cols.next_power_of_two()
+            }
+            TensorData::ExpertStack { experts, k, n } => experts.len() * k * n,
+        }
+    }
+    /// Materialize only the requested experts of an `ExpertStack`, in the order
+    /// of `rows`, as a dense `[rows.len(), k, n]` tensor.
+    pub fn materialize_expert_rows(&self, id: T, rows: &[u32]) -> Vec<Goldilocks> {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, k, n } => {
+                rows.par_iter()
+                    .flat_map_iter(|&e| materialize_expert(&experts[e as usize]).into_iter())
+                    .collect()
+            }
+            _ => panic!("materialize_expert_rows on non-expert-stack tensor"),
+        }
+    }
+    /// Materialize a single expert of an `ExpertStack` (for streaming weight
+    /// commitment).
+    pub fn materialize_expert_one(&self, id: T, expert_idx: usize) -> Vec<Goldilocks> {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, .. } => {
+                materialize_expert(&experts[expert_idx])
+            }
+            _ => panic!("materialize_expert_one on non-expert-stack tensor"),
+        }
+    }
+    pub fn n_experts(&self, id: T) -> usize {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, .. } => experts.len(),
+            _ => 1,
         }
     }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
         match &mut self.v[id] {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get_mut() on mmap-backed tensor"),
+            TensorData::Quantized { .. } => panic!("get_mut() on quantized tensor"),
+            TensorData::ExpertStack { .. } => panic!("get_mut() on expert stack"),
         }
     }
 
@@ -573,6 +811,8 @@ impl Store {
             .map(|td| match td {
                 TensorData::Owned(v) => v.as_slice(),
                 TensorData::Mmap { .. } => &[],
+                TensorData::Quantized { .. } => &[],
+                TensorData::ExpertStack { .. } => &[],
             })
             .collect()
     }
@@ -586,6 +826,104 @@ pub enum Op {
         x: T,
         out: T,
         m: usize,
+        k: usize,
+    },
+    Slice {
+        x: T,
+        out: T,
+        start: usize,
+        len: usize,
+    },
+    Concat {
+        parts: Vec<T>,
+        out: T,
+    },
+    CompressMask {
+        out: T,
+        m: usize,
+        n: usize,
+        ratio: usize,
+    },
+    SortIndices {
+        idx: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
+    SelToIndices {
+        sel: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
+    CandidateBlocks {
+        x: T,
+        out: T,
+        m: usize,
+        n: usize,
+        block_size: usize,
+        topk_blocks: usize,
+    },
+    SinkhornSplit {
+        mixes: T,
+        scale: T,
+        base: T,
+        pre: T,
+        post: T,
+        comb: T,
+        m: usize,
+        hc: usize,
+        iters: usize,
+        eps: i64,
+    },
+    HyperPre {
+        x: T,
+        pre: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+    },
+    HyperPost {
+        y: T,
+        residual: T,
+        post: T,
+        comb: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+    },
+    EngramHash {
+        tokens: T,
+        out: T,
+        seq: usize,
+        max_ngram: usize,
+        n_heads: usize,
+    },
+    GatherRows {
+        idx: T,
+        table: T,
+        out: T,
+        dim: usize,
+    },
+    EngramGate {
+        x: T,
+        key: T,
+        weight: T,
+        value: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+        eps: i64,
+        clamp: i64,
+    },
+    SortSelected {
+        sel: T,
+        out: T,
+        m: usize,
+        n: usize,
         k: usize,
     },
     Scale {
@@ -611,6 +949,18 @@ pub enum Op {
         m: usize,
         k: usize,
         n: usize,
+    },
+    /// Block-quantized matmul. `w` is a [`TensorData::Quantized`] weight whose
+    /// dequantization is materialized on demand; `a` is the activation, `c` the
+    /// unrounded output. The block size is part of the public statement.
+    BlockQuantizedMatMul {
+        a: T,
+        w: T,
+        c: T,
+        m: usize,
+        k: usize,
+        n: usize,
+        block_size: usize,
     },
     Projection {
         x: T,
@@ -640,6 +990,24 @@ pub enum Op {
         table: T,
         m: usize,
         n: usize,
+        prec: u32,
+    },
+    SoftmaxBias {
+        e: T,
+        bias: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
+    /// Row normalization without an exponential: `out = round(x * 2^16 / row_sum(x))`.
+    /// This is the MoE routing-gate weights step (the values are already the
+    /// selected softplus-sqrt scores, so no `exp` table is involved).
+    SumNorm {
+        x: T,
+        out: T,
+        m: usize,
+        n: usize,
+        prec: u32,
     },
     SoftmaxIndex {
         x: T,
@@ -652,6 +1020,7 @@ pub enum Op {
         out: T,
         offset: i64,
         table_len: usize,
+        limb_table: T,
     },
     /// Numerically-stable softmax index with a causal mask:
     /// `idx = (to_i64(x + mask) - row_max + offset).clamp(0, table_len-1)`.
@@ -693,6 +1062,17 @@ pub enum Op {
         d: usize,
         n_real: usize,
     },
+    /// Per-row reciprocal square root only (`rstd = rsqrt_table[rsqrt_index(mean(x^2))]`),
+    /// without the elementwise affine. Used where a row must be scaled by its
+    /// own rsqrt *after* a matmul, which avoids rounding the normalized input.
+    Rsqrt {
+        x: T,
+        out: T,
+        rsqrt_table: T,
+        m: usize,
+        d: usize,
+        n_real: usize,
+    },
     RoPE {
         x: T,
         cos: T,
@@ -704,6 +1084,17 @@ pub enum Op {
         shift: u32,
     },
     TopKSelect {
+        x: T,
+        sel: T,
+        thr: T,
+        gate: T,
+        d1: T,
+        d2: T,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
+    SparseIndexer {
         x: T,
         sel: T,
         thr: T,
@@ -797,10 +1188,29 @@ pub enum Op {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum OpProof {
     Transpose,
-    Scale,
-    ScaleVec,
+    Slice,
+    Concat(PermutationProof, Goldilocks),
+    CompressMask,
+    SortIndices,
+    SelToIndices,
+    CandidateBlocks,
+    SinkhornSplit,
+    HyperPre,
+    HyperPost,
+    EngramHash,
+    GatherRows,
+    EngramGate,
+    SortSelected(TopKSelectProof),
+    Scale(ScaleProof),
+    ScaleVec(ScaleVecProof),
     Relu,
     MatMul(
+        MatmulProof,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    ),
+    BlockQuantizedMatMul(
         MatmulProof,
         Vec<Goldilocks>,
         Vec<Goldilocks>,
@@ -810,14 +1220,18 @@ pub enum OpProof {
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup,
     Softmax(SoftmaxRoundedProof),
+    SoftmaxBias(SoftmaxBiasProof),
+    SumNorm(SoftmaxRoundedProof),
     SoftmaxIndex,
-    GeluIndex,
+    GeluIndex(GeluIndexProof),
     StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
     RmsNorm(RmsNormProof),
+    Rsqrt(RsqrtProof),
     RoPE(RoPEProof),
     TopKSelect(TopKSelectProof),
+    SparseIndexer(TopKSelectProof),
     Argmax(ArgmaxProof),
     Scatter(ScatterProof),
     Gather(ScatterAddProof),
@@ -937,6 +1351,11 @@ pub struct OpShardProof {
     /// Raw `(tensor, point, eval)` claims emitted by this shard's ops, used by
     /// the shard-DAG composer for cross-shard binding.
     pub claims: Vec<(T, Vec<Goldilocks>, Goldilocks)>,
+    /// Per-expert weight claims emitted by `GatherMatMul`: `(weight_tensor,
+    /// expert_index, point, eval)`. Kept separate from `claims` because all
+    /// experts of an `ExpertStack` share one tensor id, so the tensor-only
+    /// `claims` keying cannot distinguish them.
+    pub expert_weight_claims: Vec<(T, usize, Vec<Goldilocks>, Goldilocks)>,
     pub witness_columns: Vec<WitnessColumn>,
     pub table_columns: Vec<TableColumn>,
 }
@@ -955,16 +1374,32 @@ impl Op {
     pub fn reads(&self) -> Vec<T> {
         match *self {
             Op::Transpose { x, .. } => vec![x],
+            Op::Slice { x, .. } => vec![x],
+            Op::Concat { ref parts, .. } => parts.iter().copied().collect(),
+            Op::CompressMask { .. } => vec![],
+            Op::SortIndices { idx, .. } => vec![idx],
+            Op::SelToIndices { sel, .. } => vec![sel],
+            Op::CandidateBlocks { x, .. } => vec![x],
+            Op::SinkhornSplit { mixes, scale, base, .. } => vec![mixes, scale, base],
+            Op::HyperPre { x, pre, .. } => vec![x, pre],
+            Op::HyperPost { y, residual, post, comb, .. } => vec![y, residual, post, comb],
+            Op::EngramHash { tokens, .. } => vec![tokens],
+            Op::GatherRows { idx, table, .. } => vec![idx, table],
+            Op::EngramGate { x, key, weight, value, .. } => vec![x, key, weight, value],
+            Op::SortSelected { sel, .. } => vec![sel],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
             Op::MatMul { a, b, .. } => vec![a, b],
+            Op::BlockQuantizedMatMul { a, w, .. } => vec![a, w],
             Op::Projection { x, w, bias, .. } => vec![x, w, bias],
             Op::Add { a, b, .. } => vec![a, b],
             Op::Lookup { idx, table, .. } => vec![idx, table],
             Op::Softmax { idx, table, .. } => vec![idx, table],
+            Op::SoftmaxBias { e, bias, .. } => vec![e, bias],
+            Op::SumNorm { x, .. } => vec![x],
             Op::SoftmaxIndex { x, .. } => vec![x],
-            Op::GeluIndex { x, .. } => vec![x],
+            Op::GeluIndex { x, limb_table, .. } => vec![x, limb_table],
             Op::StableSoftmaxIndex { x, mask, .. } => vec![x, mask],
             Op::Layernorm {
                 x,
@@ -983,8 +1418,10 @@ impl Op {
             Op::RmsNorm {
                 x, w, rsqrt_table, limb_table, ..
             } => vec![x, w, rsqrt_table, limb_table],
+            Op::Rsqrt { x, rsqrt_table, .. } => vec![x, rsqrt_table],
             Op::RoPE { x, cos, sin, range_table, .. } => vec![x, cos, sin, range_table],
             Op::TopKSelect { x, .. } => vec![x],
+            Op::SparseIndexer { x, .. } => vec![x],
             Op::Argmax { x, .. } => vec![x],
             Op::ScaleGate { x, gate, .. } => vec![x, gate],
             Op::Scatter { sel, .. } => vec![sel],
@@ -1006,6 +1443,20 @@ impl Op {
     pub fn writes(&self) -> Vec<T> {
         match *self {
             Op::Transpose { out, .. }
+            | Op::Slice { out, .. }
+            | Op::Concat { out, .. }
+            | Op::CompressMask { out, .. }
+            | Op::SortIndices { out, .. }
+            | Op::SelToIndices { out, .. }
+            | Op::CandidateBlocks { out, .. }
+            => vec![out],
+            Op::SinkhornSplit { pre, post, comb, .. } => vec![pre, post, comb],
+            Op::HyperPre { out, .. } => vec![out],
+            Op::HyperPost { out, .. } => vec![out],
+            Op::EngramHash { out, .. } => vec![out],
+            Op::GatherRows { out, .. } => vec![out],
+            Op::EngramGate { out, .. } => vec![out],
+            Op::SortSelected { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1016,12 +1467,25 @@ impl Op {
             | Op::Layernorm { out, .. }
             | Op::LayerNormCentered { out, .. }
             | Op::RmsNorm { out, .. }
+            | Op::Rsqrt { out, .. }
             | Op::RoPE { out, .. }
             | Op::ScaleGate { out, .. } => vec![out],
-            Op::MatMul { c, .. } | Op::Add { c, .. } => vec![c],
+            Op::MatMul { c, .. }
+            | Op::BlockQuantizedMatMul { c, .. }
+            | Op::Add { c, .. } => vec![c],
             Op::Projection { out, rem, .. } => vec![out, rem],
             Op::Softmax { e, out, .. } => vec![e, out],
+            Op::SoftmaxBias { out, .. } => vec![out],
+            Op::SumNorm { out, .. } => vec![out],
             Op::TopKSelect {
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                ..
+            } => vec![sel, thr, gate, d1, d2],
+            Op::SparseIndexer {
                 sel,
                 thr,
                 gate,
@@ -1171,11 +1635,278 @@ pub fn forward_shard(store: &mut Store, ops: &[Op], shard: std::ops::Range<usize
     }
 }
 
-fn forward_ops(store: &mut Store, ops: &[Op]) {
+/// Execute every op and materialize its outputs into `store`. This is the
+/// witness-generation half of `prove_shard`; exposing it lets builders inspect
+/// intermediate tensors without running the (expensive) sumcheck proofs.
+pub fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
             Op::Transpose { x, out, m, k } => {
                 store.v[out] = TensorData::Owned(transpose(store.get(x), m, k));
+            }
+            Op::Slice { x, out, start, len } => {
+                let v = store.get(x)[start..start + len].to_vec();
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::Concat { parts, out } => {
+                let mut v = Vec::new();
+                for p in parts {
+                    v.extend_from_slice(store.get(p));
+                }
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::CompressMask { out, m, n, ratio } => {
+                let mut v = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        v.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 20)) });
+                    }
+                }
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::SortIndices { idx, out, m, n } => {
+                let mut v = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let mut row: Vec<u32> = store.idx[idx][i * n..(i + 1) * n].to_vec();
+                    row.sort_unstable();
+                    v.extend(row);
+                }
+                store.idx[out] = v;
+            }
+            Op::SelToIndices { sel, out, m, n } => {
+                let mut v = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    for j in 0..n {
+                        if to_i64(store.get(sel)[i * n + j]) != 0 {
+                            v.push(j as u32);
+                        }
+                    }
+                }
+                store.idx[out] = v;
+            }
+            Op::CandidateBlocks { x, out, m, n, block_size, topk_blocks } => {
+                let mut v = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    let blocks = (n + block_size - 1) / block_size;
+                    let mut block_score = vec![i64::MIN; blocks];
+                    for b in 0..blocks {
+                        let start = b * block_size;
+                        let end = (start + block_size).min(n);
+                        let mut best = i64::MIN;
+                        for j in start..end {
+                            best = best.max(to_i64(store.get(x)[i * n + j]));
+                        }
+                        block_score[b] = best;
+                    }
+                    let mut order: Vec<usize> = (0..blocks).collect();
+                    order.sort_by(|&a, &b| block_score[b].cmp(&block_score[a]).then(a.cmp(&b)));
+                    let keep = topk_blocks.min(blocks);
+                    for &b in &order[..keep] {
+                        if block_score[b] == i64::MIN {
+                            continue;
+                        }
+                        let start = b * block_size;
+                        let end = (start + block_size).min(n);
+                        for j in start..end {
+                            v[i * n + j] = Goldilocks::ONE;
+                        }
+                    }
+                }
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::SinkhornSplit { mixes, scale, base, pre, post, comb, m, hc, iters, eps } => {
+                let to_f = |v: Goldilocks| to_i64(v) as f64 / 65536.0;
+                let mx: Vec<f64> = store.get(mixes).iter().map(|&v| to_f(v)).collect();
+                let sc: Vec<f64> = store.get(scale).iter().map(|&v| to_f(v)).collect();
+                let bs: Vec<f64> = store.get(base).iter().map(|&v| to_f(v)).collect();
+                let e = eps as f64 / 65536.0;
+                // `mixes` may arrive either unpadded (`[m, mix_hc]`) or padded to
+                // a power of two (`[m, mix_hc_pad]`); derive the real row stride
+                // from the tensor length so both layouts index correctly.
+                let stride = mx.len() / m;
+                let mut pre_v = Vec::with_capacity(m * hc);
+                let mut post_v = Vec::with_capacity(m * hc);
+                let mut comb_v = Vec::with_capacity(m * hc * hc);
+                for i in 0..m {
+                    for j in 0..hc {
+                        let v = sigmoid(mx[i * stride + j] * sc[0] + bs[j]) + e;
+                        pre_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                    for j in 0..hc {
+                        let v = 2.0 * sigmoid(mx[i * stride + hc + j] * sc[1] + bs[hc + j]);
+                        post_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                    let mut c = vec![0.0; hc * hc];
+                    for j in 0..hc {
+                        for k in 0..hc {
+                            let idx = i * stride + 2 * hc + j * hc + k;
+                            c[j * hc + k] = mx[idx] * sc[2] + bs[2 * hc + j * hc + k];
+                        }
+                    }
+                    // row softmax + eps
+                    for j in 0..hc {
+                        let max = (0..hc).fold(f64::MIN, |a, k| a.max(c[j * hc + k]));
+                        let mut sum = 0.0;
+                        for k in 0..hc {
+                            let v = (c[j * hc + k] - max).exp();
+                            c[j * hc + k] = v;
+                            sum += v;
+                        }
+                        for k in 0..hc {
+                            c[j * hc + k] = c[j * hc + k] / sum + e;
+                        }
+                    }
+                    // col normalize + eps
+                    for k in 0..hc {
+                        let sum = (0..hc).fold(0.0, |a, j| a + c[j * hc + k]);
+                        for j in 0..hc {
+                            c[j * hc + k] /= sum + e;
+                        }
+                    }
+                    for _ in 0..iters.saturating_sub(1) {
+                        for j in 0..hc {
+                            let sum = (0..hc).fold(0.0, |a, k| a + c[j * hc + k]);
+                            for k in 0..hc {
+                                c[j * hc + k] /= sum + e;
+                            }
+                        }
+                        for k in 0..hc {
+                            let sum = (0..hc).fold(0.0, |a, j| a + c[j * hc + k]);
+                            for j in 0..hc {
+                                c[j * hc + k] /= sum + e;
+                            }
+                        }
+                    }
+                    for v in c {
+                        comb_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                }
+                store.v[pre] = TensorData::Owned(pre_v);
+                store.v[post] = TensorData::Owned(post_v);
+                store.v[comb] = TensorData::Owned(comb_v);
+            }
+            Op::HyperPre { x, pre, out, m, hc, d } => {
+                let xv = store.get(x);
+                let pv = store.get(pre);
+                let mut o = Vec::with_capacity(m * d);
+                for i in 0..m {
+                    for j in 0..d {
+                        let mut s = 0i64;
+                        for h in 0..hc {
+                            s += to_i64(xv[(i * hc + h) * d + j]) * to_i64(pv[i * hc + h]);
+                        }
+                        o.push(from_i64(round_div(s, 1i64 << 16)));
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::HyperPost { y, residual, post, comb, out, m, hc, d } => {
+                let yv = store.get(y);
+                let rv = store.get(residual);
+                let pv = store.get(post);
+                let cv = store.get(comb);
+                let mut o = Vec::with_capacity(m * hc * d);
+                for i in 0..m {
+                    for h in 0..hc {
+                        for j in 0..d {
+                            let mut s = to_i64(yv[i * d + j]) * to_i64(pv[i * hc + h]);
+                            for g in 0..hc {
+                                s += to_i64(cv[(i * hc + h) * hc + g]) * to_i64(rv[(i * hc + g) * d + j]);
+                            }
+                            o.push(from_i64(round_div(s, 1i64 << 16)));
+                        }
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::EngramHash { tokens, out, seq, max_ngram, n_heads } => {
+                let toks: Vec<u32> = store.idx[tokens].clone();
+                let mut v = Vec::with_capacity(seq * (max_ngram - 1) * n_heads);
+                for p in 0..seq {
+                    for s in 2..=max_ngram {
+                        for h in 0..n_heads {
+                            let prime = 1_000_003u64 + (s - 2) as u64 * n_heads as u64 * 97 + h as u64 * 131;
+                            let mut hash = 0u64;
+                            for j in 0..s {
+                                if p < j {
+                                    hash = u64::MAX;
+                                    break;
+                                }
+                                let t = toks[p - j] as u64;
+                                hash = (hash + t * (j as u64 * 2 + 1)) % prime;
+                            }
+                            v.push(if hash == u64::MAX { u32::MAX } else { hash as u32 });
+                        }
+                    }
+                }
+                store.idx[out] = v;
+            }
+            Op::GatherRows { idx, table, out, dim } => {
+                let mut v = Vec::with_capacity(store.idx[idx].len() * dim);
+                for &i in &store.idx[idx] {
+                    let start = i as usize * dim;
+                    v.extend_from_slice(&store.get(table)[start..start + dim]);
+                }
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::EngramGate { x, key, weight, value, out, m, hc, d, eps, clamp } => {
+                let to_f = |v: Goldilocks| to_i64(v) as f64 / 65536.0;
+                let xv: Vec<f64> = store.get(x).iter().map(|&v| to_f(v)).collect();
+                let kv: Vec<f64> = store.get(key).iter().map(|&v| to_f(v)).collect();
+                let wv: Vec<f64> = store.get(weight).iter().map(|&v| to_f(v)).collect();
+                let vv: Vec<f64> = store.get(value).iter().map(|&v| to_f(v)).collect();
+                let e = eps as f64 / 65536.0;
+                let cl = clamp as f64 / 65536.0;
+                let mut o = Vec::with_capacity(m * hc * d);
+                for i in 0..m {
+                    for h in 0..hc {
+                        let mut hsum = 0.0;
+                        let mut ksum = 0.0;
+                        let mut dot = 0.0;
+                        for j in 0..d {
+                            let xvj = xv[(i * hc + h) * d + j];
+                            let kvj = kv[(i * hc + h) * d + j];
+                            let wj = wv[h * d + j];
+                            hsum += xvj * xvj;
+                            ksum += kvj * kvj;
+                            dot += xvj * wj * kvj;
+                        }
+                        let rstd = (1.0 / (hsum / d as f64 + e).sqrt())
+                            * (1.0 / (ksum / d as f64 + e).sqrt());
+                        dot = dot * rstd / (d as f64).sqrt();
+                        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+                        let gate = sigmoid(sign * dot.abs().max(cl).sqrt());
+                        for j in 0..d {
+                            let y = xv[(i * hc + h) * d + j] + gate * vv[i * d + j];
+                            o.push(from_i64((y * 65536.0).round() as i64));
+                        }
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::SortSelected { sel, out, m, n, k } => {
+                let selv = store.get(sel);
+                let mut x = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        x[i * n + j] = if to_i64(selv[i * n + j]) != 0 {
+                            from_i64(-(j as i64))
+                        } else {
+                            from_i64(-(1i64 << 30))
+                        };
+                    }
+                }
+                let (_thr, sel2, _gate, _d1, _d2) = topk_forward(&x, m, n, k);
+                let mut idx = Vec::with_capacity(m * k);
+                for i in 0..m {
+                    for j in 0..n {
+                        if to_i64(sel2[i * n + j]) != 0 {
+                            idx.push(j as u32);
+                        }
+                    }
+                }
+                store.idx[out] = idx;
             }
             Op::Scale {
                 x,
@@ -1186,7 +1917,12 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = store
                     .get(x)
                     .iter()
-                    .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
+                    .map(|&v| {
+                        from_i128(round_div_i128(
+                            to_i128(v) * factor as i128,
+                            1i128 << shift,
+                        ))
+                    })
                     .collect();
                 store.v[out] = TensorData::Owned(o);
             }
@@ -1202,9 +1938,9 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .iter()
                     .enumerate()
                     .map(|(i, &v)| {
-                        from_i64(round_div(
-                            to_i64(v) * to_i64(sv[i % sv.len()]),
-                            1i64 << shift,
+                        from_i128(round_div_i128(
+                            to_i128(v) * to_i128(sv[i % sv.len()]),
+                            1i128 << shift,
                         ))
                     })
                     .collect();
@@ -1243,16 +1979,43 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[c] = TensorData::Owned(o);
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let wv = store.materialize(w);
-                let o = bmm::gather_matmul_forward(
-                    store.get(a),
-                    &store.idx[expert_of],
-                    wv.as_ref(),
-                    s,
-                    k,
-                    n,
-                    n_experts,
-                );
+                let o = if store.n_experts(w) > 1 {
+                    // Dequantize only the selected experts and remap the
+                    // per-position expert ids to a dense range. The matmul
+                    // result is unchanged; this just avoids materializing all
+                    // `n_experts` weights during the forward pass.
+                    let expert_ids = &store.idx[expert_of];
+                    let mut remap = std::collections::HashMap::new();
+                    let mut unique: Vec<u32> = Vec::new();
+                    for &e in expert_ids {
+                        if !remap.contains_key(&e) {
+                            remap.insert(e, unique.len() as u32);
+                            unique.push(e);
+                        }
+                    }
+                    let dense_ids: Vec<u32> = expert_ids.iter().map(|&e| remap[&e]).collect();
+                    let wv = store.materialize_expert_rows(w, &unique);
+                    bmm::gather_matmul_forward(
+                        store.get(a),
+                        &dense_ids,
+                        &wv,
+                        s,
+                        k,
+                        n,
+                        unique.len(),
+                    )
+                } else {
+                    let wv = store.materialize(w);
+                    bmm::gather_matmul_forward(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        wv.as_ref(),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                    )
+                };
                 store.v[c] = TensorData::Owned(o);
             }
             Op::IdxBroadcast { base, out, b } => {
@@ -1329,6 +2092,23 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let cval = crate::par::mm_par_fixed(store.get(a), bv.as_ref(), m, k, n);
                 store.v[c] = TensorData::Owned(cval);
             }
+            Op::BlockQuantizedMatMul {
+                a,
+                w,
+                c,
+                m,
+                k,
+                n,
+                block_size: _,
+            } => {
+                // The quantized weight materializes in n x k (output rows x
+                // input cols), matching safetensors. Transpose it to the k x n
+                // layout `mm_par_fixed` expects.
+                let wv = store.materialize(w);
+                let wt = transpose(wv.as_ref(), n, k);
+                let cval = crate::par::mm_par_fixed(store.get(a), &wt, m, k, n);
+                store.v[c] = TensorData::Owned(cval);
+            }
             Op::Projection {
                 x,
                 w,
@@ -1384,6 +2164,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 table,
                 m,
                 n,
+                prec,
             } => {
                 let ev: Vec<Goldilocks> = store.idx[idx]
                     .iter()
@@ -1394,13 +2175,42 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
-                        from_i64(round_div(
-                            to_i64(ev[ij]) * (1i64 << 16),
-                            to_i64(sum[ij / n]),
-                        ))
+                        let s = to_i64(sum[ij / n]);
+                        if s == 0 {
+                            Goldilocks::ZERO
+                        } else {
+                            from_i64(round_div_i128(
+                                to_i64(ev[ij]) as i128 * (1i128 << prec),
+                                s as i128,
+                            ) as i64)
+                        }
                     })
                     .collect();
                 store.v[e] = TensorData::Owned(ev);
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::SoftmaxBias { e, bias, out, m, n } => {
+                let (o, _sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::SumNorm { x, out, m, n, prec } => {
+                let xv = store.get(x);
+                let sum: Vec<Goldilocks> = (0..m)
+                    .map(|i| (0..n).fold(Goldilocks::ZERO, |a, j| a + xv[i * n + j]))
+                    .collect();
+                let o: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| {
+                        let s = to_i64(sum[ij / n]);
+                        if s == 0 {
+                            Goldilocks::ZERO
+                        } else {
+                            from_i64(round_div_i128(
+                                to_i64(xv[ij]) as i128 * (1i128 << prec),
+                                s as i128,
+                            ) as i64)
+                        }
+                    })
+                    .collect();
                 store.v[out] = TensorData::Owned(o);
             }
             Op::SoftmaxIndex { x, out, table_len } => {
@@ -1416,6 +2226,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 out,
                 offset,
                 table_len,
+                ..
             } => {
                 let indices: Vec<u32> = store
                     .get(x)
@@ -1526,6 +2337,10 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 );
                 store.v[out] = TensorData::Owned(o);
             }
+            Op::Rsqrt { x, out, rsqrt_table, m, d, n_real } => {
+                let (_, _, rstd, _, _) = rsqrt_forward(store.get(x), store.get(rsqrt_table), m, d, n_real);
+                store.v[out] = TensorData::Owned(rstd);
+            }
             Op::RoPE {
                 x,
                 cos,
@@ -1541,6 +2356,24 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = TensorData::Owned(o);
             }
             Op::TopKSelect {
+                x,
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                m,
+                n,
+                k,
+            } => {
+                let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(store.get(x), m, n, k);
+                store.v[thr] = TensorData::Owned(thr_v);
+                store.v[sel] = TensorData::Owned(sel_v);
+                store.v[gate] = TensorData::Owned(gate_v);
+                store.v[d1] = TensorData::Owned(d1_v);
+                store.v[d2] = TensorData::Owned(d2_v);
+            }
+            Op::SparseIndexer {
                 x,
                 sel,
                 thr,
@@ -1614,6 +2447,7 @@ pub fn prove_shard_precomputed(
 
     // (tensor_id, point, eval) claims emitted by each op's proof.
     let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let mut expert_weight_claims: Vec<(T, usize, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     let mut op_proofs = Vec::with_capacity(ops.len());
     let mut lookup_by_table: std::collections::BTreeMap<T, Vec<(Vec<u32>, Vec<Goldilocks>)>> =
         std::collections::BTreeMap::new();
@@ -1623,11 +2457,100 @@ pub fn prove_shard_precomputed(
             Op::Transpose { .. } => {
                 op_proofs.push(OpProof::Transpose);
             }
-            Op::Scale { .. } => {
-                op_proofs.push(OpProof::Scale);
+            Op::Slice { .. } => {
+                op_proofs.push(OpProof::Slice);
             }
-            Op::ScaleVec { .. } => {
-                op_proofs.push(OpProof::ScaleVec);
+            Op::Concat { ref parts, out } => {
+                let gamma = rng.field();
+                let mut a = Vec::new();
+                let mut offset = 0usize;
+                for &p in parts {
+                    let part = store.get(p);
+                    for (i, &v) in part.iter().enumerate() {
+                        a.push(v + gamma * Goldilocks::from_u64((offset + i) as u64));
+                    }
+                    offset += part.len();
+                }
+                let out_v = store.get(out);
+                let b: Vec<Goldilocks> = out_v
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &v)| v + gamma * Goldilocks::from_u64(pos as u64))
+                    .collect();
+                let perm = prove_permutation(&a, &b, rng);
+                op_proofs.push(OpProof::Concat(perm, gamma));
+            }
+            Op::CompressMask { out, m, n, ratio } => {
+                let mut mask = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        mask.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 20)) });
+                    }
+                }
+                let r: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                claims.push((out, r.clone(), mle::eval(&mask, &r)));
+                op_proofs.push(OpProof::CompressMask);
+            }
+            Op::SortIndices { .. } => {
+                op_proofs.push(OpProof::SortIndices);
+            }
+            Op::SelToIndices { .. } => {
+                op_proofs.push(OpProof::SelToIndices);
+            }
+            Op::CandidateBlocks { .. } => {
+                op_proofs.push(OpProof::CandidateBlocks);
+            }
+            Op::SinkhornSplit { .. } => {
+                op_proofs.push(OpProof::SinkhornSplit);
+            }
+            Op::HyperPre { .. } => {
+                op_proofs.push(OpProof::HyperPre);
+            }
+            Op::HyperPost { .. } => {
+                op_proofs.push(OpProof::HyperPost);
+            }
+            Op::EngramHash { .. } => {
+                op_proofs.push(OpProof::EngramHash);
+            }
+            Op::GatherRows { .. } => {
+                op_proofs.push(OpProof::GatherRows);
+            }
+            Op::EngramGate { .. } => {
+                op_proofs.push(OpProof::EngramGate);
+            }
+            Op::SortSelected { sel, out, m, n, k } => {
+                let selv = store.get(sel);
+                let mut x = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        x[i * n + j] = if to_i64(selv[i * n + j]) != 0 {
+                            from_i64(-(j as i64))
+                        } else {
+                            from_i64(-(1i64 << 30))
+                        };
+                    }
+                }
+                let (thr, sel2, gate, d1, d2) = topk_forward(&x, m, n, k);
+                let p = prove_topk(&x, &sel2, &thr, &gate, &d1, &d2, m, n, k, 22, rng);
+                claims.push((sel, p.r.clone(), mle::eval(selv, &p.r)));
+                op_proofs.push(OpProof::SortSelected(p));
+                let _ = out;
+            }
+            Op::Scale { x, out, factor, shift } => {
+                let p = prove_scale(store.get(x), store.get(out), factor, shift, rng);
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((out, p.r.clone(), mle::eval(store.get(out), &p.r)));
+                op_proofs.push(OpProof::Scale(p));
+            }
+            Op::ScaleVec { x, scale, out, shift } => {
+                let p = prove_scale_vec(store.get(x), store.get(scale), store.get(out), shift, rng);
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((scale, p.r.clone(), mle::eval(store.get(scale), &p.r)));
+                claims.push((out, p.r.clone(), mle::eval(store.get(out), &p.r)));
+                op_proofs.push(OpProof::ScaleVec(p));
             }
             Op::Scatter {
                 sel,
@@ -1683,24 +2606,54 @@ pub fn prove_shard_precomputed(
                 let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let wv = store.materialize(w);
-                let p = bmm::prove_gather_matmul(
-                    store.get(a),
-                    &store.idx[expert_of],
-                    wv.as_ref(),
-                    store.get(c),
-                    s,
-                    k,
-                    n,
-                    n_experts,
-                    &u,
-                    &v,
-                    &ch,
-                );
+                let p = if store.n_experts(w) > 1 {
+                    // Full 552B MoE: stream one expert at a time so the proof
+                    // never materializes the whole expert stack.
+                    bmm::prove_gather_matmul_streaming(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        |e| store.materialize_expert_one(w, e),
+                        store.get(c),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                        &u,
+                        &v,
+                        &ch,
+                    )
+                } else {
+                    let wv = store.materialize(w);
+                    bmm::prove_gather_matmul(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        wv.as_ref(),
+                        store.get(c),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                        &u,
+                        &v,
+                        &ch,
+                    )
+                };
                 claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                // Bind every expert weight to the committed ExpertStack: the
+                // self-contained proof only carries `table[e] = MLE(W[e],
+                // (ch_d, v))` and checks `sum(counts * table)`; the committed
+                // path must additionally open each `table[e]` at `(v, ch_d)`
+                // against its per-expert weight commitment.
+                let k_bits = k.trailing_zeros() as usize;
+                let ch_d = &ch[..k_bits];
+                for e in 0..n_experts {
+                    let mut pt = v.clone();
+                    pt.extend_from_slice(ch_d);
+                    expert_weight_claims.push((w, e, pt, p.table[e]));
+                }
                 op_proofs.push(OpProof::GatherMatMul(p, u, v, ch));
             }
             Op::IdxBroadcast { .. } => {
@@ -1744,6 +2697,39 @@ pub fn prove_shard_precomputed(
                 cp.extend_from_slice(&u);
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
                 op_proofs.push(OpProof::MatMul(p, u, v, ch));
+            }
+            Op::BlockQuantizedMatMul {
+                a,
+                w,
+                c,
+                m,
+                k,
+                n,
+                block_size: _,
+            } => {
+                let at = transpose(store.get(a), m, k);
+                let wv = store.materialize(w);
+                let wt = transpose(wv.as_ref(), n, k);
+                let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let p = matmul_prove(&at, &wt, store.get(c), m, k, n, &u, &v, &ch);
+                let mut ap = ch.clone();
+                ap.extend_from_slice(&u);
+                claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
+                let mut wp = v.clone();
+                wp.extend_from_slice(&ch);
+                claims.push((w, wp.clone(), mle::eval(wv.as_ref(), &wp)));
+                let mut cp = v.clone();
+                cp.extend_from_slice(&u);
+                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                op_proofs.push(OpProof::BlockQuantizedMatMul(p, u, v, ch));
             }
             Op::Projection {
                 x,
@@ -1804,6 +2790,7 @@ pub fn prove_shard_precomputed(
                 table,
                 m,
                 n,
+                prec,
             } => {
                 let p = prove_softmax_rounded(
                     &store.idx[idx],
@@ -1812,6 +2799,7 @@ pub fn prove_shard_precomputed(
                     store.get(table),
                     m,
                     n,
+                    prec,
                     rng,
                 );
                 claims.push((
@@ -1825,11 +2813,51 @@ pub fn prove_shard_precomputed(
                     .push((store.idx[idx].clone(), store.get(e).to_vec()));
                 op_proofs.push(OpProof::Softmax(p));
             }
+            Op::SoftmaxBias { e, bias, out, m, n } => {
+                let (_, sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
+                let p = prove_softmax_bias(
+                    store.get(e),
+                    store.get(bias),
+                    store.get(out),
+                    &sum,
+                    m,
+                    n,
+                    rng,
+                );
+                claims.push((e, p.r_scale.clone(), mle::eval(store.get(e), &p.r_scale)));
+                claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
+                op_proofs.push(OpProof::SoftmaxBias(p));
+            }
+            Op::SumNorm { x, out, m, n, prec } => {
+                let dummy_idx = vec![0u32; m * n];
+                let p = prove_softmax_rounded(
+                    &dummy_idx,
+                    store.get(x),
+                    store.get(out),
+                    &[],
+                    m,
+                    n,
+                    prec,
+                    rng,
+                );
+                claims.push((x, p.r_scale.clone(), mle::eval(store.get(x), &p.r_scale)));
+                claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
+                op_proofs.push(OpProof::SumNorm(p));
+            }
             Op::SoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::SoftmaxIndex);
             }
-            Op::GeluIndex { .. } => {
-                op_proofs.push(OpProof::GeluIndex);
+            Op::GeluIndex { x, out, offset, table_len, limb_table } => {
+                let (p, limbs) = prove_gelu_index(store.get(x), &store.idx[out], offset, table_len, rng);
+                for limb in &limbs {
+                    let idx: Vec<u32> = limb.iter().map(|&v| to_i32(v) as u32).collect();
+                    lookup_by_table
+                        .entry(limb_table)
+                        .or_insert(Vec::new())
+                        .push((idx, limb.clone()));
+                }
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                op_proofs.push(OpProof::GeluIndex(p));
             }
             Op::StableSoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::StableSoftmaxIndex);
@@ -1932,6 +2960,19 @@ pub fn prove_shard_precomputed(
                 claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
                 op_proofs.push(OpProof::RmsNorm(p));
             }
+            Op::Rsqrt { x, out, rsqrt_table, m, d, n_real } => {
+                let (p, ridx, rvals) =
+                    prove_rsqrt(store.get(x), store.get(rsqrt_table), m, d, n_real, rng);
+                lookup_by_table
+                    .entry(rsqrt_table)
+                    .or_insert(Vec::new())
+                    .push((ridx, rvals));
+                let r: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                claims.push((out, r.clone(), mle::eval(store.get(out), &r)));
+                op_proofs.push(OpProof::Rsqrt(p));
+            }
             Op::RoPE {
                 x,
                 cos,
@@ -1993,6 +3034,35 @@ pub fn prove_shard_precomputed(
                 claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
                 claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
                 op_proofs.push(OpProof::TopKSelect(p));
+            }
+            Op::SparseIndexer {
+                x,
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                m,
+                n,
+                k,
+            } => {
+                let p = prove_topk(
+                    store.get(x),
+                    store.get(sel),
+                    store.get(thr),
+                    store.get(gate),
+                    store.get(d1),
+                    store.get(d2),
+                    m,
+                    n,
+                    k,
+                    22,
+                    rng,
+                );
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
+                claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
+                op_proofs.push(OpProof::SparseIndexer(p));
             }
             Op::Argmax {
                 x,
@@ -2088,6 +3158,7 @@ pub fn prove_shard_precomputed(
         bound,
         binds,
         claims: raw_claims,
+        expert_weight_claims,
         witness_columns,
         table_columns,
     }
@@ -2119,8 +3190,68 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                 // forward_ops, and the downstream op's claim on `out` is checked
                 // against that recomputed value.
             }
-            (Op::Scale { .. }, OpProof::Scale) => {}
-            (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
+            (Op::Slice { .. }, OpProof::Slice) => {}
+            (Op::Concat { parts, out }, OpProof::Concat(perm, gamma)) => {
+                let mut a = Vec::new();
+                let mut offset = 0usize;
+                for &p in parts {
+                    let part = tables[p];
+                    for (i, &v) in part.iter().enumerate() {
+                        a.push(v + *gamma * Goldilocks::from_u64((offset + i) as u64));
+                    }
+                    offset += part.len();
+                }
+                let out_v = tables[*out];
+                let b: Vec<Goldilocks> = out_v
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &v)| v + *gamma * Goldilocks::from_u64(pos as u64))
+                    .collect();
+                if perm.a != a || perm.b != b || !verify_permutation(perm) {
+                    return false;
+                }
+            }
+            (Op::CompressMask { out, m, n, ratio }, OpProof::CompressMask) => {
+                let (out, m, n, ratio) = (*out, *m, *n, *ratio);
+                let mut mask = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        mask.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 20)) });
+                    }
+                }
+                let ok = proof
+                    .claims
+                    .iter()
+                    .any(|(t, pt, ev)| *t == out && *ev == mle::eval(&mask, pt));
+                if !ok {
+                    return false;
+                }
+            }
+            (Op::SortIndices { .. }, OpProof::SortIndices) => {}
+            (Op::SelToIndices { .. }, OpProof::SelToIndices) => {}
+            (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
+            (Op::SinkhornSplit { .. }, OpProof::SinkhornSplit) => {}
+            (Op::HyperPre { .. }, OpProof::HyperPre) => {}
+            (Op::HyperPost { .. }, OpProof::HyperPost) => {}
+            (Op::EngramHash { .. }, OpProof::EngramHash) => {}
+            (Op::GatherRows { .. }, OpProof::GatherRows) => {}
+            (Op::EngramGate { .. }, OpProof::EngramGate) => {}
+            (Op::SortSelected { k, .. }, OpProof::SortSelected(p)) => {
+                if !verify_topk(p, *k) {
+                    return false;
+                }
+            }
+            (Op::Scale { factor, shift, .. }, OpProof::Scale(p)) => {
+                if !verify_scale(p, *factor, *shift) {
+                    return false;
+                }
+            }
+            (Op::ScaleVec { shift, .. }, OpProof::ScaleVec(p)) => {
+                if !verify_scale_vec(p, *shift) {
+                    return false;
+                }
+            }
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
                 if !verify_scatter(p, *m, *n) {
                     return false;
@@ -2155,6 +3286,14 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
+            (
+                Op::BlockQuantizedMatMul { .. },
+                OpProof::BlockQuantizedMatMul(mp, _, _, ch),
+            ) => {
+                if !matmul_verify(mp, ch) {
+                    return false;
+                }
+            }
             (Op::Projection { shift, .. }, OpProof::Projection(pp)) => {
                 if !verify_projection(pp, *shift) {
                     return false;
@@ -2182,10 +3321,24 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
+            (Op::SoftmaxBias { .. }, OpProof::SoftmaxBias(sp)) => {
+                if !verify_softmax_bias(sp) {
+                    return false;
+                }
+            }
+            (Op::SumNorm { .. }, OpProof::SumNorm(sp)) => {
+                if !verify_softmax_rounded(sp) {
+                    return false;
+                }
+            }
             (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
                 // No proof: the verifier recomputes `idx = softmax_index(scores)`.
             }
-            (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
+            (Op::GeluIndex { offset, table_len, .. }, OpProof::GeluIndex(p)) => {
+                if !verify_gelu_index(p, *offset, *table_len) {
+                    return false;
+                }
+            }
             (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
             (Op::Layernorm { .. }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(lp) {
@@ -2205,12 +3358,22 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
+            (Op::Rsqrt { n_real, .. }, OpProof::Rsqrt(p)) => {
+                if !verify_rsqrt(p, *n_real) {
+                    return false;
+                }
+            }
             (Op::RoPE { shift, .. }, OpProof::RoPE(p)) => {
                 if !verify_rope(p, *shift) {
                     return false;
                 }
             }
             (Op::TopKSelect { k, .. }, OpProof::TopKSelect(p)) => {
+                if !verify_topk(p, *k) {
+                    return false;
+                }
+            }
+            (Op::SparseIndexer { k, .. }, OpProof::SparseIndexer(p)) => {
                 if !verify_topk(p, *k) {
                     return false;
                 }
@@ -2286,6 +3449,23 @@ fn absorb_statement(t: &mut Transcript, ops: &[Op], ops_per_shard: usize) {
     }
 }
 
+fn absorb_statement_ranges(t: &mut Transcript, ops: &[Op], ranges: &[(usize, usize)]) {
+    t.absorb_u64(ranges.len() as u64);
+    t.absorb_u64(ops.len() as u64);
+    for &(s, e) in ranges {
+        t.absorb_u64(s as u64);
+        t.absorb_u64(e as u64);
+    }
+    for op in ops {
+        for id in op.reads() {
+            t.absorb_u64(id as u64);
+        }
+        for id in op.writes() {
+            t.absorb_u64(id as u64);
+        }
+    }
+}
+
 pub fn prove_shard_dag(
     store: &mut Store,
     ops: &[Op],
@@ -2302,10 +3482,15 @@ pub fn prove_shard_dag(
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
     absorb_statement(&mut master, ops, ops_per_shard);
 
+    // Bound the number of shards proven concurrently: each shard caches its
+    // selected experts for the MoE gather proof, so unbounded parallelism
+    // materializes many expert caches at once (~25GB each).
+    let shard_sem = Arc::new(Semaphore::new(8));
     let shards: Vec<OpShardProof> = ranges
         .par_iter()
         .enumerate()
         .map(|(si, &(s, e))| {
+            let _permit = shard_sem.acquire();
             let mut child = master.clone();
             child.absorb_u64(si as u64);
             prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut child)
@@ -2322,6 +3507,61 @@ pub fn prove_shard_dag(
     }
     // Recompute per-tensor shard count with a set (a tensor may be claimed twice
     // by one shard, so a plain counter would overcount).
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in shards.iter().enumerate() {
+        for (t, _, _) in &shard.claims {
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
+
+    let mut cross_tensors = Vec::new();
+    let mut cross_binds = Vec::new();
+    for (t, claims) in by_tensor {
+        if tensor_shards.get(&t).map(|s| s.len()).unwrap_or(0) > 1 {
+            let sp = prove_same_poly(store.get(t), &claims, &mut master);
+            cross_tensors.push(t);
+            cross_binds.push(sp);
+        }
+    }
+    ShardDagProof {
+        shards,
+        cross_tensors,
+        cross_binds,
+    }
+}
+
+/// Like [`prove_shard_dag`], but uses explicit `[start, end)` ranges. This is
+/// what the 40-layer builder needs: shard boundaries follow layer boundaries,
+/// not a fixed op count.
+pub fn prove_shard_dag_with_ranges(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+) -> ShardDagProof {
+    forward_ops(store, ops);
+    let store_ref: &Store = store;
+
+    let mut master = Transcript::new(b"zkie-shard-dag-v1");
+    absorb_statement_ranges(&mut master, ops, ranges);
+
+    let shards: Vec<OpShardProof> = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(si, &(s, e))| {
+            let mut child = master.clone();
+            child.absorb_u64(si as u64);
+            prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut child)
+        })
+        .collect();
+
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for shard in shards.iter() {
+        for (t, pt, ev) in &shard.claims {
+            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+        }
+    }
     let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
         std::collections::BTreeMap::new();
     for (si, shard) in shards.iter().enumerate() {
@@ -2393,6 +3633,51 @@ pub fn verify_shard_dag(
         }
     }
 
+    let mut expected_cross: Vec<T> = Vec::new();
+    for (t, _) in &by_tensor {
+        if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
+            expected_cross.push(*t);
+        }
+    }
+    if expected_cross != proof.cross_tensors {
+        return false;
+    }
+    for (ci, &t) in proof.cross_tensors.iter().enumerate() {
+        if verify_same_poly(&proof.cross_binds[ci], &by_tensor[&t]).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn verify_shard_dag_with_ranges(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    proof: &ShardDagProof,
+) -> bool {
+    if proof.shards.len() != ranges.len() || proof.cross_tensors.len() != proof.cross_binds.len() {
+        return false;
+    }
+    let all_ok = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(s, e))| verify_shard_precomputed(tables, &ops[s..e], &proof.shards[i]))
+        .all(|ok| ok);
+    if !all_ok {
+        return false;
+    }
+
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in proof.shards.iter().enumerate() {
+        for (t, pt, ev) in &shard.claims {
+            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
     let mut expected_cross: Vec<T> = Vec::new();
     for (t, _) in &by_tensor {
         if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
@@ -2516,6 +3801,9 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
                     weights.insert(*b);
                 }
             }
+            Op::BlockQuantizedMatMul { w, .. } => {
+                weights.insert(*w);
+            }
             Op::Projection { w, bias, .. } => {
                 weights.insert(*w);
                 weights.insert(*bias);
@@ -2530,6 +3818,11 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
             }
             Op::RmsNorm { w, .. } => {
                 weights.insert(*w);
+            }
+            Op::GatherMatMul { w, .. } | Op::BatchedMatMul { w, .. } => {
+                if !written.contains(w) {
+                    weights.insert(*w);
+                }
             }
             _ => {}
         }
@@ -2554,7 +3847,81 @@ pub struct CachedWeightBatch {
     pub security: usize,
     pub pow_bits: usize,
     pub table_ids: Vec<T>,
+    /// `Some(expert_idx)` when `table_ids[i]` is one expert of an
+    /// `ExpertStack`; `None` for a whole tensor.
+    pub expert_indices: Vec<Option<usize>>,
     pub cache_path: std::path::PathBuf,
+}
+
+/// Grouping metadata for one weight batch, without the commitment. Used to
+/// stream commit + open per group for the full 552B model, where the disk can
+/// hold only one group's Merkle prover data at a time.
+#[derive(Clone)]
+pub struct WeightGroupPlan {
+    pub arity: usize,
+    pub num_tables: usize,
+    pub num_vars: usize,
+    pub security: usize,
+    pub pow_bits: usize,
+    pub table_ids: Vec<T>,
+    pub expert_indices: Vec<Option<usize>>,
+}
+
+/// Enumerate the weight-commit units and group them by arity, without
+/// materializing or committing anything. Shared by the disk-cached and the
+/// streaming committed provers.
+pub fn weight_commit_plan(store: &Store, ops: &[Op]) -> Vec<WeightGroupPlan> {
+    const SECURITY: usize = 90;
+    let weight_tensors = collect_weight_tensors(ops);
+    let mut units: Vec<(T, Option<usize>)> = Vec::new();
+    for &t in &weight_tensors {
+        let n = store.n_experts(t);
+        if n > 1 {
+            for e in 0..n {
+                units.push((t, Some(e)));
+            }
+        } else {
+            units.push((t, None));
+        }
+    }
+    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Option<usize>)>> =
+        std::collections::BTreeMap::new();
+    for &(t, e) in &units {
+        let len = match e {
+            Some(_) => store.len(t) / store.n_experts(t),
+            None => store.len(t),
+        };
+        if len < 32 {
+            continue;
+        }
+        by_size.entry(len).or_default().push((t, e));
+    }
+
+    let mut plans = Vec::new();
+    for (len, group) in by_size {
+        let arity = len.trailing_zeros() as usize;
+        let eff_group_size = if arity <= 26 {
+            (1usize << (26 - arity)).max(1)
+        } else {
+            1
+        };
+        for ids in group.chunks(eff_group_size) {
+            let num_tables = ids.len();
+            let total_slots = num_tables * (1usize << arity);
+            let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
+            plans.push(WeightGroupPlan {
+                arity,
+                num_tables,
+                num_vars,
+                security: SECURITY,
+                pow_bits,
+                table_ids: ids.iter().map(|&(t, _)| t).collect(),
+                expert_indices: ids.iter().map(|&(_, e)| e).collect(),
+            });
+        }
+    }
+    plans
 }
 
 /// Phase 1 (offline, once): commit every weight group and stream the Merkle
@@ -2565,71 +3932,50 @@ pub fn commit_model_weights(
     ops: &[Op],
     cache_dir: &str,
 ) -> Vec<CachedWeightBatch> {
-    // Borrowed from feature/batch-pcs: 90-bit security + pow_bits=17 (enough for
-    // packed codewords up to 2^26), instead of the low-security testing params.
-    const SECURITY: usize = 90;
-
-    let weight_tensors = collect_weight_tensors(ops);
-    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>)>> =
-        std::collections::BTreeMap::new();
-    for &t in &weight_tensors {
-        let v = store.materialize(t).into_owned();
-        // WHIR folding factor is 5, so a tensor shorter than 2^5 cannot be
-        // folded; skip such tiny weights (they are negligible and have no
-        // meaningful commitment).
-        if v.len() < 32 {
-            continue;
-        }
-        by_size.entry(v.len()).or_default().push((t, v));
-    }
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
     let mut batches = Vec::new();
-    for (len, group) in by_size {
-        let arity = len.trailing_zeros() as usize;
-        // Horizontal merge: pack same-arity weights into groups that fit the
-        // WHIR PoW budget (num_vars = arity + log2(group_size) <= 26).
-        let eff_group_size = if arity <= 26 {
-            (1usize << (26 - arity)).max(1)
-        } else {
-            1
-        };
-        for ids in group.chunks(eff_group_size) {
-            let num_tables = ids.len();
-            let total_slots = num_tables * (1usize << arity);
-            let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
-            // Per-group adaptive PoW budget: use the minimum pow_bits required at
-            // 90-bit security for this group's num_variables, so a large tensor
-            // (e.g. a 2^28 lm_head) gets a higher budget while small groups stay
-            // cheap. See Whir::required_pow_bits.
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
-            let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v)| v.as_slice()).collect();
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
-            let (commitment, prover_data, _protocol, batch_whir) =
-                base_whir.commit_batch(&refs);
-            let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.iter().map(|(t, _)| *t).collect();
-            let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
-                "weight-a{arity}-g{}.bin",
-                batches.len()
-            ));
-            let file = std::fs::File::create(&cache_path).expect("create weight cache");
-            let mut writer = std::io::BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
-            zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
-                .expect("write cache prover data");
-            std::io::Write::flush(&mut writer).expect("flush weight cache");
-            batches.push(CachedWeightBatch {
-                commitment,
-                arity,
-                num_tables,
-                num_vars,
-                security: SECURITY,
-                pow_bits,
-                table_ids,
-                cache_path,
-            });
-        }
+    for plan in weight_commit_plan(store, ops) {
+        // Materialize exactly this group, commit it, then drop the vectors.
+        let materialized: Vec<Vec<Goldilocks>> = plan
+            .table_ids
+            .iter()
+            .zip(plan.expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
+            .collect();
+        let refs: Vec<&[Goldilocks]> = materialized.iter().map(|v| v.as_slice()).collect();
+        let base_whir = zkie_core::pcs::whir::Whir::with_params(
+            plan.arity,
+            plan.security,
+            plan.pow_bits,
+        );
+        let (commitment, prover_data, _protocol, batch_whir) = base_whir.commit_batch(&refs);
+        let num_vars = batch_whir.num_variables();
+        let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
+            "weight-a{}-g{}.bin",
+            plan.arity,
+            batches.len()
+        ));
+        let file = std::fs::File::create(&cache_path).expect("create weight cache");
+        let mut writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
+        zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
+            .expect("write cache prover data");
+        std::io::Write::flush(&mut writer).expect("flush weight cache");
+        batches.push(CachedWeightBatch {
+            commitment,
+            arity: plan.arity,
+            num_tables: plan.num_tables,
+            num_vars,
+            security: plan.security,
+            pow_bits: plan.pow_bits,
+            table_ids: plan.table_ids,
+            expert_indices: plan.expert_indices,
+            cache_path,
+        });
     }
     batches
 }
@@ -2643,7 +3989,7 @@ pub struct WeightBatchOpening {
     pub table_idxs: Vec<usize>,
     pub points: Vec<Vec<Goldilocks>>,
     pub claimed: Vec<Goldilocks>,
-    pub proof: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
+    pub proof: Option<Vec<u8>>,
 }
 
 /// A single lookup witness column pair opened at its chained-GKR leaf point:
@@ -2757,6 +4103,14 @@ pub struct SelOpening {
     pub openings: Vec<zkie_core::pcs::whir::Proof>,
 }
 
+/// Coordinates of one weight tensor (or one expert of an `ExpertStack`) within
+/// the committed weight batches: `batch` is the size-group and `table` is the
+/// table index inside that batch.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+pub struct WeightClaimLoc {
+    pub batch: usize,
+    pub table: usize,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CommittedShardDagProof {
@@ -2766,7 +4120,8 @@ pub struct CommittedShardDagProof {
     pub cross_binds: Vec<CommittedCrossBindProof>,
     pub weight_batches: Vec<WeightBatchCommit>,
     pub weight_batch_openings: Vec<WeightBatchOpening>,
-    pub weight_locs: std::collections::BTreeMap<T, (usize, usize)>,
+    pub weight_locs: std::collections::BTreeMap<T, WeightClaimLoc>,
+    pub expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc>,
     pub tokens: Vec<u32>,
     pub argmax_t: Vec<u32>,
     pub witness_batches: Vec<WitnessBatchCommit>,
@@ -2783,17 +4138,18 @@ pub struct CommittedShardDagProof {
     pub gather_indep_batches: usize,
 }
 
-pub fn prove_committed_shard_dag(
+fn prove_committed_shard_dag_impl(
     store: &mut Store,
     ops: &[Op],
-    ops_per_shard: usize,
+    ranges: &[(usize, usize)],
     _whir: &zkie_core::pcs::whir::Whir,
     cached_weights: &[CachedWeightBatch],
+    streaming: bool,
     rng: &mut impl ChallengeSource,
     tokens_t: T,
     argmax_t: T,
 ) -> CommittedShardDagProof {
-    let plain = prove_shard_dag(store, ops, ops_per_shard);
+    let plain = prove_shard_dag_with_ranges(store, ops, ranges);
     let boundary_tensors = plain.cross_tensors.clone();
 
     let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
@@ -2819,84 +4175,147 @@ pub fn prove_committed_shard_dag(
         cross_binds.push(sp);
     }
 
-    // Restore each weight group's Merkle prover data from its cache file (no
-    // re-commit), then reduce each group's claims to one FRI proof + one sumcheck.
-    let mut weight_locs: std::collections::BTreeMap<T, (usize, usize)> =
+    // Weight groups: either restore each group's Merkle prover data from its
+    // cache file, or (`streaming`) commit the group inline and drop it, so the
+    // full 552B parameter set never occupies disk or memory at once.
+    let streaming_plans = if streaming {
+        Some(weight_commit_plan(store, ops))
+    } else {
+        None
+    };
+    let num_groups = streaming_plans
+        .as_ref()
+        .map(|p| p.len())
+        .unwrap_or(cached_weights.len());
+    let mut weight_locs: std::collections::BTreeMap<T, WeightClaimLoc> =
         std::collections::BTreeMap::new();
-    let mut group_tensors: Vec<Vec<Vec<Goldilocks>>> = Vec::with_capacity(cached_weights.len());
-    for (bi, cw) in cached_weights.iter().enumerate() {
-        let tensors: Vec<Vec<Goldilocks>> = cw
-            .table_ids
-            .iter()
-            .map(|&t| store.materialize(t).into_owned())
-            .collect();
-        for (i, &t) in cw.table_ids.iter().enumerate() {
-            weight_locs.insert(t, (bi, i));
-        }
-        group_tensors.push(tensors);
-    }
-
-    let num_groups = cached_weights.len();
-    let mut group_claims: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
-        vec![Vec::new(); num_groups];
-    for shard in &plain.shards {
-        for (t, pt, ev) in &shard.claims {
-            if let Some(&(bi, ti)) = weight_locs.get(t) {
-                group_claims[bi].push((ti, pt.clone(), *ev));
+    let mut expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc> =
+        std::collections::BTreeMap::new();
+    for bi in 0..num_groups {
+        let (table_ids, expert_indices) = match &streaming_plans {
+            Some(p) => (&p[bi].table_ids, &p[bi].expert_indices),
+            None => (&cached_weights[bi].table_ids, &cached_weights[bi].expert_indices),
+        };
+        for (i, (&t, &e)) in table_ids.iter().zip(expert_indices.iter()).enumerate() {
+            let loc = WeightClaimLoc { batch: bi, table: i };
+            match e {
+                Some(ei) => {
+                    expert_weight_locs.insert((t, ei), loc);
+                }
+                None => {
+                    weight_locs.insert(t, loc);
+                }
             }
         }
     }
 
-    let mut weight_batch_openings = Vec::with_capacity(num_groups);
-    let mut weight_batches = Vec::with_capacity(num_groups);
-    for (bi, cw) in cached_weights.iter().enumerate() {
+    let mut group_claims: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
+        vec![Vec::new(); num_groups];
+    for shard in &plain.shards {
+        for (t, pt, ev) in &shard.claims {
+            if let Some(loc) = weight_locs.get(t) {
+                group_claims[loc.batch].push((loc.table, pt.clone(), *ev));
+            }
+        }
+        for (t, e, pt, ev) in &shard.expert_weight_claims {
+            if let Some(loc) = expert_weight_locs.get(&(*t, *e)) {
+                group_claims[loc.batch].push((loc.table, pt.clone(), *ev));
+            }
+        }
+    }
+
+    // Commit + open each weight group in parallel. Every group touches a
+    // disjoint set of tensors and only reads the store (`materialize` is
+    // `&self`), so the work is embarrassingly parallel; rayon's work-stealing
+    // pool bounds the in-flight materializations by the thread count, keeping
+    // peak memory at roughly `threads x one group` instead of the whole 552B.
+    let commit_sem = Arc::new(Semaphore::new(24));
+    let weight_results: Vec<(WeightBatchCommit, WeightBatchOpening)> = (0..num_groups)
+        .into_par_iter()
+        .map(|bi| {
+        let _permit = commit_sem.acquire();
+        let (arity, num_tables, num_vars, security, pow_bits) = match &streaming_plans {
+            Some(p) => {
+                let g = &p[bi];
+                (g.arity, g.num_tables, g.num_vars, g.security, g.pow_bits)
+            }
+            None => {
+                let c = &cached_weights[bi];
+                (c.arity, c.num_tables, c.num_vars, c.security, c.pow_bits)
+            }
+        };
         let claims = &group_claims[bi];
         let table_idxs: Vec<usize> = claims.iter().map(|(ti, _, _)| *ti).collect();
         let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(_, pt, _)| pt.clone()).collect();
         let claimed: Vec<Goldilocks> = claims.iter().map(|(_, _, ev)| *ev).collect();
 
-        // Verifier-side batch commitment (no prover data); prover-side Whir is
-        // reconstructed below from the same params.
-        weight_batches.push(WeightBatchCommit {
-            commitment: cw.commitment.clone(),
-            arity: cw.arity,
-            num_tables: cw.num_tables,
-            whir: zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits),
-        });
+        // Materialize exactly this group's tensors, then commit (streaming) or
+        // restore from cache, keeping peak memory at one group.
+        let (table_ids, expert_indices) = match &streaming_plans {
+            Some(p) => (&p[bi].table_ids, &p[bi].expert_indices),
+            None => (&cached_weights[bi].table_ids, &cached_weights[bi].expert_indices),
+        };
+        let group_tensors: Vec<Vec<Goldilocks>> = table_ids
+            .iter()
+            .zip(expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
+            .collect();
+        let ref_slices: Vec<&[Goldilocks]> = group_tensors.iter().map(|v| v.as_slice()).collect();
+
+        let (commitment, prover_data, batch_whir) = match &streaming_plans {
+            Some(_) => {
+                let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, security, pow_bits);
+                let (c, pd, _protocol, bw) = base_whir.commit_batch(&ref_slices);
+                (c, pd, bw)
+            }
+            None => {
+                let batch_whir =
+                    zkie_core::pcs::whir::Whir::with_params(num_vars, security, pow_bits);
+                let mut reader = std::io::BufReader::new(
+                    std::fs::File::open(&cached_weights[bi].cache_path).expect("open weight cache"),
+                );
+                let commitment: zkie_core::pcs::whir::Commitment =
+                    bincode::deserialize_from(&mut reader).expect("read cache commitment");
+                let prover_data = batch_whir
+                    .restore_batch_prover_data_from(&ref_slices, &mut reader)
+                    .expect("restore cache prover data");
+                (commitment, prover_data, batch_whir)
+            }
+        };
+
+        let weight_batch = WeightBatchCommit {
+            commitment: commitment.clone(),
+            arity,
+            num_tables,
+            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, security, pow_bits),
+        };
 
         if claims.is_empty() {
-            weight_batch_openings.push(WeightBatchOpening {
+            return (
+                weight_batch,
+                WeightBatchOpening {
                 table_idxs,
                 points,
                 claimed,
                 proof: None,
-            });
-            continue;
+                },
+            );
         }
 
-        let batch_whir =
-            zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits);
-        let mut reader = std::io::BufReader::new(
-            std::fs::File::open(&cw.cache_path).expect("open weight cache"),
-        );
-        let commitment: zkie_core::pcs::whir::Commitment =
-            bincode::deserialize_from(&mut reader).expect("read cache commitment");
-        let ref_slices: Vec<&[Goldilocks]> =
-            group_tensors[bi].iter().map(|v| v.as_slice()).collect();
-        let prover_data = batch_whir
-            .restore_batch_prover_data_from(&ref_slices, &mut reader)
-            .expect("restore cache prover data");
-        let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
+        let protocol = batch_whir.batch_opening_protocol(num_tables, arity);
         let ctx = zkie_core::pcs::committed::BatchCtx {
             commitment,
             prover_data,
             protocol,
             whir: batch_whir,
-            num_tables: cw.num_tables,
+            num_tables,
         };
         let tensors: Vec<Vec<Goldilocks>> = claims
             .iter()
-            .map(|(ti, _, _)| group_tensors[bi][*ti].clone())
+            .map(|(ti, _, _)| group_tensors[*ti].clone())
             .collect();
         let proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
             ctx,
@@ -2906,13 +4325,23 @@ pub fn prove_committed_shard_dag(
             &claimed,
         )
         .expect("honest batch-open");
-        weight_batch_openings.push(WeightBatchOpening {
-            table_idxs,
-            points,
-            claimed,
-            proof: Some(proof),
-        });
-    }
+        // Serialize the FRI opening immediately and drop the in-memory struct:
+        // the proof struct (STIR query openings) is far larger than its bincode
+        // form, and holding all 23k openings resident would OOM the 1TB box.
+        let proof_bytes = bincode::serialize(&proof).expect("serialize batch open");
+        (
+            weight_batch,
+            WeightBatchOpening {
+                table_idxs,
+                points,
+                claimed,
+                proof: Some(proof_bytes),
+            },
+        )
+        })
+        .collect();
+    let (weight_batches, weight_batch_openings): (Vec<_>, Vec<_>) =
+        weight_results.into_iter().unzip();
 
     // Vertical batch the witness columns across all shards: group the x/y/num
     // columns by arity, committing each (arity, column-type) group once. This
@@ -3018,7 +4447,7 @@ pub fn prove_committed_shard_dag(
         let mut t_arity = Vec::new();
         let mut t_cm = Vec::new();
         for tc in &shard.table_columns {
-            let total = tc.m.len().next_power_of_two();
+            let total = tc.m.len().next_power_of_two().max(32);
             let arity = total.trailing_zeros() as usize;
             let mut m_pad = vec![Goldilocks::from_u64(0); total];
             for (j, &v) in tc.m.iter().enumerate() {
@@ -3037,7 +4466,7 @@ pub fn prove_committed_shard_dag(
     // root, then every table root, before deriving per-lookup alpha/beta and the
     // chained-GKR leaf challenges.
     let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-    absorb_statement(&mut ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut ts, ops, ranges);
     for g in &witness_groups {
         ts.absorb(&bincode::serialize(&g.x_ctx.commitment).unwrap());
         ts.absorb(&bincode::serialize(&g.y_ctx.commitment).unwrap());
@@ -3074,7 +4503,7 @@ pub fn prove_committed_shard_dag(
     let mut t_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
     for shard in &shards {
         for tc in &shard.table_columns {
-            let a = tc.m.len().next_power_of_two().trailing_zeros() as usize;
+            let a = tc.m.len().next_power_of_two().max(32).trailing_zeros() as usize;
             t_challs.push((ts.field_vec(a), ts.field_vec(a)));
         }
     }
@@ -3249,7 +4678,7 @@ pub fn prove_committed_shard_dag(
     // positions, so the argmax-index binding is authenticated without the
     // plaintext m x n selection matrix.
     let mut sel_openings = Vec::new();
-    let sel_ranges = shard_ranges(ops.len(), ops_per_shard);
+    let sel_ranges = ranges.to_vec();
     for (si, &(s, e)) in sel_ranges.iter().enumerate() {
         for (op, op_proof) in ops[s..e].iter().zip(shards[si].ops.iter_mut()) {
             if let (Op::Argmax { sel: sel_t, out: out_t, m, n, .. }, OpProof::Argmax(ap)) = (op, op_proof) {
@@ -3304,7 +4733,7 @@ pub fn prove_committed_shard_dag(
 
     let mut perm_ops: Vec<(usize, usize, usize)> = Vec::new(); // (si, li, arity)
     {
-        let pr = shard_ranges(ops.len(), ops_per_shard);
+        let pr = ranges.to_vec();
         for (si, &(s, e)) in pr.iter().enumerate() {
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let Op::Scatter { .. } = op {
@@ -3378,7 +4807,7 @@ pub fn prove_committed_shard_dag(
     }
 
     let mut perm_ts = Transcript::new(b"zkie-committed-perm-v1");
-    absorb_statement(&mut perm_ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut perm_ts, ops, ranges);
     for g in &perm_groups {
         perm_ts.absorb(&bincode::serialize(&g.a_ctx.commitment).unwrap());
         perm_ts.absorb(&bincode::serialize(&g.b_ctx.commitment).unwrap());
@@ -3500,7 +4929,7 @@ pub fn prove_committed_shard_dag(
     //           5=out 6=gate 7=token_id
     let mut gather_ops: Vec<(usize, usize, usize, usize, usize, usize, usize)> = Vec::new();
     {
-        let gr = shard_ranges(ops.len(), ops_per_shard);
+        let gr = ranges.to_vec();
         for (si, &(s, e)) in gr.iter().enumerate() {
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let (Op::Gather { m, h, .. }, OpProof::Gather(sp)) = (op, &shards[si].ops[li]) {
@@ -3570,7 +4999,7 @@ pub fn prove_committed_shard_dag(
     let gather_indep_count = gather_groups.len();
     // FS: absorb the six independent roots, then derive alpha/gamma.
     let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-    absorb_statement(&mut ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut ts, ops, ranges);
     for g in &gather_groups {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
     }
@@ -3756,6 +5185,7 @@ pub fn prove_committed_shard_dag(
         weight_batches,
         weight_batch_openings,
         weight_locs,
+        expert_weight_locs,
         tokens: store.idx[tokens_t].clone(),
         argmax_t: store.idx[argmax_t].clone(),
         witness_batches,
@@ -3773,14 +5203,86 @@ pub fn prove_committed_shard_dag(
     }
 }
 
-pub fn verify_committed_shard_dag(
-    tables: &[&[Goldilocks]],
+pub fn prove_committed_shard_dag(
+    store: &mut Store,
     ops: &[Op],
     ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir,
+    cached_weights: &[CachedWeightBatch],
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        &ranges,
+        whir,
+        cached_weights,
+        false,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+pub fn prove_committed_shard_dag_with_ranges(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    cached_weights: &[CachedWeightBatch],
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        ranges,
+        whir,
+        cached_weights,
+        false,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+/// Committed prove that commits every weight group inline and drops it
+/// immediately (no disk cache). For the full 552B parameter set the cached
+/// path would need tens of TB of disk; streaming keeps disk near zero and
+/// memory at one group's size.
+pub fn prove_committed_shard_dag_streaming(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        ranges,
+        whir,
+        &[],
+        true,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+fn verify_committed_shard_dag_impl(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
     _whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
 ) -> bool {
-    let ranges = shard_ranges(ops.len(), ops_per_shard);
     if proof.shards.len() != ranges.len()
         || proof.boundary_tensors.len() != proof.boundary_commitments.len()
         || proof.boundary_tensors.len() != proof.cross_binds.len()
@@ -3826,6 +5328,11 @@ pub fn verify_committed_shard_dag(
             Some(p) => p,
             None => continue, // committed but never opened (e.g. affine bias)
         };
+        let opening_proof: zkie_core::pcs::batch_open::BatchOpeningProof =
+            match bincode::deserialize(opening_proof) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
         if opening.table_idxs.len() != opening.points.len()
             || opening.table_idxs.len() != opening.claimed.len()
         {
@@ -3840,9 +5347,41 @@ pub fn verify_committed_shard_dag(
             &opening.table_idxs,
             &opening.points,
             &opening.claimed,
-            opening_proof,
+            &opening_proof,
         ) {
             return false;
+        }
+    }
+    // Bind every shard weight claim to its committed opening. The shard proofs
+    // carry weight evals as oracle claims (`(w, pt, ev)`, or per-expert
+    // `(w, e, pt, ev)` for `GatherMatMul`); without this cross-check a prover
+    // could prove against a different weight than the one committed.
+    let opening_matches = |loc: WeightClaimLoc, pt: &[Goldilocks], ev: Goldilocks| {
+        if loc.batch >= proof.weight_batch_openings.len() {
+            return false;
+        }
+        let opening = &proof.weight_batch_openings[loc.batch];
+        opening
+            .table_idxs
+            .iter()
+            .zip(&opening.points)
+            .zip(&opening.claimed)
+            .any(|((&ti, p), &c)| ti == loc.table && p.as_slice() == pt && c == ev)
+    };
+    for shard in &proof.shards {
+        for (t, pt, ev) in &shard.claims {
+            if let Some(loc) = proof.weight_locs.get(t) {
+                if !opening_matches(*loc, pt, *ev) {
+                    return false;
+                }
+            }
+        }
+        for (t, e, pt, ev) in &shard.expert_weight_claims {
+            if let Some(loc) = proof.expert_weight_locs.get(&(*t, *e)) {
+                if !opening_matches(*loc, pt, *ev) {
+                    return false;
+                }
+            }
         }
     }
     for to in &proof.table_openings {
@@ -4038,7 +5577,7 @@ pub fn verify_committed_shard_dag(
     // used exactly those derived values.
     {
         let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in &proof.witness_batches {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4116,7 +5655,7 @@ pub fn verify_committed_shard_dag(
     // Fiat-Shamir for permutations: verify alpha/full_r/c are transcript-derived.
     {
         let mut ts = Transcript::new(b"zkie-committed-perm-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in &proof.perm_batches {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4159,7 +5698,7 @@ pub fn verify_committed_shard_dag(
     // absorbs the den roots.
     {
         let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in proof.gather_batches.iter().take(proof.gather_indep_batches) {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4212,6 +5751,27 @@ pub fn verify_sequence_shift(tokens: &[u32], argmax_t: &[u32], prompt: &[u32]) -
         }
     }
     true
+}
+
+pub fn verify_committed_shard_dag(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir,
+    proof: &CommittedShardDagProof,
+) -> bool {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    verify_committed_shard_dag_impl(tables, ops, &ranges, whir, proof)
+}
+
+pub fn verify_committed_shard_dag_with_ranges(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    proof: &CommittedShardDagProof,
+) -> bool {
+    verify_committed_shard_dag_impl(tables, ops, ranges, whir, proof)
 }
 
 pub fn verify_committed_shard_dag_bytes(
@@ -4388,6 +5948,7 @@ pub fn build_gpt2_layer(
             table: exp_table,
             m,
             n: m,
+            prec: 16,
         });
         ops.push(Op::MatMul {
             a: probs,
@@ -4776,6 +6337,7 @@ mod tests {
             table,
             m,
             n,
+            prec: 16,
         }];
         let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
@@ -5075,6 +6637,54 @@ mod tests {
             }
         }
         assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+    }
+
+    #[test]
+    fn committed_weight_binding_rejects_tamper() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x5151);
+        let (m, k, n) = (4usize, 8usize, 8usize);
+        let mut store = Store::new();
+        let a = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let c = store.push(vec![]);
+        let ops = vec![Op::MatMul { a, b: w, c, m, k, n }];
+
+        let whir = Whir::new_testing(6); // weight k*n = 64 = 2^6
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-test-cache-wbind");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof = prove_committed_shard_dag(
+            &mut store,
+            &ops,
+            1,
+            &whir,
+            &cached,
+            &mut rng,
+            tokens_t,
+            argmax_t,
+        );
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+
+        // Tamper the shard's weight eval: the weight opening is bound to the
+        // committed weight, so the cross-check must reject the mismatch.
+        let mut bad = proof;
+        for shard in bad.shards.iter_mut() {
+            if let Some((_, _, ev)) = shard.claims.iter_mut().find(|(t, _, _)| *t == w) {
+                *ev = *ev + Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &bad));
     }
 
     #[test]
@@ -5879,6 +7489,7 @@ mod tests {
                 table: exp_table,
                 m,
                 n: m,
+                prec: 16,
             },
             Op::MatMul {
                 a: probs,
@@ -6039,6 +7650,7 @@ mod tests {
                 table: exp_table,
                 m,
                 n: m,
+                prec: 16,
             });
             ops.push(Op::MatMul {
                 a: probs,
@@ -6491,12 +8103,21 @@ mod tests {
             // `Projection` already does with `rem`. Relu and the three Index ops are
             // table functions, so they need a lookup (`logup_gkr` is already in tree).
             OpProof::Transpose
-            | OpProof::Scale
-            | OpProof::ScaleVec
+            | OpProof::Slice
+            | OpProof::CompressMask
+            | OpProof::SortIndices
+            | OpProof::SelToIndices
+            | OpProof::CandidateBlocks
+            | OpProof::SinkhornSplit
+            | OpProof::HyperPre
+            | OpProof::HyperPost
+            | OpProof::EngramHash
+            | OpProof::GatherRows
+            | OpProof::EngramGate
+            | OpProof::SortSelected(..)
             | OpProof::ScaleGate
             | OpProof::Relu
             | OpProof::SoftmaxIndex
-            | OpProof::GeluIndex
             | OpProof::StableSoftmaxIndex
             | OpProof::IdxBroadcast
             | OpProof::CombineIdx
@@ -6504,15 +8125,24 @@ mod tests {
             | OpProof::BroadcastScale => false,
             // Carry their own argument.
             OpProof::MatMul(..)
+            | OpProof::BlockQuantizedMatMul(..)
             | OpProof::Projection(..)
             | OpProof::Add(..)
             | OpProof::Lookup
             | OpProof::Softmax(..)
+            | OpProof::SoftmaxBias(..)
+            | OpProof::SumNorm(..)
             | OpProof::Layernorm(..)
             | OpProof::LayerNormCentered(..)
             | OpProof::RmsNorm(..)
+            | OpProof::Rsqrt(..)
+            | OpProof::Scale(..)
+            | OpProof::ScaleVec(..)
+            | OpProof::GeluIndex(..)
+            | OpProof::Concat(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
+            | OpProof::SparseIndexer(..)
             | OpProof::Argmax(..)
             | OpProof::Scatter(..)
             | OpProof::Gather(..)
@@ -6529,12 +8159,21 @@ mod tests {
     fn ops_without_their_own_proof_are_the_known_eight() {
         let unproven = [
             OpProof::Transpose,
-            OpProof::Scale,
-            OpProof::ScaleVec,
+            OpProof::Slice,
+            OpProof::CompressMask,
+            OpProof::SortIndices,
+            OpProof::SelToIndices,
+            OpProof::CandidateBlocks,
+            OpProof::SinkhornSplit,
+            OpProof::HyperPre,
+            OpProof::HyperPost,
+            OpProof::EngramHash,
+            OpProof::GatherRows,
+            OpProof::EngramGate,
+            // SortSelected carries its own proof, so it is NOT in the unproven set.
             OpProof::ScaleGate,
             OpProof::Relu,
             OpProof::SoftmaxIndex,
-            OpProof::GeluIndex,
             OpProof::StableSoftmaxIndex,
             OpProof::IdxBroadcast,
             OpProof::CombineIdx,
@@ -6543,7 +8182,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            12,
+            20,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {

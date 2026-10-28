@@ -37,6 +37,7 @@ pub struct SoftmaxRoundedProof {
     pub sum_ch: Vec<Goldilocks>,
     pub r_scale: Vec<Goldilocks>,
     pub claimed: Goldilocks,
+    pub prec: u32,
 }
 
 pub fn prove_softmax_rounded(
@@ -46,6 +47,7 @@ pub fn prove_softmax_rounded(
     table: &[Goldilocks],
     m: usize,
     n: usize,
+    prec: u32,
     rng: &mut impl ChallengeSource,
 ) -> SoftmaxRoundedProof {
     assert_eq!(indices.len(), m * n);
@@ -72,6 +74,149 @@ pub fn prove_softmax_rounded(
     );
 
     let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
+    let two = Goldilocks::from_u64(1u64 << prec);
+    let rem: Vec<Goldilocks> = (0..m * n)
+        .map(|ij| {
+            e[ij] * two - out[ij] * sum_broadcast[ij]
+        })
+        .collect();
+    let r_scale: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    // out * sum_broadcast - e * 2^prec - rem = 0
+    let rescale = prove_virtual(
+        &[out, e, &sum_broadcast, &rem],
+        &[
+            (Goldilocks::ONE, vec![0usize, 2usize]),
+            (neg * two, vec![1usize]),
+            (Goldilocks::ONE, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &r_scale,
+    );
+
+    SoftmaxRoundedProof {
+        row_sum,
+        rescale,
+        r_sum,
+        sum_ch,
+        r_scale,
+        claimed,
+        prec,
+    }
+}
+
+pub fn verify_softmax_rounded(proof: &SoftmaxRoundedProof) -> bool {
+    if !verify_virtual(
+        &proof.row_sum,
+        &[(Goldilocks::ONE, vec![0usize, 1usize])],
+        proof.claimed,
+        &proof.sum_ch,
+        &proof.row_sum.final_evals,
+    ) {
+        return false;
+    }
+    let two = Goldilocks::from_u64(1u64 << proof.prec);
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    verify_virtual(
+        &proof.rescale,
+        &[
+            (Goldilocks::ONE, vec![0usize, 2usize]),
+            (neg * two, vec![1usize]),
+            (Goldilocks::ONE, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.r_scale,
+        &proof.rescale.final_evals,
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SoftmaxBiasProof {
+    pub row_sum: VirtualProof,
+    pub add: VirtualProof,
+    pub rescale: VirtualProof,
+    pub r_sum: Vec<Goldilocks>,
+    pub sum_ch: Vec<Goldilocks>,
+    pub r_scale: Vec<Goldilocks>,
+    pub claimed: Goldilocks,
+    pub row_fe: Vec<Goldilocks>,
+    pub add_fe: Vec<Goldilocks>,
+    pub rescale_fe: Vec<Goldilocks>,
+}
+
+pub fn softmax_bias_forward(
+    e: &[Goldilocks],
+    bias: &[Goldilocks],
+    m: usize,
+    n: usize,
+) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
+    let sum: Vec<Goldilocks> = (0..m)
+        .map(|i| {
+            (0..n).fold(bias[i], |acc, j| acc + e[i * n + j])
+        })
+        .collect();
+    let out: Vec<Goldilocks> = (0..m * n)
+        .map(|ij| {
+            from_i64(
+                zkie_core::common::fixed_point::to_i64(e[ij]) * (1i64 << 16)
+                    / zkie_core::common::fixed_point::to_i64(sum[ij / n]),
+            )
+        })
+        .collect();
+    (out, sum)
+}
+
+pub fn prove_softmax_bias(
+    e: &[Goldilocks],
+    bias: &[Goldilocks],
+    out: &[Goldilocks],
+    sum: &[Goldilocks],
+    m: usize,
+    n: usize,
+    rng: &mut impl ChallengeSource,
+) -> SoftmaxBiasProof {
+    let r_sum: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let eq_i = mle::eq_evals(&r_sum);
+    let eq_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| eq_i[idx / n]).collect();
+    let bias_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| bias[idx / n]).collect();
+    let sum_ch: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let sum_e: Vec<Goldilocks> = (0..m)
+        .map(|i| (0..n).fold(Goldilocks::ZERO, |acc, j| acc + e[i * n + j]))
+        .collect();
+    let claimed_sum_e = mle::eval(&sum_e, &r_sum);
+    let row_sum = prove_virtual(
+        &[&eq_broadcast, e],
+        &[(Goldilocks::ONE, vec![0usize, 1usize])],
+        claimed_sum_e,
+        &sum_ch,
+    );
+    let add = prove_virtual(
+        &[&sum_e, bias, sum],
+        &[
+            (Goldilocks::ONE, vec![0usize]),
+            (Goldilocks::ONE, vec![1usize]),
+            (Goldilocks::ZERO - Goldilocks::ONE, vec![2usize]),
+        ],
+        Goldilocks::ZERO,
+        &r_sum,
+    );
+    let row_fe = vec![
+        mle::eval(&eq_broadcast, &sum_ch),
+        mle::eval(e, &sum_ch),
+    ];
+    let add_fe = vec![
+        mle::eval(&sum_e, &r_sum),
+        mle::eval(bias, &r_sum),
+        mle::eval(sum, &r_sum),
+    ];
+
+    let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
     let rem: Vec<Goldilocks> = (0..m * n)
         .map(|ij| {
             from_i64(
@@ -86,7 +231,6 @@ pub fn prove_softmax_rounded(
         .collect();
     let two16 = Goldilocks::from_u64(1u64 << 16);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    // out * sum_broadcast - e * 2^16 - rem = 0
     let rescale = prove_virtual(
         &[out, e, &sum_broadcast, &rem],
         &[
@@ -97,24 +241,46 @@ pub fn prove_softmax_rounded(
         Goldilocks::ZERO,
         &r_scale,
     );
-
-    SoftmaxRoundedProof {
+    let rescale_fe = vec![
+        mle::eval(out, &r_scale),
+        mle::eval(e, &r_scale),
+        mle::eval(&sum_broadcast, &r_scale),
+        mle::eval(&rem, &r_scale),
+    ];
+    SoftmaxBiasProof {
         row_sum,
+        add,
         rescale,
         r_sum,
         sum_ch,
         r_scale,
-        claimed,
+        claimed: claimed_sum_e,
+        row_fe,
+        add_fe,
+        rescale_fe,
     }
 }
 
-pub fn verify_softmax_rounded(proof: &SoftmaxRoundedProof) -> bool {
+pub fn verify_softmax_bias(proof: &SoftmaxBiasProof) -> bool {
     if !verify_virtual(
         &proof.row_sum,
         &[(Goldilocks::ONE, vec![0usize, 1usize])],
         proof.claimed,
         &proof.sum_ch,
-        &proof.row_sum.final_evals,
+        &proof.row_fe,
+    ) {
+        return false;
+    }
+    if !verify_virtual(
+        &proof.add,
+        &[
+            (Goldilocks::ONE, vec![0usize]),
+            (Goldilocks::ONE, vec![1usize]),
+            (Goldilocks::ZERO - Goldilocks::ONE, vec![2usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.r_sum,
+        &proof.add_fe,
     ) {
         return false;
     }
@@ -129,7 +295,7 @@ pub fn verify_softmax_rounded(proof: &SoftmaxRoundedProof) -> bool {
         ],
         Goldilocks::ZERO,
         &proof.r_scale,
-        &proof.rescale.final_evals,
+        &proof.rescale_fe,
     )
 }
 

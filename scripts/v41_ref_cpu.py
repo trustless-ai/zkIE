@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""CPU reference for DeepSeek-V4.1-Flash quantized ops.
+
+The full 40-layer CSA2/CED/Engram forward is still being wired into the Rust
+builder. This script provides the reference primitive used by the first vertical
+slice: dequantize an FP8-E4M3/E8M0 safetensors weight and compute
+`x @ W^T` for an all-ones input, so it can be diffed against the Rust
+`matmul_ref` example.
+
+Usage:
+  python3 scripts/v41_ref_cpu.py \
+    --shard /data/zkIE/models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors \
+    --weight layers.0.attn.wo_a.weight \
+    --scale layers.0.attn.wo_a.scale \
+    --m 1 --k 4096 --n 8192
+"""
+
+import argparse
+import json
+import struct
+import math
+from pathlib import Path
+
+import numpy as np
+
+
+def read_safetensors(path):
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        base = 8 + n
+        tensors = {}
+        for name, meta in header.items():
+            start, end = meta["data_offsets"]
+            f.seek(base + start)
+            tensors[name] = {
+                "dtype": meta["dtype"],
+                "shape": meta["shape"],
+                "data": f.read(end - start),
+            }
+        return tensors
+
+
+def dequant_fp8_weight(weight, scale, block=32):
+    w = np.frombuffer(weight["data"], dtype=np.uint8).reshape(weight["shape"])
+    s = np.frombuffer(scale["data"], dtype=np.uint8).reshape(scale["shape"])
+    s = np.power(2.0, s.astype(np.float64) - 127.0)
+    s_big = np.repeat(np.repeat(s, block, axis=0), block, axis=1)
+    sign = np.where((w & 0x80) != 0, -1.0, 1.0)
+    exp = (w >> 3) & 0x0F
+    man = (w & 0x07).astype(np.float64)
+    val = np.where(
+        exp == 0,
+        man * (2.0 ** -9),
+        (1.0 + man / 8.0) * np.power(2.0, exp.astype(np.float64) - 7.0),
+    )
+    return sign * val * s_big
+
+
+def dequant_fp4_weight(weight, scale, logical_cols, block=32):
+    w = np.frombuffer(weight["data"], dtype=np.uint8).reshape(weight["shape"])
+    s = np.frombuffer(scale["data"], dtype=np.uint8).reshape(scale["shape"])
+    rows, packed_cols = w.shape
+    s = np.power(2.0, s.astype(np.float64) - 127.0)
+    s_big = np.repeat(s, block, axis=1)
+    low = (w & 0x0F).astype(np.int64)
+    high = (w >> 4).astype(np.int64)
+    table = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    unpacked = np.stack([table[low], table[high]], axis=-1).reshape(rows, logical_cols)
+    return unpacked * s_big
+
+
+def bf16_vec(weight):
+    bits = np.frombuffer(weight["data"], dtype="<u2").astype(np.uint32)
+    return (bits << 16).astype(np.uint32).view(np.float32).astype(np.float64)
+
+
+def rms_norm(x, w, eps=1e-20):
+    rsqrt = 1.0 / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x * rsqrt * w
+
+
+def rope(x, freqs, inverse=False):
+    half = x.shape[-1] // 2
+    xr = x.reshape(*x.shape[:-1], half, 2)
+    cos = np.cos(freqs)
+    sin = np.sin(freqs)
+    if inverse:
+        sin = -sin
+    out = np.empty_like(xr)
+    out[..., 0] = xr[..., 0] * cos - xr[..., 1] * sin
+    out[..., 1] = xr[..., 0] * sin + xr[..., 1] * cos
+    return out.reshape(x.shape)
+
+
+def sparse_attn(q, kv, sink, topk_idxs, scale):
+    b, s, h, d = q.shape
+    o = np.zeros_like(q)
+    for bi in range(b):
+        for si in range(s):
+            idxs = topk_idxs[bi, si]
+            idxs = idxs[idxs >= 0]
+            if len(idxs) == 0:
+                continue
+            kv_sel = kv[bi, idxs, :]
+            scores = q[bi, si] @ kv_sel.T * scale
+            scores = np.concatenate([scores, sink[:, None]], axis=1)
+            scores = scores - np.max(scores, axis=1, keepdims=True)
+            probs = np.exp(scores)
+            denom = probs.sum(axis=1, keepdims=True)
+            o[bi, si] = (probs[:, : len(idxs)] @ kv_sel) / denom
+    return o
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--shard", required=True)
+    ap.add_argument("--weight", required=True)
+    ap.add_argument("--scale", required=True)
+    ap.add_argument("--m", type=int, default=1)
+    ap.add_argument("--k", type=int, default=4096)
+    ap.add_argument("--n", type=int, default=8192)
+    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "block", "compressor", "sparse_attn_full", "embedding"], default="matmul")
+    ap.add_argument("--expert-id", type=int, default=240)
+    ap.add_argument("--tokenizer-json", default="")
+    ap.add_argument("--prompt", default="The sky is")
+    args = ap.parse_args()
+
+    t = read_safetensors(args.shard)
+
+    if args.mode == "embedding":
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(args.tokenizer_json)
+        ids = tok.encode(args.prompt).ids
+        # The embedding shard is model-00002, not the layer shard.
+        raw_dir = Path(args.shard).parent
+        emb_path = raw_dir / "model-00002-of-00048.safetensors"
+        e = read_safetensors(str(emb_path))
+        w = bf16_vec(e["embed.weight"]).reshape(-1, 5120)
+        fixed = np.round(w[ids] * 65536.0).astype(np.int64)
+        print("embedding_ids", ids)
+        print("embedding[0..4]", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "attention":
+        m = 16
+        dim = 5120
+        dim_pad = 8192
+        n_heads = 64
+        head_dim = 512
+        q_lora = 1280
+        q_lora_pad = 2048
+        qk_rope = 64
+        o_lora = 1024
+        o_groups = 8
+        sink = np.frombuffer(t["layers.0.attn.attn_sink"]["data"], dtype="<f4").astype(np.float64)
+        q_norm_real = bf16_vec(t["layers.0.attn.q_norm.weight"])
+        kv_norm = bf16_vec(t["layers.0.attn.kv_norm.weight"])
+
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+
+        def pad2d(w, nr, nc):
+            out = np.zeros((nr, nc), dtype=np.float64)
+            out[: w.shape[0], : w.shape[1]] = w
+            return out
+
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"]))
+        wo_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"]))
+        wo_b = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"])), dim_pad, o_groups * o_lora)
+
+        x = np.ones((1, m, dim), dtype=np.float64)
+        qr = rms_norm(x @ wq_a.T, q_norm_real)
+        q = (qr @ wq_b.T).reshape(1, m, n_heads, head_dim)
+        kv = rms_norm(x @ wkv.T, kv_norm)
+
+        pos = np.arange(m, dtype=np.float64)
+        inv = np.arange(qk_rope // 2, dtype=np.float64)
+        freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+        kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+
+        end = np.arange(m)[:, None]
+        topk = (end - 127).clip(0) + np.arange(m)[None, :]
+        topk = np.where(topk > end, -1, topk).astype(np.int64)[None, :, :]
+        o = sparse_attn(q, kv, sink, topk, head_dim ** -0.5)
+        # Official Attention.forward un-rotates the output rope tail
+        # (`apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)`).
+        o[..., -qk_rope:] = rope(o[..., -qk_rope:], freqs[None, :, None, :], inverse=True)
+
+        o = o.reshape(1, m, o_groups, -1)
+        wo_a = wo_a.reshape(o_groups, o_lora, -1)
+        o = np.einsum("bsgd,grd->bsgr", o, wo_a)
+        out = o.reshape(1, m, -1) @ wo_b.T
+        fixed = np.round(out[0] * 65536.0).astype(np.int64)
+        for i in range(8):
+            print(f"[{i}] {int(fixed[0, i])}")
+        print("last_token")
+        for i in range(8):
+            print(f"[{i}] {int(fixed[-1, i])}")
+        return
+
+    if args.mode == "attention_head0":
+        m = 16
+        dim = 5120
+        dim_pad = 8192
+        heads = 64
+        head_dim = 512
+        q_lora = 1280
+        q_lora_pad = 2048
+        qk_rope = 64
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+        def pad2d(w, nr, nc):
+            out = np.zeros((nr, nc), dtype=np.float64)
+            out[: w.shape[0], : w.shape[1]] = w
+            return out
+        kv_norm = bf16_vec(t["layers.0.attn.kv_norm.weight"])
+        q_norm = bf16_vec(t["layers.0.attn.q_norm.weight"])
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"]))
+        x = np.ones((1, m, dim))
+        qr = rms_norm(x @ wq_a.T, q_norm)
+        q = (qr @ wq_b.T).reshape(1, m, heads, head_dim)
+        kv = rms_norm(x @ wkv.T, kv_norm)
+        pos = np.arange(m, dtype=np.float64)
+        inv = np.arange(qk_rope // 2, dtype=np.float64)
+        freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+        kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+        # dense causal attention without sink
+        o = np.zeros_like(q)
+        scale = head_dim ** -0.5
+        for p in range(m):
+            kv_sel = kv[0, : p + 1, :]
+            scores = q[0, p] @ kv_sel.T * scale
+            scores = scores - np.max(scores, axis=1, keepdims=True)
+            probs = np.exp(scores)
+            probs = probs / probs.sum(axis=1, keepdims=True)
+            o[0, p] = probs @ kv_sel
+        fixed = np.round(o[0, 0, :8] * 65536.0).astype(np.int64)
+        print("attention_head0", fixed.tolist())
+        return
+
+    if args.mode == "proj":
+        m = 16
+        dim = 5120
+        n_heads = 64
+        head_dim = 512
+        q_lora = 1280
+        wq_a = dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"])
+        wq_b = dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"])
+        wkv = dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"])
+        x = np.ones((1, m, dim), dtype=np.float64)
+        def fixed(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.int64)
+        wq_a_f = fixed(wq_a)
+        wq_b_f = fixed(wq_b)
+        wkv_f = fixed(wkv)
+        xf = np.full((1, m, dim), 65536, dtype=np.int64)
+        # Rust path: exact integer dot, then round_div by 2^16.
+        qr_h = xf @ wq_a_f.T
+        qr = np.floor_divide(qr_h + (1 << 15), 1 << 16)[0]
+        q_h = qr.astype(np.int64) @ wq_b_f.T
+        q = np.floor_divide(q_h + (1 << 15), 1 << 16)[0]
+        kv_h = xf @ wkv_f.T
+        kv = np.floor_divide(kv_h + (1 << 15), 1 << 16)[0]
+        qrf = qr
+        qf = q
+        kvf = kv
+        print("qr", qrf.reshape(-1)[:4].tolist())
+        print("q", qf.reshape(-1)[:4].tolist())
+        print("kv", kvf.reshape(-1)[:4].tolist())
+        return
+
+    if args.mode == "oproj":
+        m = 16
+        o_lora = 1024
+        o_groups = 8
+        def fixed(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.int64)
+        wa = fixed(dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"]))
+        wb = fixed(dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"]))
+        # wo_a is [g*r, d] with g=8, r=1024. With all-ones input at 2^16 and
+        # shift 16, each output is the exact integer sum of its weight row.
+        oa = wa.reshape(o_groups, o_lora, 4096).sum(axis=2).reshape(-1)
+        # wo_b is stored padded [8192,8192]; first 5120 output rows are real.
+        s = oa.astype(np.int64) @ wb[:4, :].T
+        fixed = np.floor_divide(s + (1 << 15), 1 << 16)
+        print("oproj", fixed[:4].tolist())
+        return
+
+    if args.mode == "moe_gate":
+        m = 16
+        dim = 5120
+        n_experts = 384
+        gate_w = bf16_vec(t["layers.0.ffn.gate.weight"])
+        gate_w = gate_w.reshape(n_experts, dim)
+        gate_b = np.frombuffer(t["layers.0.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
+        x = np.ones((m, dim), dtype=np.float64)
+        scores = (x @ gate_w.T) / 1.0
+        scores = np.sqrt(np.log1p(np.exp(scores)))
+        biased = scores + gate_b[None, :]
+        topk = np.argsort(-biased, axis=1)[:, :6]
+        weights = np.take_along_axis(scores, topk, axis=1)
+        weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+        print("moe_gate_topk", topk[0].tolist())
+        print("moe_gate_weights", np.round(weights[0] * 65536.0).astype(np.int64).tolist())
+        return
+
+    if args.mode == "shared_expert":
+        m = 16
+        dim = 5120
+        inter = 2304
+        w1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
+        w2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
+        w3 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w3.weight"], t["layers.0.ffn.shared_experts.w3.scale"])
+        x = np.ones((m, dim), dtype=np.float64)
+        gate = x @ w1.T
+        up = x @ w3.T
+        up = np.clip(up, -10.0, 10.0)
+        gate = np.clip(gate, None, 10.0)
+        hidden = (gate / (1.0 + np.exp(-gate))) * up
+        out = hidden @ w2.T
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print("shared_expert", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "routed_expert":
+        eid = args.expert_id
+        m = 16
+        dim = 5120
+        inter = 2304
+        base = f"layers.0.ffn.experts.{eid}"
+        w1 = dequant_fp4_weight(t[f"{base}.w1.weight"], t[f"{base}.w1.scale"], dim, 32)
+        w2 = dequant_fp4_weight(t[f"{base}.w2.weight"], t[f"{base}.w2.scale"], inter, 32)
+        w3 = dequant_fp4_weight(t[f"{base}.w3.weight"], t[f"{base}.w3.scale"], dim, 32)
+        x = np.ones((m, dim), dtype=np.float64)
+        gate = x @ w1.T
+        up = x @ w3.T
+        up = np.clip(up, -10.0, 10.0)
+        gate = np.clip(gate, None, 10.0)
+        hidden = (gate / (1.0 + np.exp(-gate))) * up
+        out = hidden @ w2.T
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print(f"routed_expert_{eid}", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "mlp":
+        m = 16
+        dim = 5120
+        inter = 2304
+        n_experts = 384
+        x = np.ones((m, dim), dtype=np.float64)
+
+        gate_w = bf16_vec(t["layers.0.ffn.gate.weight"]).reshape(n_experts, dim)
+        gate_b = np.frombuffer(t["layers.0.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
+        scores = np.sqrt(np.log1p(np.exp(x @ gate_w.T)))
+        biased = scores + gate_b[None, :]
+        topk = np.argsort(-biased, axis=1)[:, :6]
+        weights = np.take_along_axis(scores, topk, axis=1)
+        weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+        weights = weights * 1.5
+
+        sw1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
+        sw2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
+        sw3 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w3.weight"], t["layers.0.ffn.shared_experts.w3.scale"])
+        out = np.zeros((m, dim), dtype=np.float64)
+        sg = x @ sw1.T
+        su = x @ sw3.T
+        su = np.clip(su, -10.0, 10.0)
+        sg = np.clip(sg, None, 10.0)
+        out += ((sg / (1.0 + np.exp(-sg))) * su) @ sw2.T
+
+        for ti in range(m):
+            for k in range(6):
+                eid = int(topk[ti, k])
+                base = f"layers.0.ffn.experts.{eid}"
+                w1 = dequant_fp4_weight(t[f"{base}.w1.weight"], t[f"{base}.w1.scale"], dim, 32)
+                w2 = dequant_fp4_weight(t[f"{base}.w2.weight"], t[f"{base}.w2.scale"], inter, 32)
+                w3 = dequant_fp4_weight(t[f"{base}.w3.weight"], t[f"{base}.w3.scale"], dim, 32)
+                g = x[ti : ti + 1] @ w1.T
+                u = x[ti : ti + 1] @ w3.T
+                u = np.clip(u, -10.0, 10.0)
+                g = np.clip(g, None, 10.0)
+                h = (g / (1.0 + np.exp(-g))) * u
+                out[ti] += weights[ti, k] * (h @ w2.T)[0]
+
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print("mlp", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "block":
+        m = 16
+        dim = 5120
+        hc = 4
+        mix_hc = (2 + hc) * hc
+        hc_d = hc * dim
+        norm_eps = 1e-20
+        hc_eps = 1e-6
+        iters = 20
+        head_dim = 512
+        n_heads = 64
+        qk_rope = 64
+        o_lora = 1024
+        o_groups = 8
+        inter = 2304
+        n_experts = 384
+        route_scale = 1.5
+
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+
+        def hc_split_sinkhorn(mixes, scale, base):
+            pre = 1.0 / (1.0 + np.exp(-(mixes[:, :hc] * scale[0] + base[:hc]))) + hc_eps
+            post = 2.0 / (1.0 + np.exp(-(mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])))
+            c = mixes[:, 2 * hc :].reshape(m, hc, hc) * scale[2] + base[2 * hc :].reshape(hc, hc)
+            c = np.exp(c - c.max(-1, keepdims=True))
+            c = c / c.sum(-1, keepdims=True) + hc_eps
+            c = c / (c.sum(-2, keepdims=True) + hc_eps)
+            for _ in range(iters - 1):
+                c = c / (c.sum(-1, keepdims=True) + hc_eps)
+                c = c / (c.sum(-2, keepdims=True) + hc_eps)
+            return pre, post, c
+
+        def hc_mixes(x4, hc_fn, hc_scale, hc_base):
+            xf = x4.reshape(m, hc_d).astype(np.float64)
+            rsqrt = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + norm_eps)
+            mixes = (xf @ hc_fn.T) * rsqrt
+            return hc_split_sinkhorn(mixes, hc_scale, hc_base)
+
+        def hc_pre(x4, pre):
+            return np.sum(pre[:, :, None] * x4, axis=1)
+
+        def hc_post(y, residual, post, comb):
+            return post[:, :, None] * y[:, None, :] + np.einsum("mhg,mgd->mhd", comb, residual)
+
+        sink = np.frombuffer(t["layers.0.attn.attn_sink"]["data"], dtype="<f4").astype(np.float64)
+        q_norm_real = bf16_vec(t["layers.0.attn.q_norm.weight"])
+        kv_norm = bf16_vec(t["layers.0.attn.kv_norm.weight"])
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"]))
+        wo_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"]))
+        wo_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"]))
+        attn_norm_w = bf16_vec(t["layers.0.attn_norm.weight"])
+        ffn_norm_w = bf16_vec(t["layers.0.ffn_norm.weight"])
+        hc_attn_fn = np.frombuffer(t["layers.0.hc_attn_fn"]["data"], dtype="<f4").astype(np.float64).reshape(mix_hc, hc_d)
+        hc_attn_base = np.frombuffer(t["layers.0.hc_attn_base"]["data"], dtype="<f4").astype(np.float64)
+        hc_attn_scale = np.frombuffer(t["layers.0.hc_attn_scale"]["data"], dtype="<f4").astype(np.float64)
+        hc_ffn_fn = np.frombuffer(t["layers.0.hc_ffn_fn"]["data"], dtype="<f4").astype(np.float64).reshape(mix_hc, hc_d)
+        hc_ffn_base = np.frombuffer(t["layers.0.hc_ffn_base"]["data"], dtype="<f4").astype(np.float64)
+        hc_ffn_scale = np.frombuffer(t["layers.0.hc_ffn_scale"]["data"], dtype="<f4").astype(np.float64)
+
+        def attention(x):
+            qr = rms_norm(x @ wq_a.T, q_norm_real)
+            q = (qr @ wq_b.T).reshape(1, m, n_heads, head_dim)
+            kv = rms_norm(x @ wkv.T, kv_norm)[None, :, :]
+            pos = np.arange(m, dtype=np.float64)
+            inv = np.arange(qk_rope // 2, dtype=np.float64)
+            freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+            q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+            kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+            end = np.arange(m)[:, None]
+            topk = (end - 127).clip(0) + np.arange(m)[None, :]
+            topk = np.where(topk > end, -1, topk).astype(np.int64)[None, :, :]
+            o = sparse_attn(q, kv, sink, topk, head_dim ** -0.5)
+            o[..., -qk_rope:] = rope(o[..., -qk_rope:], freqs[None, :, None, :], inverse=True)
+            o = o[0]
+            o = o.reshape(m, o_groups, -1)
+            wa = wo_a.reshape(o_groups, o_lora, -1)
+            o = np.einsum("sgd,grd->sgr", o, wa)
+            return o.reshape(m, -1) @ wo_b.T
+
+        gate_w = bf16_vec(t["layers.0.ffn.gate.weight"]).reshape(n_experts, dim)
+        gate_b = np.frombuffer(t["layers.0.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
+        sw1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
+        sw2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
+        sw3 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w3.weight"], t["layers.0.ffn.shared_experts.w3.scale"])
+
+        def moe(x):
+            scores = np.sqrt(np.log1p(np.exp(x @ gate_w.T)))
+            biased = scores + gate_b[None, :]
+            topk = np.argsort(-biased, axis=1)[:, :6]
+            weights = np.take_along_axis(scores, topk, axis=1)
+            weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+            weights = weights * route_scale
+            sg = x @ sw1.T
+            su = x @ sw3.T
+            su = np.clip(su, -10.0, 10.0)
+            sg = np.clip(sg, None, 10.0)
+            out = ((sg / (1.0 + np.exp(-sg))) * su) @ sw2.T
+            for ti in range(m):
+                for k in range(6):
+                    eid = int(topk[ti, k])
+                    base = f"layers.0.ffn.experts.{eid}"
+                    w1 = dequant_fp4_weight(t[f"{base}.w1.weight"], t[f"{base}.w1.scale"], dim, 32)
+                    w2 = dequant_fp4_weight(t[f"{base}.w2.weight"], t[f"{base}.w2.scale"], inter, 32)
+                    w3 = dequant_fp4_weight(t[f"{base}.w3.weight"], t[f"{base}.w3.scale"], dim, 32)
+                    g = x[ti : ti + 1] @ w1.T
+                    u = x[ti : ti + 1] @ w3.T
+                    u = np.clip(u, -10.0, 10.0)
+                    g = np.clip(g, None, 10.0)
+                    h = (g / (1.0 + np.exp(-g))) * u
+                    out[ti] += weights[ti, k] * (h @ w2.T)[0]
+            return out
+
+        x = np.ones((m, dim), dtype=np.float64)
+        x4 = np.repeat(x[:, None, :], hc, axis=1)
+        pre_mix = np.zeros((m, hc), dtype=np.float64)
+        pre_mix[:, 0] = 1.0
+
+        attn_pre, attn_post, attn_comb = hc_mixes(x4, hc_attn_fn, hc_attn_scale, hc_attn_base)
+        attn_in = hc_pre(x4, pre_mix)
+        attn_in = rms_norm(attn_in, attn_norm_w)
+        attn_out = attention(attn_in)
+        x4 = hc_post(attn_out, x4, attn_post, attn_comb)
+
+        ffn_pre, ffn_post, ffn_comb = hc_mixes(x4, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
+        ffn_in = hc_pre(x4, attn_pre)
+        ffn_in = rms_norm(ffn_in, ffn_norm_w)
+        ffn_out = moe(ffn_in)
+        print("ffn_out_first8", np.round(ffn_out[0] * 65536.0).astype(np.int64).tolist()[:8])
+        x4 = hc_post(ffn_out, x4, ffn_post, ffn_comb)
+
+        fixed = np.round(x4 * 65536.0).astype(np.int64)
+        print("block_first8", fixed[0, 0, :8].tolist())
+        print("block_last8", fixed[-1, 0, :8].tolist())
+        print("ffn_pre", np.round(ffn_pre[0] * 65536.0).astype(np.int64).tolist())
+        return
+
+    if args.mode == "compressor":
+        m = 16
+        dim = 5120
+        hd = 512
+        ratio = 2
+        groups = m // ratio
+        wkv = bf16_vec(t["layers.2.attn.compressor.wkv.weight"]).reshape(hd, dim)
+        wgate = bf16_vec(t["layers.2.attn.compressor.wgate.weight"]).reshape(hd, dim)
+        norm = bf16_vec(t["layers.2.attn.compressor.norm.weight"])
+        x = np.ones((m, dim), dtype=np.float64)
+        kv = x @ wkv.T
+        score = x @ wgate.T
+        kv = kv.reshape(groups, ratio, hd)
+        score = score.reshape(groups, ratio, hd)
+        score = score - score.max(axis=1, keepdims=True)
+        probs = np.exp(score)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        latent = (kv * probs).sum(axis=1)
+        latent = rms_norm(latent, norm)
+        fixed = np.round(latent * 65536.0).astype(np.int64)
+        print("compressor", fixed[0, :8].tolist())
+        return
+
+    if args.mode == "sparse_attn_full":
+        # Layer 2: sliding window (dense for seq16) + ratio-2 compressed KV + sink.
+        m = 16
+        dim = 5120
+        n_heads = 64
+        head_dim = 512
+        q_lora = 1280
+        qk_rope = 64
+        ratio = 2
+        window = 128
+
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+
+        sink = np.frombuffer(t["layers.2.attn.attn_sink"]["data"], dtype="<f4").astype(np.float64)
+        q_norm = bf16_vec(t["layers.2.attn.q_norm.weight"])
+        kv_norm = bf16_vec(t["layers.2.attn.kv_norm.weight"])
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.2.attn.wq_a.weight"], t["layers.2.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.2.attn.wq_b.weight"], t["layers.2.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.2.attn.wkv.weight"], t["layers.2.attn.wkv.scale"]))
+        cwkv = bf16_vec(t["layers.2.attn.compressor.wkv.weight"]).reshape(head_dim, dim)
+        cwgate = bf16_vec(t["layers.2.attn.compressor.wgate.weight"]).reshape(head_dim, dim)
+        cnorm = bf16_vec(t["layers.2.attn.compressor.norm.weight"])
+
+        x = np.ones((m, dim), dtype=np.float64)
+        qr = rms_norm(x @ wq_a.T, q_norm)
+        q = (qr @ wq_b.T).reshape(1, m, n_heads, head_dim)
+        kv = rms_norm(x @ wkv.T, kv_norm)
+
+        pos = np.arange(m, dtype=np.float64)
+        inv = np.arange(qk_rope // 2, dtype=np.float64)
+        freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+        kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+
+        # compressor latent (pre-RoPE), then rotate the rope tail at compressed positions.
+        groups = m // ratio
+        ckv = x @ cwkv.T
+        cscore = x @ cwgate.T
+        ckv = ckv.reshape(groups, ratio, head_dim)
+        cscore = cscore.reshape(groups, ratio, head_dim)
+        cscore = cscore - cscore.max(axis=1, keepdims=True)
+        cprob = np.exp(cscore)
+        cprob = cprob / cprob.sum(axis=1, keepdims=True)
+        latent = (ckv * cprob).sum(axis=1)
+        latent = rms_norm(latent, cnorm)
+        cpos = np.arange(groups, dtype=np.float64) * ratio
+        cfreqs = cpos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        latent[..., -qk_rope:] = rope(latent[..., -qk_rope:], cfreqs[None, :, :])
+
+        kv_all = np.concatenate([kv[None], latent[None]], axis=1)  # [1, m + groups, head_dim]
+        # topk_idxs: window slots [0..m) causal, compressed slots [m..m+groups) offset.
+        end = np.arange(m)[:, None]
+        win_idxs = (end - window + 1).clip(0) + np.arange(m)[None, :]
+        win_idxs = np.where(win_idxs > end, -1, win_idxs).astype(np.int64)
+        comp_idxs = np.arange(groups)[None, :] + m
+        comp_visible = comp_idxs - m <= (end // ratio)
+        comp_idxs = np.where(comp_visible, comp_idxs, -1).astype(np.int64)
+        topk = np.concatenate([win_idxs, comp_idxs], axis=1)[None]  # [1, m, m+groups]
+
+        o = sparse_attn(q, kv_all, sink, topk, head_dim ** -0.5)
+        o[..., -qk_rope:] = rope(o[..., -qk_rope:], freqs[None, :, None, :], inverse=True)
+        fixed = np.round(o[0, 0, 0, :8] * 65536.0).astype(np.int64)
+        print("sparse_attn_full", fixed.tolist())
+        return
+
+    winfo = t[args.weight]
+    sinfo = t[args.scale]
+    w = np.frombuffer(winfo["data"], dtype=np.uint8).reshape(winfo["shape"])
+    s = np.frombuffer(sinfo["data"], dtype=np.uint8).reshape(sinfo["shape"])
+
+    block = 32
+    s = np.power(2.0, s.astype(np.float64) - 127.0)
+    s_big = np.repeat(np.repeat(s, block, axis=0), block, axis=1)
+    sign = np.where((w & 0x80) != 0, -1.0, 1.0)
+    exp = (w >> 3) & 0x0F
+    man = (w & 0x07).astype(np.float64)
+    val = np.where(
+        exp == 0,
+        man * (2.0 ** -9),
+        (1.0 + man / 8.0) * np.power(2.0, exp.astype(np.float64) - 7.0),
+    )
+    wdec = sign * val * s_big
+
+    x = np.ones((args.m, args.k), dtype=np.float64)
+    # Match the Rust prover's fixed-point path: each weight is rounded to i64
+    # before the dot product, and the dot product is an exact integer sum.
+    scaled = wdec * 65536.0
+    wfixed = np.where(
+        scaled >= 0.0,
+        np.floor(scaled + 0.5),
+        np.ceil(scaled - 0.5),
+    ).astype(np.int64)
+    fixed = x.astype(np.int64) @ wfixed.T
+    for i in range(min(8, fixed.shape[1])):
+        print(f"[{i}] {int(fixed[0, i])}")
+
+
+if __name__ == "__main__":
+    main()

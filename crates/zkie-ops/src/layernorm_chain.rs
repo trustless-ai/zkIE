@@ -9,7 +9,8 @@ use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
 };
 use zkie_core::common::mle;
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use zkie_core::common::transcript::Transcript;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct LayernormChainProof {
@@ -29,7 +30,7 @@ pub fn prove_layernorm_chain(
     rsqrt_table: &[Goldilocks],
     m: usize,
     d: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> (LayernormChainProof, Vec<u32>, Vec<Goldilocks>) {
     // forward
     let mean_sq: Vec<Goldilocks> = (0..m)
@@ -43,34 +44,38 @@ pub fn prove_layernorm_chain(
     let scale: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d] * w[ij]).collect();
     let out: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] * scale[ij] + b[ij]).collect();
 
-    // 1. mean_sq reduction: sum_{i,j} eq(r,i) * x^2 = mean_sq(r)
-    let r_mean: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
+    // 1. mean_sq reduction: sum_{i,j} eq(r,i) * x^2 = mean_sq(r).
+    //    r_mean is the eq point (squeezed upfront); the sumcheck challenges
+    //    are derived per-round (S1).
+    let r_mean: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
     let eq_i = mle::eq_evals(&r_mean);
     let eq_b: Vec<Goldilocks> = (0..m * d).map(|idx| eq_i[idx / d]).collect();
     let mean_claim = mle::eval(&mean_sq, &r_mean);
-    let mean_ch: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let mean_sq_proof = prove_virtual(
+    let (mean_sq_proof, mean_ch) = prove_virtual(
         &[&eq_b, x],
         &[(Goldilocks::ONE, vec![0usize, 1usize, 1usize])],
         mean_claim,
-        &mean_ch,
+        transcript,
     );
 
-    // 3. out affine: out = x * scale + b  (i.e. x*scale + b - out = 0)
-    let r_out: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
+    // 3. out = x * rsqrt * w + b  (degree-3; S2: binds the weight w into the
+    //    output relation instead of the prover-computed `scale` product).
+    //    rsqrt comes from the lookup table, so the mles are
+    //    [x, rsqrt_b, w, b, out] with x*rsqrt*w + b - out = 0.
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let rsqrt_b: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d]).collect();
+    // S5: EQ-WEIGHTED out relation (pointwise at the squeezed eq point;
+    // the claim point r_out stays the sumcheck's derived vector).
+    let q: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
+    let eq = mle::eq_evals(&q);
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg, vec![0usize, 5usize]),
     ];
-    let out_proof = prove_virtual(&[x, &scale, b, &out], &terms, Goldilocks::ZERO, &r_out);
+    let (out_proof, r_out) =
+        prove_virtual(&[&eq, x, &rsqrt_b, w, b, &out], &terms, Goldilocks::ZERO, transcript);
 
     (
         LayernormChainProof {
@@ -87,23 +92,48 @@ pub fn prove_layernorm_chain(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_layernorm_chain(proof: &LayernormChainProof) -> bool {
-    if !verify_virtual(
+pub fn verify_layernorm_chain(
+    proof: &LayernormChainProof,
+    m: usize,
+    d: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    let r_mean: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
+    if r_mean != proof.r_mean {
+        return false;
+    }
+    let mean_terms = [(Goldilocks::ONE, vec![0usize, 1usize, 1usize])];
+    let (ok, mean_ch, fc) = verify_virtual(
         &proof.mean_sq,
-        &[(Goldilocks::ONE, vec![0usize, 1usize, 1usize])],
+        &mean_terms,
         proof.mean_claim,
-        &proof.mean_ch,
-        &proof.mean_sq.final_evals,
-    ) {
+        (m * d).trailing_zeros() as usize,
+        transcript,
+    );
+    if !ok
+        || mean_ch != proof.mean_ch
+        || fc != virtual_eval(&mean_terms, &proof.mean_sq.final_evals)
+    {
         return false;
     }
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let q_s: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg, vec![0usize, 5usize]),
     ];
-    verify_virtual(&proof.out, &terms, Goldilocks::ZERO, &proof.r_out, &proof.out.final_evals)
+    let (ok, r_out, fc) = verify_virtual(
+        &proof.out,
+        &terms,
+        Goldilocks::ZERO,
+        (m * d).trailing_zeros() as usize,
+        transcript,
+    );
+    ok && r_out == proof.r_out
+        && proof.out.final_evals[0] == mle::eq_poly(&q_s, &r_out)
+        && fc == virtual_eval(&terms, &proof.out.final_evals)
 }
 
 #[cfg(test)]
@@ -124,7 +154,11 @@ mod tests {
             .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
             .collect();
         let rsqrt_table: Vec<Goldilocks> = (0..(1usize << 8)).map(|_| rng.field()).collect();
-        let (proof, _ridx, _rvals) = prove_layernorm_chain(&x, &w, &b, &rsqrt_table, m, d, &mut rng);
-        assert!(verify_layernorm_chain(&proof));
+        let mut tp = Transcript::new(b"zkie-layernorm-test");
+        tp.absorb_u64(0x9E9E);
+        let (proof, _ridx, _rvals) = prove_layernorm_chain(&x, &w, &b, &rsqrt_table, m, d, &mut tp);
+        let mut tv = Transcript::new(b"zkie-layernorm-test");
+        tv.absorb_u64(0x9E9E);
+        assert!(verify_layernorm_chain(&proof, m, d, &mut tv));
     }
 }

@@ -3,6 +3,7 @@
 
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use zkie_core::common::logup_gkr::{prove_permutation, verify_permutation, PermutationProof};
+use zkie_core::common::transcript::Transcript;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ScatterProof {
@@ -42,7 +43,19 @@ pub fn prove_scatter(
     expert_of: &[u32],
     m: usize,
     n: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
+) -> ScatterProof {
+    prove_scatter_with_mode(sel, token_id, expert_of, m, n, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn prove_scatter_with_mode(
+    sel: &[Goldilocks],
+    token_id: &[u32],
+    expert_of: &[u32],
+    m: usize,
+    n: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
 ) -> ScatterProof {
     let a = source_encodings(sel, m, n);
     let b: Vec<Goldilocks> = token_id
@@ -50,12 +63,47 @@ pub fn prove_scatter(
         .zip(expert_of.iter())
         .map(|(&t, &e)| Goldilocks::from_u64((t as usize * n + e as usize) as u64))
         .collect();
-    let perm = prove_permutation(&a, &b, rng);
+    let perm = match mode {
+        // Committed: the committed perm section re-proves the fracs on its
+        // own transcript (binding the committed column roots); here they run
+        // on a scratch transcript so the shard transcript stays frac-free.
+        crate::compose::FracMode::Committed => {
+            let mut scratch = Transcript::new(b"zkie-scratch-perm");
+            prove_permutation(&a, &b, &mut scratch)
+        }
+        crate::compose::FracMode::Plain => prove_permutation(&a, &b, transcript),
+    };
     ScatterProof { perm }
 }
 
-pub fn verify_scatter(proof: &ScatterProof, _m: usize, _n: usize) -> bool {
-    verify_permutation(&proof.perm)
+pub fn verify_scatter(
+    proof: &ScatterProof,
+    _m: usize,
+    _n: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    verify_scatter_with_mode(proof, _m, _n, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn verify_scatter_with_mode(
+    proof: &ScatterProof,
+    _m: usize,
+    _n: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> bool {
+    match mode {
+        crate::compose::FracMode::Plain => {
+            // S3: the permutation depth comes from the (padded, proof-carried)
+            // a column length (build_perm_num_den pads to at least 2^5).
+            let t = proof.perm.a.len().next_power_of_two().max(32).trailing_zeros() as usize;
+            verify_permutation(&proof.perm, t, transcript)
+        }
+        // Committed: the fracs are verified by the committed perm section on
+        // the committed transcript; nothing is replayed on the shard
+        // transcript.
+        crate::compose::FracMode::Committed => true,
+    }
 }
 
 #[cfg(test)]
@@ -73,7 +121,11 @@ mod tests {
         }
         let (token_id, expert_of) = scatter_forward(&sel, m, n);
         assert_eq!(token_id.len(), m * k);
-        let proof = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut rng);
-        assert!(verify_scatter(&proof, m, n));
+        let mut tp = Transcript::new(b"zkie-scatter-test");
+        tp.absorb_u64(0x4242);
+        let proof = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut tp);
+        let mut tv = Transcript::new(b"zkie-scatter-test");
+        tv.absorb_u64(0x4242);
+        assert!(verify_scatter(&proof, m, n, &mut tv));
     }
 }

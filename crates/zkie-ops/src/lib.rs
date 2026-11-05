@@ -10,3 +10,4 @@ pub mod gather;
 pub mod scatter;
 pub mod softmax_scaled;
 pub mod topk;
+pub mod proof_size;

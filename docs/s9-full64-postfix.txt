@@ -1,0 +1,31 @@
+S9 full64 segmented rerun after same_poly out-binding fixes (2026-11-05)
+fix/soundness-repair @ abb1751; DeepSeek-V2-Lite layer 10, seq=1, K=6 (64 experts)
+Command: ZKIE_S9_BUDGET_LOG=1 ZKIE_S7_DUMP_PREFIX=/tmp/s7-runN \
+  cargo run --release -p zkie-models-deepseek-v2-lite --example prove_core_chain_full64
+
+RUN1=0 RUN2=0
+BYTES-a-IDENTICAL BYTES-b-IDENTICAL BYTES-d-IDENTICAL BYTES-c-IDENTICAL
+
+A commit 23.459us prove 129.078957ms bytes 291042
+S9-budget openings=7 weighted=7122 merge=592 outer_units=7714 security=97 required=93
+A negative rejected: router score above 2^22 (proof-level range)
+B forward 305.16899ms g_len=16384
+B gate range [-232482,171093] w=[8156126,8559701] high=[-8621089,-8217514]
+S9-budget openings=23 weighted=21102 merge=1232 outer_units=22334 security=97 required=95
+B commit+prove 596.831045712s verify 198.082898ms bytes 2993256 peak_rss=4808732kB
+negative rejected: A tampered gate
+negative rejected: A tampered router score input
+negative rejected: B tampered public routing array
+negative rejected: B tampered g output
+negative rejected: wrong expert weight root
+negative rejected: wrong activation table root
+D ScaleVec domain |silu|max=159381 |u|max=231507 (contract < 2^24)
+S9-budget openings=49 weighted=16806966 merge=2554 outer_units=16809520 security=97 required=96
+D commit+prove 1282.389413728s verify 401.463802ms bytes 6712889 peak_rss=10957896kB
+D negatives rejected: out/g/mask tamper, swapped experts, dropped route
+negative rejected: wrong up/down expert root
+negative rejected: wrong real silu table root
+C forward 288.201491ms commit+prove 287.889735ms verify 20.015432ms bytes 470760 out_len=2048
+S9-budget openings=12 weighted=8642 merge=690 outer_units=9332 security=97 required=94
+C negatives rejected: d/score/out/gate tamper
+S7-CHAIN-OK layer=10 A_bytes=291042 B_bytes=2993256 D_bytes=6712889 C_bytes=470760 peak_rss=10957896kB

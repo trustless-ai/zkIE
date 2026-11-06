@@ -4,3 +4,8 @@ members = ["crates/zkie-core", "crates/zkie-ops", "crates/zkie-engine", "models/
 
 [patch.crates-io]
 p3-merkle-tree = { path = "crates/zkie-core/vendor/p3-merkle-tree" }
+# O2 determinism: the upstream PoW grind uses Rayon find_any/find_map_any, so
+# the witness (and proof bytes) varies with thread scheduling. The vendored
+# copy uses ordered find_first/find_map_first and returns the smallest valid
+# witness, making proof bytes deterministic. Security and transcript unchanged.
+p3-challenger = { path = "crates/zkie-core/vendor/p3-challenger" }

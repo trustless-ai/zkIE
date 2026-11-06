@@ -7,8 +7,13 @@ use zkie_core::common::fixed_point::{from_i32, to_i32, to_i64};
 use zkie_core::pcs::whir::Whir;
 use zkie_models_gemma3::{build_gemma3, VOCAB};
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes,
-    verify_sequence_shift, Store,
+    commit_model_weights,
+    prove_committed_shard_dag,
+    verify_committed_shard_dag_bytes,
+    verify_sequence_shift,
+    Store,
+    TrustedModelManifest,
+    PublicStatement,
 };
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -45,16 +50,18 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let cached = commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/gemma3-model-batches-v2");
+    let trusted_model = TrustedModelManifest::from_offline_commitment(
+        &cached, &store.owned_slices(), &ops);
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 53, &whir, &cached, &mut rng, tokens, t);
+    let proof = prove_committed_shard_dag(&mut store, &ops, 53, &whir, &cached, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
     assert!(
-        verify_committed_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 53, &whir),
+        verify_committed_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 53, &whir, &PublicStatement::Generic, &trusted_model),
         "committed proof failed"
     );
     let verify_t = t2.elapsed();

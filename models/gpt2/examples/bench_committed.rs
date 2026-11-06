@@ -9,8 +9,13 @@ use zkie_core::common::fixed_point::{from_i32, to_i32, to_i64};
 use zkie_core::pcs::whir::Whir;
 use zkie_models_gpt2::build_gpt2;
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes,
-    verify_sequence_shift, Store,
+    commit_model_weights,
+    prove_committed_shard_dag,
+    verify_committed_shard_dag_bytes,
+    verify_sequence_shift,
+    PublicStatement,
+    Store,
+    TrustedModelManifest,
 };
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -54,16 +59,30 @@ fn main() {
     let t0 = std::time::Instant::now();
     let cached =
         commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/gpt2-model-batches-v2");
+    let trusted_model = TrustedModelManifest::from_offline_commitment(
+        &cached, &store.owned_slices(), &ops);
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, &mut rng, tokens, t);
+    let proof = prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
+    // S6: this benchmark replays extracted (non-generated) tokens, so the
+    // language-model sequence statement is not asserted here; real public
+    // sequence verification passes a `PublicStatement::LanguageModel` with
+    // the caller-confirmed prompt + response (see the s6_* tests).
     assert!(
-        verify_committed_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 176, &whir),
+        verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            176,
+            &whir,
+            &PublicStatement::Generic,
+            &trusted_model
+        ),
         "committed proof failed"
     );
     let verify_t = t2.elapsed();

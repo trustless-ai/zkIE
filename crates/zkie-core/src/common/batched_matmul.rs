@@ -16,11 +16,16 @@
 //! reduces to claims on `seg` (at the full challenge) and `w` (at `v || ch`),
 //! plus the public `eq(pos, u)` selector.
 
-use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
-use crate::common::mle;
-use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use std::borrow::Cow;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+use crate::common::field::{Ef, Goldilocks, PrimeCharacteristicRing};
+use crate::common::ef_outer;
+use crate::common::mle;
+use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use crate::common::transcript::Transcript;
+use crate::common::weights_io::WeightMmap;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchedMatmulProof {
     pub claimed: Goldilocks,
     pub sumcheck: VirtualProof,
@@ -45,9 +50,11 @@ fn terms() -> Vec<(Goldilocks, Vec<usize>)> {
 /// `(u, v)`.
 ///
 /// Layouts (row-major): `seg` = `S x K`, `w` = `S x K x N`, `g` = `S x N`.
-/// `u` fixes the `S` position variables, `v` fixes the `N` output variables, and
-/// `ch` carries `S + K` sumcheck challenges (the `(pos, d)` domain). `S`, `K`,
-/// `N` must be powers of two.
+/// `u` fixes the `S` position variables and `v` the `N` output variables
+/// (statement-bound, squeezed by the caller). S1: the `S + K` sumcheck
+/// challenges `ch` over the `(pos, d)` domain are derived per-round from the
+/// sumcheck's own round messages and returned. `S`, `K`, `N` must be powers of
+/// two.
 pub fn prove(
     seg: &[Goldilocks],
     w: &[Goldilocks],
@@ -57,14 +64,13 @@ pub fn prove(
     n: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> BatchedMatmulProof {
+    transcript: &mut Transcript,
+) -> (BatchedMatmulProof, Vec<Goldilocks>) {
     assert_eq!(seg.len(), s * k);
     assert_eq!(w.len(), s * k * n);
     assert_eq!(g.len(), s * n);
     assert_eq!(u.len(), s.trailing_zeros() as usize);
     assert_eq!(v.len(), n.trailing_zeros() as usize);
-    assert_eq!(ch.len(), (s * k).trailing_zeros() as usize);
 
     let w_v = mle::partial_eval(w, v); // S x K, index pos*K + d
     let eq_u = mle::eq_evals(u); // S
@@ -75,37 +81,59 @@ pub fn prove(
     let claimed = mle::eval(g, &gp);
 
     let mles: [&[Goldilocks]; 3] = [seg, &w_v, &eq_b];
-    let sumcheck = prove_virtual(&mles, &terms(), claimed, ch);
-    BatchedMatmulProof { claimed, sumcheck }
+    let (sumcheck, ch) = prove_virtual(&mles, &terms(), claimed, transcript);
+    (BatchedMatmulProof { claimed, sumcheck }, ch)
 }
 
-/// Verify the sumcheck, recomputing the public `eq(pos, u)` selector. The
-/// `seg`/`w` endpoint evals carried by the proof are bound to their commitments
-/// by the caller (op layer), matching the ordinary-matmul convention.
+/// Verify the sumcheck with the S1 transcript replay, recomputing the public
+/// `eq(pos, u)` selector. Returns the derived `ch`. The `seg`/`w` endpoint
+/// evals carried by the proof are bound to their commitments by the caller
+/// (op layer), matching the ordinary-matmul convention.
 pub fn verify(
     proof: &BatchedMatmulProof,
     s: usize,
     k: usize,
     u: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
-    assert_eq!(u.len(), s.trailing_zeros() as usize);
-    assert_eq!(ch.len(), (s * k).trailing_zeros() as usize);
-    let eq_u = mle::eq_evals(u);
-    let eq_b = broadcast_eq(&eq_u, k);
-    let eq_final = mle::eval(&eq_b, ch);
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    // O4: for the row-major (pos*K + d) layout with power-of-two S and K, the
+    // public broadcast selector eq_b[pos*K + d] = eq_u[pos] is independent of
+    // the low d variables. Its MLE at the sumcheck challenge ch is therefore
+    // eq_u evaluated at the high position variables ch[logK..]; the verifier
+    // needs no S*K expansion. Non-power-of-two shapes fail closed: padding
+    // must already be expressed by the caller's masked/zeroed domain, not by
+    // truncating coordinates here.
+    if !s.is_power_of_two() || !k.is_power_of_two() {
+        return (false, Vec::new());
+    }
+    if u.len() != s.trailing_zeros() as usize {
+        return (false, Vec::new());
+    }
+    let (ok, ch, final_claim) = verify_virtual(
+        &proof.sumcheck,
+        &terms(),
+        proof.claimed,
+        (s * k).trailing_zeros() as usize,
+        transcript,
+    );
+    if !ok {
+        return (false, ch);
+    }
+    let k_bits = k.trailing_zeros() as usize;
+    if ch.len() != (s * k).trailing_zeros() as usize || ch.len() < k_bits {
+        return (false, ch);
+    }
+    // Closed-form point evaluation of the public broadcast selector: the
+    // verifier does not materialize eq_u or the S*K column. Padding is part of
+    // the masked/zeroed power-of-two domain chosen by the caller; the
+    // challenge coordinates are never truncated.
+    let eq_final = mle::eq_poly(u, &ch[k_bits..]);
     let final_evals = vec![
         proof.sumcheck.final_evals[0],
         proof.sumcheck.final_evals[1],
         eq_final,
     ];
-    verify_virtual(
-        &proof.sumcheck,
-        &terms(),
-        proof.claimed,
-        ch,
-        &final_evals,
-    )
+    (final_claim == virtual_eval(&terms(), &final_evals), ch)
 }
 
 /// Plain per-position matmul forward (also the test oracle).
@@ -191,14 +219,23 @@ mod tests {
         }
         assert_eq!(g, reference);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
+        let mut tp = Transcript::new(b"zkie-bmm-test");
+        tp.absorb_u64(0xbeef);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) = prove(&seg, &w, &g, s, k, n, &u, &v, &mut tp);
 
-        let proof = prove(&seg, &w, &g, s, k, n, &u, &v, &ch);
-        assert!(verify(&proof, s, k, &u, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-test");
+        tv.absorb_u64(0xbeef);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // endpoint evals match the committed tensors at the expected points
         let w_v = mle::partial_eval(&w, &v);
@@ -208,7 +245,16 @@ mod tests {
         // tamper the claimed output value -> reject
         let mut bad = proof;
         bad.claimed = bad.claimed + Goldilocks::ONE;
-        assert!(!verify(&bad, s, k, &u, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-test");
+        tv2.absorb_u64(0xbeef);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify(&bad, s, k, &u, &mut tv2);
+        assert!(!ok2);
     }
 }
 
@@ -240,6 +286,258 @@ pub fn gather_w_v(
         }
     }
     w_v
+}
+
+/// Source of the expert-major weight `W_all` for streaming GatherMatMul
+/// evaluation. Each expert block `W_all[e]` is `K x N` row-major
+/// (`d*N + j`). An owned flat buffer is borrowed in place; an mmap-backed i32
+/// tensor converts exactly one `K*N` block at a time, so the full weight is
+/// never resident (O5 / streaming-gather design).
+#[derive(Clone, Copy)]
+pub enum WeightBlocks<'a> {
+    Slice(&'a [Goldilocks]),
+    Mmap { mmap: &'a WeightMmap, start: usize, len: usize },
+}
+
+impl<'a> WeightBlocks<'a> {
+    /// Element count of the full expert-major weight (`n_experts * K * N`).
+    pub fn len(&self) -> usize {
+        match *self {
+            WeightBlocks::Slice(s) => s.len(),
+            WeightBlocks::Mmap { len, .. } => len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Expert block `e` as a `K*N` slice (mmap blocks are converted on demand
+    /// and freed when the returned `Cow` is dropped).
+    pub fn block(&self, e: usize, k: usize, n: usize) -> Cow<'a, [Goldilocks]> {
+        let per = k * n;
+        let lo = e * per;
+        let hi = lo + per;
+        assert!(hi <= self.len(), "expert weight block out of range");
+        match *self {
+            WeightBlocks::Slice(s) => Cow::Borrowed(&s[lo..hi]),
+            WeightBlocks::Mmap { mmap, start, .. } => {
+                Cow::Owned(mmap.read_goldilocks(start + lo, per))
+            }
+        }
+    }
+}
+
+/// One streaming pass over the per-expert weight blocks.
+pub struct StreamedWeights {
+    /// `w_v[pos*K + d] = sum_j W_all[expert_of[pos]][d][j] * eq(j, v)`.
+    pub w_v: Vec<Goldilocks>,
+    /// `row_dots[e*K + d] = sum_j W_all[e][d][j] * eq(j, v)`.
+    row_dots: Vec<Goldilocks>,
+    experts_read: Vec<bool>,
+    n_experts: usize,
+    k: usize,
+}
+
+impl StreamedWeights {
+    /// `table[e] = MLE(W_all[e], (ch_d, v))`, recovered from the row folds
+    /// without touching the weight again. Returns `None` unless every expert
+    /// block was read (i.e. the pass used `all_experts = true`) and the point
+    /// arity matches the contraction dimension.
+    pub fn table_evals(&self, ch_d: &[Goldilocks]) -> Option<Vec<Goldilocks>> {
+        if ch_d.len() != self.k.trailing_zeros() as usize {
+            return None;
+        }
+        if self.experts_read.iter().any(|&r| !r) {
+            return None;
+        }
+        let eq_d = mle::eq_evals(ch_d);
+        let mut out = Vec::with_capacity(self.n_experts);
+        for e in 0..self.n_experts {
+            let mut acc = Goldilocks::ZERO;
+            for d in 0..self.k {
+                acc = acc + eq_d[d] * self.row_dots[e * self.k + d];
+            }
+            out.push(acc);
+        }
+        Some(out)
+    }
+}
+
+/// S9 EF version of [`StreamedWeights`]: `v` is an EF point, `row_dots` and
+/// `w_v` are EF, and the per-expert table terminals are recovered at an EF
+/// `ch_d` point.
+pub struct StreamedWeightsEf {
+    pub w_v: Vec<Ef>,
+    row_dots: Vec<Ef>,
+    experts_read: Vec<bool>,
+    n_experts: usize,
+    k: usize,
+}
+
+impl StreamedWeightsEf {
+    pub fn table_evals(&self, ch_d: &[Ef]) -> Option<Vec<Ef>> {
+        if ch_d.len() != self.k.trailing_zeros() as usize {
+            return None;
+        }
+        if self.experts_read.iter().any(|&r| !r) {
+            return None;
+        }
+        let eq_d = ef_outer::eq_evals(ch_d);
+        let mut out = Vec::with_capacity(self.n_experts);
+        for e in 0..self.n_experts {
+            let mut acc = Ef::ZERO;
+            for d in 0..self.k {
+                acc = acc + eq_d[d] * self.row_dots[e * self.k + d];
+            }
+            out.push(acc);
+        }
+        Some(out)
+    }
+}
+
+/// EF streaming pass: identical block traversal to [`stream_weights`], with
+/// the `v` fold and all derived values in EF.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_weights_ef(
+    expert_of: &[u32],
+    weights: &WeightBlocks<'_>,
+    s: usize,
+    n_experts: usize,
+    k: usize,
+    n: usize,
+    v: &[Ef],
+    all_experts: bool,
+) -> StreamedWeightsEf {
+    assert_eq!(expert_of.len(), s);
+    assert_eq!(weights.len(), n_experts * k * n, "expert weight shape mismatch");
+    assert_eq!(v.len(), n.trailing_zeros() as usize, "seq point arity mismatch");
+    let eq_v = ef_outer::eq_evals(v);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+    for (pos, &e) in expert_of.iter().enumerate() {
+        assert!((e as usize) < n_experts, "expert id out of range");
+        buckets[e as usize].push(pos);
+    }
+    let mut w_v = vec![Ef::ZERO; s * k];
+    let mut row_dots = vec![Ef::ZERO; n_experts * k];
+    let mut experts_read = vec![false; n_experts];
+    for e in 0..n_experts {
+        if !all_experts && buckets[e].is_empty() {
+            continue;
+        }
+        let block = weights.block(e, k, n);
+        debug_assert_eq!(block.len(), k * n);
+        for d in 0..k {
+            let row = &block[d * n..(d + 1) * n];
+            let mut acc = Ef::ZERO;
+            for j in 0..n {
+                acc = acc + Ef::from(row[j]) * eq_v[j];
+            }
+            row_dots[e * k + d] = acc;
+        }
+        for &pos in &buckets[e] {
+            w_v[pos * k..(pos + 1) * k].copy_from_slice(&row_dots[e * k..(e + 1) * k]);
+        }
+        experts_read[e] = true;
+    }
+    StreamedWeightsEf { w_v, row_dots, experts_read, n_experts, k }
+}
+
+/// Fold each expert's `K x N` block against `eq(j, v)` once, then emit
+/// `w_v[pos][d]` for every routed position (streaming, no `S x K x N` gather).
+/// With `all_experts = true` every block is read so the per-expert `table`
+/// terminals can be derived afterwards from the stored row folds; with
+/// `all_experts = false` only experts that own a position are read (forward).
+pub fn stream_weights(
+    expert_of: &[u32],
+    weights: &WeightBlocks<'_>,
+    s: usize,
+    n_experts: usize,
+    k: usize,
+    n: usize,
+    v: &[Goldilocks],
+    all_experts: bool,
+) -> StreamedWeights {
+    assert_eq!(expert_of.len(), s);
+    assert_eq!(weights.len(), n_experts * k * n, "expert weight shape mismatch");
+    assert_eq!(v.len(), n.trailing_zeros() as usize, "seq point arity mismatch");
+    let eq_v = mle::eq_evals(v);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+    for (pos, &e) in expert_of.iter().enumerate() {
+        assert!((e as usize) < n_experts, "expert id out of range");
+        buckets[e as usize].push(pos);
+    }
+    let mut w_v = vec![Goldilocks::ZERO; s * k];
+    let mut row_dots = vec![Goldilocks::ZERO; n_experts * k];
+    let mut experts_read = vec![false; n_experts];
+    for e in 0..n_experts {
+        if !all_experts && buckets[e].is_empty() {
+            continue;
+        }
+        let block = weights.block(e, k, n);
+        debug_assert_eq!(block.len(), k * n);
+        for d in 0..k {
+            let row = &block[d * n..(d + 1) * n];
+            let mut acc = Goldilocks::ZERO;
+            for j in 0..n {
+                acc = acc + row[j] * eq_v[j];
+            }
+            row_dots[e * k + d] = acc;
+        }
+        for &pos in &buckets[e] {
+            w_v[pos * k..(pos + 1) * k].copy_from_slice(&row_dots[e * k..(e + 1) * k]);
+        }
+        experts_read[e] = true;
+    }
+    StreamedWeights {
+        w_v,
+        row_dots,
+        experts_read,
+        n_experts,
+        k,
+    }
+}
+
+/// Streaming per-position matmul forward from a weight-block source:
+/// `g[pos][j] = sum_d seg[pos][d] * W_all[expert_of[pos]][d][j]`, reading one
+/// `K x N` block per used expert (no `S x K x N` materialization). Identical
+/// field arithmetic to [`gather_matmul_forward`].
+pub fn gather_matmul_forward_streaming(
+    seg: &[Goldilocks],
+    expert_of: &[u32],
+    weights: &WeightBlocks<'_>,
+    s: usize,
+    k: usize,
+    n: usize,
+    n_experts: usize,
+) -> Vec<Goldilocks> {
+    assert_eq!(seg.len(), s * k);
+    assert_eq!(expert_of.len(), s);
+    assert_eq!(weights.len(), n_experts * k * n, "expert weight shape mismatch");
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+    for (pos, &e) in expert_of.iter().enumerate() {
+        assert!((e as usize) < n_experts, "expert id out of range");
+        buckets[e as usize].push(pos);
+    }
+    let mut g = vec![Goldilocks::ZERO; s * n];
+    for e in 0..n_experts {
+        if buckets[e].is_empty() {
+            continue;
+        }
+        let block = weights.block(e, k, n);
+        for &pos in &buckets[e] {
+            let seg_row = &seg[pos * k..(pos + 1) * k];
+            let dst = &mut g[pos * n..(pos + 1) * n];
+            for j in 0..n {
+                let mut acc = Goldilocks::ZERO;
+                for d in 0..k {
+                    acc = acc + seg_row[d] * block[d * n + j];
+                }
+                dst[j] = acc;
+            }
+        }
+    }
+    g
 }
 
 /// `counts[e] = sum_{pos: expert_of[pos]=e} eq(pos, ch_pos)`. Computed by the
@@ -300,8 +598,13 @@ mod streaming_tests {
             .collect();
         let expert_of: Vec<u32> = (0..s).map(|i| (i % n_experts) as u32).collect();
 
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
         let ch_d: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        // The prover and verifier both derive (u, v) from the same transcript
+        // prefix, exactly like the op layer does.
+        let mut tp = Transcript::new(b"zkie-bmm-mmap-test");
+        tp.absorb_u64(0x8181);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
         let ch_pos: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
 
         // materialized reference
@@ -356,6 +659,7 @@ pub fn gather_matmul_forward(
 
 /// Streaming prove: same eq-selector sumcheck as `prove`, but `w_v` is computed on
 /// the fly from the per-expert weights instead of a materialized `S x K x N` gather.
+/// Returns the proof and the derived `ch`.
 pub fn prove_streaming(
     seg: &[Goldilocks],
     expert_of: &[u32],
@@ -367,14 +671,35 @@ pub fn prove_streaming(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> BatchedMatmulProof {
+    transcript: &mut Transcript,
+) -> (BatchedMatmulProof, Vec<Goldilocks>) {
     assert_eq!(seg.len(), s * k);
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
     assert_eq!(g.len(), s * n);
 
     let w_v = gather_w_v(expert_of, w_all, s, n_experts, k, n, v);
+    prove_with_w_v(seg, &w_v, g, s, k, n, u, v, transcript)
+}
+
+/// Prove the eq-selector sumcheck from an already-computed weight fold `w_v`
+/// (`S x K`). Shared by the materialized and the streaming gather variants, so
+/// both produce the identical sumcheck/transcript for the same inputs.
+pub fn prove_with_w_v(
+    seg: &[Goldilocks],
+    w_v: &[Goldilocks],
+    g: &[Goldilocks],
+    s: usize,
+    k: usize,
+    n: usize,
+    u: &[Goldilocks],
+    v: &[Goldilocks],
+    transcript: &mut Transcript,
+) -> (BatchedMatmulProof, Vec<Goldilocks>) {
+    assert_eq!(seg.len(), s * k);
+    assert_eq!(w_v.len(), s * k);
+    assert_eq!(g.len(), s * n);
+
     let eq_u = mle::eq_evals(u);
     let eq_b = broadcast_eq(&eq_u, k);
 
@@ -382,13 +707,14 @@ pub fn prove_streaming(
     gp.extend_from_slice(u);
     let claimed = mle::eval(g, &gp);
 
-    let mles: [&[Goldilocks]; 3] = [seg, &w_v, &eq_b];
-    let sumcheck = prove_virtual(&mles, &terms(), claimed, ch);
-    BatchedMatmulProof { claimed, sumcheck }
+    let mles: [&[Goldilocks]; 3] = [seg, w_v, &eq_b];
+    let (sumcheck, ch) = prove_virtual(&mles, &terms(), claimed, transcript);
+    (BatchedMatmulProof { claimed, sumcheck }, ch)
 }
 
-/// Streaming verify: the ordinary eq-selector sumcheck, plus the weight claim bound
-/// by the linear combination `final_evals[1] == sum_e counts[e] * table[e]`.
+/// Streaming verify: the ordinary eq-selector sumcheck (S1 transcript replay),
+/// plus the weight claim bound by the linear combination
+/// `final_evals[1] == sum_e counts[e] * table[e]`.
 pub fn verify_streaming(
     proof: &BatchedMatmulProof,
     expert_of: &[u32],
@@ -399,19 +725,20 @@ pub fn verify_streaming(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
-    if !verify(proof, s, k, u, ch) {
-        return false;
+    let (ok, ch) = verify(proof, s, k, u, transcript);
+    if !ok {
+        return (false, ch);
     }
     let k_bits = k.trailing_zeros() as usize;
     let ch_d = &ch[..k_bits];
     let ch_pos = &ch[k_bits..];
     let counts = expert_counts(expert_of, n_experts, ch_pos);
     let table = expert_table_evals(w_all, n_experts, k, n, ch_d, v);
-    proof.sumcheck.final_evals[1] == gather_open(&counts, &table)
+    (proof.sumcheck.final_evals[1] == gather_open(&counts, &table), ch)
 }
 
 #[cfg(test)]
@@ -438,17 +765,121 @@ mod streaming_matmul_tests {
         let g_mat = forward(&seg, &w_gathered, s, k, n);
         assert_eq!(g_stream, g_mat);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let mut tp = Transcript::new(b"zkie-bmm-stream-test");
+        tp.absorb_u64(0x6161);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) =
+            prove_streaming(&seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &mut tp);
 
-        let proof = prove_streaming(&seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &ch);
-        assert!(verify_streaming(&proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-stream-test");
+        tv.absorb_u64(0x6161);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify_streaming(&proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // tamper the weight claim -> reject
         let mut bad = proof;
         bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
-        assert!(!verify_streaming(&bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-stream-test");
+        tv2.absorb_u64(0x6161);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify_streaming(&bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &mut tv2);
+        assert!(!ok2);
+    }
+
+    /// O5/B: the same block stream must produce the same `w_v`, per-expert
+    /// terminals and forward output from (a) an owned slice and (b) an
+    /// mmap-backed i32 weight, and the streaming gather proof must verify
+    /// against the same verifier.
+    #[test]
+    fn streaming_from_mmap_matches_slice() {
+        use crate::common::fixed_point::from_i32;
+        use std::io::Write;
+        let mut rng = XorShift64::new(0x8181);
+        let (s, k, n, n_experts) = (8usize, 4usize, 2usize, 4usize);
+        let raw: Vec<i32> = (0..n_experts * k * n).map(|i| (i as i32 % 7) - 3).collect();
+        let w_all: Vec<Goldilocks> = raw.iter().map(|&v| from_i32(v)).collect();
+        let experts: Vec<u32> = (0..s).map(|i| (i % n_experts) as u32).collect();
+        let seg: Vec<Goldilocks> = (0..s * k)
+            .map(|i| Goldilocks::from_u64((i as u64 % 11) + 1))
+            .collect();
+        let ch_d: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        // The prover and verifier both derive (u, v) from the same transcript
+        // prefix, exactly like the op layer does.
+        let mut tp = Transcript::new(b"zkie-bmm-mmap-test");
+        tp.absorb_u64(0x8181);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+
+        // mmap-backed source
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zkie-bmm-mmap-{}-{stamp}.bin", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for x in &raw {
+                f.write_all(&x.to_le_bytes()).unwrap();
+            }
+        }
+        let mmap = WeightMmap::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let from_mmap = WeightBlocks::Mmap { mmap: &mmap, start: 0, len: raw.len() };
+        let from_slice = WeightBlocks::Slice(&w_all);
+
+        // Forward: identical output.
+        let g_mmap = gather_matmul_forward_streaming(&seg, &experts, &from_mmap, s, k, n, n_experts);
+        let g_slice = gather_matmul_forward_streaming(&seg, &experts, &from_slice, s, k, n, n_experts);
+        assert_eq!(g_mmap, g_slice);
+        let w_gathered = gather_weights(&experts, &w_all, s, n_experts, k, n);
+        assert_eq!(g_slice, forward(&seg, &w_gathered, s, k, n));
+
+        // Weight stream: w_v and every expert terminal (all experts read).
+        let sm = stream_weights(&experts, &from_mmap, s, n_experts, k, n, &v, true);
+        let ss = stream_weights(&experts, &from_slice, s, n_experts, k, n, &v, true);
+        assert_eq!(sm.w_v, ss.w_v);
+        assert_eq!(sm.w_v, gather_w_v(&experts, &w_all, s, n_experts, k, n, &v));
+        assert_eq!(
+            sm.table_evals(&ch_d).unwrap(),
+            expert_table_evals(&w_all, n_experts, k, n, &ch_d, &v)
+        );
+
+        // Streaming gather proof from the mmap source verifies with the same
+        // verifier as the materialized path.
+        let (proof, ch) =
+            prove_gather_matmul_streaming(&seg, &experts, &from_mmap, &g_mmap, s, k, n, n_experts, &u, &v, &mut tp);
+        let mut tv = Transcript::new(b"zkie-bmm-mmap-test");
+        tv.absorb_u64(0x8181);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify_gather_matmul(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
+        // Tampered terminal -> reject.
+        let mut bad = proof;
+        bad.table[0] = bad.table[0] + Goldilocks::ONE;
+        let mut tv2 = Transcript::new(b"zkie-bmm-mmap-test");
+        tv2.absorb_u64(0x8181);
+        for _ in 0..s.trailing_zeros() { tv2.field(); }
+        for _ in 0..n.trailing_zeros() { tv2.field(); }
+        assert!(!verify_gather_matmul(&bad, s, k, &u, &mut tv2).0);
     }
 }
 
@@ -477,20 +908,62 @@ pub fn prove_gather_matmul(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> GatherMatMulProof {
-    let matmul = prove_streaming(seg, expert_of, w_all, g, s, k, n, n_experts, u, v, ch);
+    transcript: &mut Transcript,
+) -> (GatherMatMulProof, Vec<Goldilocks>) {
+    let (matmul, ch) = prove_streaming(seg, expert_of, w_all, g, s, k, n, n_experts, u, v, transcript);
     let k_bits = k.trailing_zeros() as usize;
     let ch_d = &ch[..k_bits];
     let ch_pos = &ch[k_bits..];
     let counts = expert_counts(expert_of, n_experts, ch_pos);
     let table = expert_table_evals(w_all, n_experts, k, n, ch_d, v);
-    GatherMatMulProof {
-        claimed: matmul.claimed,
-        sumcheck: matmul.sumcheck,
-        counts,
-        table,
-    }
+    (
+        GatherMatMulProof {
+            claimed: matmul.claimed,
+            sumcheck: matmul.sumcheck,
+            counts,
+            table,
+        },
+        ch,
+    )
+}
+
+/// Streaming variant of [`prove_gather_matmul`]: the same eq-selector
+/// sumcheck, with `w_v` and the per-expert terminals produced by one streaming
+/// pass over the weight blocks (`WeightBlocks`), never materializing
+/// `W_gathered` or the full flat `W_all`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_gather_matmul_streaming(
+    seg: &[Goldilocks],
+    expert_of: &[u32],
+    weights: &WeightBlocks<'_>,
+    g: &[Goldilocks],
+    s: usize,
+    k: usize,
+    n: usize,
+    n_experts: usize,
+    u: &[Goldilocks],
+    v: &[Goldilocks],
+    transcript: &mut Transcript,
+) -> (GatherMatMulProof, Vec<Goldilocks>) {
+    assert_eq!(g.len(), s * n);
+    let streamed = stream_weights(expert_of, weights, s, n_experts, k, n, v, true);
+    let (matmul, ch) = prove_with_w_v(seg, &streamed.w_v, g, s, k, n, u, v, transcript);
+    let k_bits = k.trailing_zeros() as usize;
+    let ch_d = &ch[..k_bits];
+    let ch_pos = &ch[k_bits..];
+    let counts = expert_counts(expert_of, n_experts, ch_pos);
+    let table = streamed
+        .table_evals(ch_d)
+        .expect("streaming pass read every expert block");
+    (
+        GatherMatMulProof {
+            claimed: matmul.claimed,
+            sumcheck: matmul.sumcheck,
+            counts,
+            table,
+        },
+        ch,
+    )
 }
 
 pub fn verify_gather_matmul(
@@ -498,26 +971,55 @@ pub fn verify_gather_matmul(
     s: usize,
     k: usize,
     u: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
-    let eq_u = mle::eq_evals(u);
-    let eq_b = broadcast_eq(&eq_u, k);
-    let eq_final = mle::eval(&eq_b, ch);
-    let final_evals = vec![
-        proof.sumcheck.final_evals[0],
-        proof.sumcheck.final_evals[1],
-        eq_final,
-    ];
-    if !verify_virtual(&proof.sumcheck, &terms(), proof.claimed, ch, &final_evals) {
-        return false;
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    let (ok, ch) = verify(
+        &BatchedMatmulProof {
+            claimed: proof.claimed,
+            sumcheck: proof.sumcheck.clone(),
+        },
+        s,
+        k,
+        u,
+        transcript,
+    );
+    if !ok {
+        return (false, ch);
     }
-    proof.sumcheck.final_evals[1] == gather_open(&proof.counts, &proof.table)
+    (proof.sumcheck.final_evals[1] == gather_open(&proof.counts, &proof.table), ch)
 }
 
 #[cfg(test)]
 mod gather_matmul_proof_tests {
     use super::*;
     use crate::common::field::{ChallengeSource, XorShift64};
+
+    #[test]
+    fn gather_verify_uses_closed_form_broadcast_eq() {
+        let mut rng = XorShift64::new(0x7172);
+        let (s, k, n, n_experts) = (8usize, 4usize, 2usize, 4usize);
+        let w_all: Vec<Goldilocks> = (0..n_experts * k * n)
+            .map(|i| Goldilocks::from_u64((i as u64 % 7) + 1)).collect();
+        let expert_of: Vec<u32> = (0..s).map(|i| (i % n_experts) as u32).collect();
+        let seg: Vec<Goldilocks> = (0..s * k)
+            .map(|i| Goldilocks::from_u64((i as u64 % 11) + 1)).collect();
+        let g = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
+        let mut tp = Transcript::new(b"o4-gather");
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field()).collect();
+        let (proof, ch) = prove_gather_matmul(
+            &seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &mut tp);
+        let mut tv = Transcript::new(b"o4-gather");
+        let (ok, ch_v) = verify_gather_matmul(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
+        let k_bits = k.trailing_zeros() as usize;
+        let eq_u = mle::eq_evals(&u);
+        let full = broadcast_eq(&eq_u, k);
+        assert_eq!(mle::eval(&full, &ch), mle::eq_poly(&u, &ch[k_bits..]));
+    }
 
     #[test]
     fn gather_matmul_self_contained() {
@@ -532,17 +1034,119 @@ mod gather_matmul_proof_tests {
             .collect();
         let g = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let mut tp = Transcript::new(b"zkie-bmm-gather-test");
+        tp.absorb_u64(0x7171);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) =
+            prove_gather_matmul(&seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &mut tp);
 
-        let proof = prove_gather_matmul(&seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &ch);
-        assert!(verify_gather_matmul(&proof, s, k, &u, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-gather-test");
+        tv.absorb_u64(0x7171);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify_gather_matmul(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // tamper the weight claim (final_evals[1]) -> reject
         let mut bad = proof;
         bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
-        assert!(!verify_gather_matmul(&bad, s, k, &u, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-gather-test");
+        tv2.absorb_u64(0x7171);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify_gather_matmul(&bad, s, k, &u, &mut tv2);
+        assert!(!ok2);
+    }
+}
+
+#[cfg(test)]
+mod o4_tests {
+    use super::*;
+    use crate::common::field::{ChallengeSource, XorShift64};
+
+    /// O4: the closed form eq_u(ch[logK..]) must equal the full S*K broadcast
+    /// column evaluated at ch, for several power-of-two shapes and random
+    /// points (including K=1 and S=1).
+    #[test]
+    fn broadcast_eq_closed_form_matches_expansion() {
+        let mut rng = XorShift64::new(0x04A4);
+        for (s, k) in [(1usize, 1usize), (2, 4), (8, 16), (32, 64), (4, 1), (1, 8)] {
+            let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+                .map(|_| rng.field())
+                .collect();
+            let sk_bits = (s * k).trailing_zeros() as usize;
+            let ch: Vec<Goldilocks> = (0..sk_bits).map(|_| rng.field()).collect();
+            let eq_u = mle::eq_evals(&u);
+            let full = broadcast_eq(&eq_u, k);
+            let full_eval = mle::eval(&full, &ch);
+            let k_bits = k.trailing_zeros() as usize;
+            let closed = mle::eq_poly(&u, &ch[k_bits..]);
+            assert_eq!(full_eval, closed, "closed form mismatch for s={s}, k={k}");
+        }
+    }
+
+    /// A masked/zero-padded power-of-two domain: six real positions are
+    /// embedded in S=8 with zero rows, exactly as the op layer pads S. The
+    /// closed form uses all three position bits; it must not truncate the
+    /// challenge to the six-real-bit prefix.
+    #[test]
+    fn closed_form_handles_zero_padded_rows() {
+        use crate::common::field::ChallengeSource;
+        let mut rng = XorShift64::new(0x04A5);
+        let (s_pad, actual, k, n) = (8usize, 6usize, 4usize, 2usize);
+        let mut seg = vec![Goldilocks::ZERO; s_pad * k];
+        let mut w = vec![Goldilocks::ZERO; s_pad * k * n];
+        for pos in 0..actual {
+            for d in 0..k {
+                seg[pos * k + d] = rng.field();
+                for j in 0..n {
+                    w[(pos * k + d) * n + j] = rng.field();
+                }
+            }
+        }
+        let g = forward(&seg, &w, s_pad, k, n);
+        let u: Vec<Goldilocks> = (0..s_pad.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let (proof, ch) = prove(&seg, &w, &g, s_pad, k, n, &u, &v, &mut Transcript::new(b"o4-pad"));
+        let (ok, ch_v) = verify(&proof, s_pad, k, &u, &mut Transcript::new(b"o4-pad"));
+        assert!(ok, "zero-padded domain must verify");
+        assert_eq!(ch_v, ch);
+        let eq_u = mle::eq_evals(&u);
+        let full = broadcast_eq(&eq_u, k);
+        let k_bits = k.trailing_zeros() as usize;
+        assert_eq!(mle::eval(&full, &ch), mle::eq_poly(&u, &ch[k_bits..]));
+        // The six-real-bit prefix (mechanically truncated coordinates) is not
+        // the selector used by the padded proof.
+        let truncated = mle::eq_poly(&u[..actual.trailing_zeros() as usize], &ch[k_bits..][..actual.trailing_zeros() as usize]);
+        let pad = mle::eq_poly(&u[actual.trailing_zeros() as usize..], &ch[k_bits + actual.trailing_zeros() as usize..]);
+        assert_eq!(mle::eq_poly(&u, &ch[k_bits..]), truncated * pad,
+            "padded closed form must factor through the extra valid bits");
+    }
+
+    /// Non-power-of-two layouts are outside the closed-form contract and must
+    /// fail closed rather than truncating coordinates.
+    #[test]
+    fn verify_rejects_non_power_of_two_shapes() {
+        let proof = BatchedMatmulProof {
+            claimed: Goldilocks::ZERO,
+            sumcheck: VirtualProof { rounds: Vec::new(), final_evals: Vec::new() },
+        };
+        let mut t = Transcript::new(b"o4-shape");
+        let (ok, _) = verify(&proof, 3, 4, &[], &mut t);
+        assert!(!ok, "s=3 must fail closed");
+        let mut t = Transcript::new(b"o4-shape");
+        let (ok, _) = verify(&proof, 4, 3, &[], &mut t);
+        assert!(!ok, "k=3 must fail closed");
     }
 }
 

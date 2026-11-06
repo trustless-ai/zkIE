@@ -7,11 +7,23 @@
 //! (products are 32-bit, a length-K dot product adds `log2(K)` bits), and
 //! `p - 1 = 2^32 * (2^32 - 1)` gives a large 2-adic subgroup for FRI/WHIR.
 
-pub use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+pub use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField64};
+pub use p3_field::extension::BinomialExtensionField;
 pub use p3_goldilocks::Goldilocks;
 
 /// Field characteristic `p = 2^64 - 2^32 + 1`.
 pub const P: u64 = Goldilocks::ORDER_U64;
+
+/// S9 outer-challenge field: the quadratic extension used by WHIR.
+/// `|Ef| ≈ 2^128`; base-field elements embed via `Ef::from(g)` and each
+/// element is absorbed/serialized as its two base-field lanes.
+pub type Ef = BinomialExtensionField<Goldilocks, 2>;
+
+/// Lift a base-field element into the extension field.
+#[inline]
+pub fn ef(x: Goldilocks) -> Ef {
+    Ef::from(x)
+}
 
 /// A deterministic xorshift64 PRNG producing canonical `Goldilocks` elements.
 pub struct XorShift64(u64);
@@ -63,6 +75,15 @@ pub trait ChallengeSource {
     fn next_u64(&mut self) -> u64;
     fn field_vec(&mut self, n: usize) -> Vec<Goldilocks> {
         (0..n).map(|_| self.field()).collect()
+    }
+    /// S9: one extension-field challenge built from two base-field squeezes.
+    /// The default keeps every challenge source (including the test PRNG)
+    /// usable; `Transcript` overrides it with absorption-bound sampling.
+    fn ef_field(&mut self) -> Ef {
+        Ef::new([self.field(), self.field()])
+    }
+    fn ef_field_vec(&mut self, n: usize) -> Vec<Ef> {
+        (0..n).map(|_| self.ef_field()).collect()
     }
 }
 

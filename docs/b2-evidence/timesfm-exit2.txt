@@ -1,0 +1,637 @@
+warning: unused import: `std::env`
+  --> crates/zkie-core/build.rs:10:5
+   |
+10 | use std::env;
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::path::PathBuf`
+  --> crates/zkie-core/build.rs:11:5
+   |
+11 | use std::path::PathBuf;
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::process::Command`
+  --> crates/zkie-core/build.rs:12:5
+   |
+12 | use std::process::Command;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `zkie-core` (build script) generated 3 warnings
+warning: unused import: `Field`
+  --> crates/zkie-core/src/common/ef_logup.rs:12:32
+   |
+12 | use crate::common::field::{Ef, Field, Goldilocks, PrimeCharacteristicRing};
+   |                                ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Field` and `XorShift64`
+  --> crates/zkie-core/src/common/logup_gkr.rs:25:28
+   |
+25 | use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                            ^^^^^                                       ^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+ --> crates/zkie-core/src/common/same_poly.rs:9:72
+  |
+9 | use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                        ^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+ --> crates/zkie-core/src/pcs/batch_open.rs:8:65
+  |
+8 | use crate::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+  |                                                                 ^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+  --> crates/zkie-core/src/common/logup_gkr.rs:25:84
+   |
+25 | use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                                    ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-core/src/common/same_poly.rs:9:84
+  |
+9 | use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                    ^^^^^^^^^^^^^^^
+
+warning: unused variable: `claimed`
+   --> crates/zkie-core/src/common/sumcheck.rs:797:5
+    |
+797 |     claimed: Goldilocks,
+    |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_claimed`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-core` (lib) generated 7 warnings (run `cargo fix --lib -p zkie-core` to apply 5 suggestions)
+warning: unused imports: `prove_scatter_add` and `verify_scatter_add`
+  --> crates/zkie-ops/src/compose.rs:23:21
+   |
+23 |     gather_forward, prove_scatter_add, prove_scatter_add_with_mode, verify_scatter_add,
+   |                     ^^^^^^^^^^^^^^^^^                               ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `prove_scatter` and `verify_scatter`
+  --> crates/zkie-ops/src/compose.rs:28:5
+   |
+28 |     prove_scatter, prove_scatter_with_mode, scatter_forward, verify_scatter,
+   |     ^^^^^^^^^^^^^                                            ^^^^^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+  --> crates/zkie-ops/src/compose.rs:36:80
+   |
+36 | use zkie_core::common::field::{Field, Goldilocks, Ef, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                                ^^^^^^^^^^
+
+warning: unused import: `EfFractionalChainClaims`
+  --> crates/zkie-ops/src/compose.rs:39:54
+   |
+39 | use zkie_core::common::ef_logup::{EfFractionalProof, EfFractionalChainClaims, EfPermutationProof};
+   |                                                      ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `FractionalChainClaims`, `PermutationProof`, `build_lookup_table_num_den`, `pad_table`, `prove_lookup_fractional_batch`, `prove_lookup_fractional_columns`, `prove_lookup_fractional`, `prove_permutation`, `verify_fractional_chain_core`, `verify_lookup_fractional_batch`, `verify_lookup_fractional_chain`, and `verify_lookup_fractional`
+  --> crates/zkie-ops/src/compose.rs:43:5
+   |
+43 |     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+44 |     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+45 |     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^                                                           ^^^^^^^^^
+46 |     prove_fractional, prove_lookup_table, prove_lookup_witness_batch_columns,
+47 |     verify_fractional_chain_core, verify_lookup_split, FractionalChainClaims, FractionalProof,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                       ^^^^^^^^^^^^^^^^^^^^^
+48 |     prove_permutation, PermutationProof,
+   |     ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `TensorKey`
+  --> crates/zkie-ops/src/bundle.rs:14:5
+   |
+14 |     TensorKey, TrustedExecution, TrustedModelManifest,
+   |     ^^^^^^^^^
+
+warning: unused imports: `Field` and `XorShift64`
+ --> crates/zkie-ops/src/layer_norm_centered.rs:7:32
+  |
+7 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                ^^^^^                                       ^^^^^^^^^^
+
+warning: unused imports: `FractionalProof`, `prove_lookup_fractional`, and `verify_lookup_fractional`
+  --> crates/zkie-ops/src/layer_norm_centered.rs:10:5
+   |
+10 |     prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::mle`
+  --> crates/zkie-ops/src/layer_norm_centered.rs:12:5
+   |
+12 | use zkie_core::common::mle;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Field` and `XorShift64`
+ --> crates/zkie-ops/src/layernorm_chain.rs:6:32
+  |
+6 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                ^^^^^                                       ^^^^^^^^^^
+
+warning: unused import: `from_i64`
+ --> crates/zkie-ops/src/layernorm_chain.rs:7:38
+  |
+7 | use zkie_core::common::fixed_point::{from_i64, to_i64};
+  |                                      ^^^^^^^^
+
+warning: unused imports: `FractionalProof`, `prove_lookup_fractional`, and `verify_lookup_fractional`
+ --> crates/zkie-ops/src/layernorm_chain.rs:9:5
+  |
+9 |     prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Field` and `XorShift64`
+ --> crates/zkie-ops/src/projection.rs:6:32
+  |
+6 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                ^^^^^                                       ^^^^^^^^^^
+
+warning: unused import: `verify_lookup_fractional`
+ --> crates/zkie-ops/src/projection.rs:9:30
+  |
+9 |     prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Field` and `XorShift64`
+ --> crates/zkie-ops/src/rms_norm.rs:7:32
+  |
+7 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                ^^^^^                                       ^^^^^^^^^^
+
+warning: unused import: `to_i32`
+ --> crates/zkie-ops/src/rms_norm.rs:8:48
+  |
+8 | use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+  |                                                ^^^^^^
+
+warning: unused imports: `FractionalProof`, `prove_lookup_fractional_batch`, and `verify_lookup_fractional_batch`
+  --> crates/zkie-ops/src/rms_norm.rs:10:5
+   |
+10 |     prove_lookup_fractional_batch, verify_lookup_fractional_batch, FractionalProof,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::mle`
+  --> crates/zkie-ops/src/rms_norm.rs:12:5
+   |
+12 | use zkie_core::common::mle;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+  --> crates/zkie-ops/src/rope.rs:15:69
+   |
+15 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                     ^^^^^^^^^^
+
+warning: unused import: `to_i32`
+  --> crates/zkie-ops/src/rope.rs:16:48
+   |
+16 | use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+   |                                                ^^^^^^
+
+warning: unused imports: `FractionalProof`, `prove_lookup_fractional`, and `verify_lookup_fractional`
+  --> crates/zkie-ops/src/rope.rs:18:5
+   |
+18 |     prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::mle`
+  --> crates/zkie-ops/src/rope.rs:20:5
+   |
+20 | use zkie_core::common::mle;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+ --> crates/zkie-ops/src/gather.rs:6:69
+  |
+6 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                     ^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::fixed_point::from_i64`
+ --> crates/zkie-ops/src/gather.rs:7:5
+  |
+7 | use zkie_core::common::fixed_point::from_i64;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `verify_fractional`
+ --> crates/zkie-ops/src/gather.rs:8:54
+  |
+8 | use zkie_core::common::logup_gkr::{prove_fractional, verify_fractional, verify_lookup_split, FractionalProof};
+  |                                                      ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ChallengeSource` and `XorShift64`
+ --> crates/zkie-ops/src/scatter.rs:4:69
+  |
+4 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                     ^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Field` and `XorShift64`
+  --> crates/zkie-ops/src/softmax_scaled.rs:10:32
+   |
+10 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                ^^^^^                                       ^^^^^^^^^^
+
+warning: unused import: `XorShift64`
+  --> crates/zkie-ops/src/topk.rs:12:69
+   |
+12 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                     ^^^^^^^^^^
+
+warning: unused import: `verify_lookup_fractional`
+  --> crates/zkie-ops/src/topk.rs:15:30
+   |
+15 |     prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+  --> crates/zkie-ops/src/topk.rs:12:81
+   |
+12 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                                 ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-ops/src/layer_norm_centered.rs:7:88
+  |
+7 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                        ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-ops/src/layernorm_chain.rs:6:88
+  |
+6 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                        ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-ops/src/projection.rs:6:88
+  |
+6 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                        ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-ops/src/rms_norm.rs:7:88
+  |
+7 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                        ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+  --> crates/zkie-ops/src/rope.rs:15:81
+   |
+15 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                                 ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+ --> crates/zkie-ops/src/gather.rs:6:81
+  |
+6 | use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+  |                                                                                 ^^^^^^^^^^^^^^^
+
+warning: unused import: `ChallengeSource`
+  --> crates/zkie-ops/src/softmax_scaled.rs:10:88
+   |
+10 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+   |                                                                                        ^^^^^^^^^^^^^^^
+
+warning: unused variable: `q_g`
+   --> crates/zkie-ops/src/compose.rs:567:9
+    |
+567 |     let q_g: Vec<Ef> = transcript.ef_field_vec(arity);
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_q_g`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `neg`
+    --> crates/zkie-ops/src/compose.rs:1193:9
+     |
+1193 |     let neg = Ef::ZERO - Ef::ONE;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `neg`
+    --> crates/zkie-ops/src/compose.rs:1234:9
+     |
+1234 |     let neg = Ef::ZERO - Ef::ONE;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `neg`
+    --> crates/zkie-ops/src/compose.rs:2103:9
+     |
+2103 |     let neg = Ef::ZERO - Ef::ONE;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `eq2`
+    --> crates/zkie-ops/src/compose.rs:2806:9
+     |
+2806 |     let eq2 = efo::eq_evals(&q2);
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_eq2`
+
+warning: variable does not need to be mutable
+    --> crates/zkie-ops/src/compose.rs:3350:9
+     |
+3350 |     let mut next = |gp: &mut Ef| { let w = *gp; *gp = *gp * gamma; w };
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `w_final_num`
+    --> crates/zkie-ops/src/compose.rs:3633:10
+     |
+3633 |     let (w_final_num, w_final_den) = fraction_root(w_num_col, w_den_col)?;
+     |          ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_w_final_num`
+
+warning: unused variable: `neg`
+    --> crates/zkie-ops/src/compose.rs:4732:9
+     |
+4732 |     let neg = Ef::ZERO - Ef::ONE;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `gk`
+    --> crates/zkie-ops/src/compose.rs:4922:9
+     |
+4922 |     let gk = transcript.ef_field();
+     |         ^^ help: if this is intentional, prefix it with an underscore: `_gk`
+
+warning: unused variable: `gd`
+    --> crates/zkie-ops/src/compose.rs:4936:9
+     |
+4936 |     let gd = transcript.ef_field();
+     |         ^^ help: if this is intentional, prefix it with an underscore: `_gd`
+
+warning: unused variable: `gk`
+    --> crates/zkie-ops/src/compose.rs:5049:9
+     |
+5049 |     let gk = transcript.ef_field();
+     |         ^^ help: if this is intentional, prefix it with an underscore: `_gk`
+
+warning: unused variable: `neg`
+    --> crates/zkie-ops/src/compose.rs:5235:9
+     |
+5235 |     let neg = Ef::ZERO - Ef::ONE;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `protocol`
+    --> crates/zkie-ops/src/compose.rs:5496:9
+     |
+5496 |     let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_protocol`
+
+warning: unused variable: `before_bool_idx`
+    --> crates/zkie-ops/src/compose.rs:5719:9
+     |
+5719 |     let before_bool_idx = values.len();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_before_bool_idx`
+
+warning: unused variable: `before_coeff`
+    --> crates/zkie-ops/src/compose.rs:5825:9
+     |
+5825 |     let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
+     |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_before_coeff`
+
+warning: unused variable: `out_coeff`
+    --> crates/zkie-ops/src/compose.rs:5827:9
+     |
+5827 |     let out_coeff = argmax_coeff_col(&efo::eq_evals(&qo), &(0..n).map(|j| ef_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
+     |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_coeff`
+
+warning: unused variable: `eq_bool`
+    --> crates/zkie-ops/src/compose.rs:5835:9
+     |
+5835 |     let eq_bool = efo::eq_evals(&q_bool);
+     |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_eq_bool`
+
+warning: unused variable: `eq_bit`
+    --> crates/zkie-ops/src/compose.rs:5841:9
+     |
+5841 |     let eq_bit = efo::eq_evals(&q_bit);
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_eq_bit`
+
+warning: unused variable: `padded`
+    --> crates/zkie-ops/src/compose.rs:5885:9
+     |
+5885 |     let padded = 1usize.checked_shl(arity as u32)?;
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_padded`
+
+warning: variable does not need to be mutable
+    --> crates/zkie-ops/src/compose.rs:8059:13
+     |
+8059 |         let mut claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `protocol`
+    --> crates/zkie-ops/src/compose.rs:8335:9
+     |
+8335 |     let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_protocol`
+
+warning: unused variable: `bound`
+    --> crates/zkie-ops/src/compose.rs:8411:9
+     |
+8411 |     let bound = 1i64 << (bits - 1);
+     |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_bound`
+
+warning: unused variable: `tag`
+    --> crates/zkie-ops/src/compose.rs:8485:9
+     |
+8485 |     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_tag`
+
+warning: unused variable: `tag`
+    --> crates/zkie-ops/src/compose.rs:8924:9
+     |
+8924 |     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_tag`
+
+warning: unused variable: `rems`
+    --> crates/zkie-ops/src/compose.rs:9470:14
+     |
+9470 |     let (ys, rems) = forward(x, steps);
+     |              ^^^^ help: if this is intentional, prefix it with an underscore: `_rems`
+
+warning: variable `prev` is assigned to, but never used
+    --> crates/zkie-ops/src/compose.rs:9472:9
+     |
+9472 |     let mut prev = x;
+     |         ^^^^^^^^
+     |
+     = note: consider using `_prev` instead
+
+warning: value assigned to `prev` is never read
+    --> crates/zkie-ops/src/compose.rs:9477:9
+     |
+9477 |         prev = &ys[i];
+     |         ^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rems`
+    --> crates/zkie-ops/src/compose.rs:9726:18
+     |
+9726 |     let (xs, ps, rems) = residual_forward(x, steps);
+     |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_rems`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/compose.rs:10768:17
+      |
+10768 |                 m,
+      |                 ^ help: try ignoring the field: `m: _`
+
+warning: unused variable: `limb_table`
+     --> crates/zkie-ops/src/compose.rs:10993:17
+      |
+10993 |                 limb_table,
+      |                 ^^^^^^^^^^ help: try ignoring the field: `limb_table: _`
+
+warning: unused variable: `range_table`
+     --> crates/zkie-ops/src/compose.rs:11013:17
+      |
+11013 |                 range_table,
+      |                 ^^^^^^^^^^^ help: try ignoring the field: `range_table: _`
+
+warning: unused variable: `scale`
+     --> crates/zkie-ops/src/compose.rs:11295:41
+      |
+11295 |             Op::CombineIdx { a, b, out, scale } => {
+      |                                         ^^^^^ help: try ignoring the field: `scale: _`
+
+warning: unused variable: `neg`
+     --> crates/zkie-ops/src/compose.rs:11706:21
+      |
+11706 |                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
+      |                     ^^^ help: if this is intentional, prefix it with an underscore: `_neg`
+
+warning: unused variable: `k`
+     --> crates/zkie-ops/src/compose.rs:12029:34
+      |
+12029 |                 for &(x, out, m, k) in &transposes {
+      |                                  ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/compose.rs:12385:49
+      |
+12385 |             (Op::ScaleGate { x, gate, col, out, m, n, h, shift }, OpProof::ScaleGate(vp, r, r_gate)) => {
+      |                                                 ^ help: try ignoring the field: `m: _`
+
+warning: unused variable: `k`
+     --> crates/zkie-ops/src/compose.rs:12767:34
+      |
+12767 |                 for &(x, out, m, k) in &transposes {
+      |                                  ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: unused variable: `den_leaf_a`
+     --> crates/zkie-ops/src/compose.rs:14607:52
+      |
+14607 |             let (point_a, num_leaf_a, den_point_a, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
+      |                                                    ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_den_leaf_a`
+
+warning: unused variable: `den_leaf_b`
+     --> crates/zkie-ops/src/compose.rs:14608:52
+      |
+14608 |             let (point_b, num_leaf_b, den_point_b, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
+      |                                                    ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_den_leaf_b`
+
+warning: value assigned to `perm_locations` is never read
+     --> crates/zkie-ops/src/compose.rs:14460:49
+      |
+14460 |     let mut perm_locations: Vec<PermLocation> = Vec::new();
+      |                                                 ^^^^^^^^^^ this value is reassigned later and never used
+...
+14659 |     perm_locations = perm_locations_slots.into_iter().map(|x| x.unwrap()).collect();
+      |     -------------- `perm_locations` is overwritten here before the previous value is read
+
+warning: value assigned to `gather_locations` is never read
+     --> crates/zkie-ops/src/compose.rs:14669:53
+      |
+14669 |     let mut gather_locations: Vec<GatherLocation> = Vec::new();
+      |                                                     ^^^^^^^^^^ this value is reassigned later and never used
+...
+14968 |     gather_locations = gather_locations_slots.into_iter().map(|x| x.unwrap()).collect();
+      |     ---------------- `gather_locations` is overwritten here before the previous value is read
+
+warning: variable does not need to be mutable
+     --> crates/zkie-ops/src/compose.rs:15175:17
+      |
+15175 |             let mut ins = |id: Option<T>, len: usize, lengths: &mut std::collections::BTreeMap<T, usize>, changed: &mut bool| {
+      |                 ----^^^
+      |                 |
+      |                 help: remove this `mut`
+
+warning: unused variable: `table`
+  --> crates/zkie-ops/src/softmax_scaled.rs:47:5
+   |
+47 |     table: &[Goldilocks],
+   |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_table`
+
+warning: function `argmax_known_cols` is never used
+    --> crates/zkie-ops/src/compose.rs:5532:4
+     |
+5532 | fn argmax_known_cols(m: usize, n: usize, arity: usize) -> (Vec<Ef>, Vec<Ef>) {
+     |    ^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `known_sel_terms` is never used
+    --> crates/zkie-ops/src/compose.rs:7218:4
+     |
+7218 | fn known_sel_terms() -> Vec<(Ef, Vec<usize>)> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `prove_known_sel_sum` is never used
+    --> crates/zkie-ops/src/compose.rs:7222:4
+     |
+7222 | fn prove_known_sel_sum(known: &[Ef], sel: &[Ef], target: Ef,
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `RELU_BOUND` is never used
+    --> crates/zkie-ops/src/compose.rs:7673:7
+     |
+7673 | const RELU_BOUND: i64 = 1 << 22;
+     |       ^^^^^^^^^^
+
+warning: method `matches_proof` is never used
+     --> crates/zkie-ops/src/compose.rs:13435:8
+      |
+13313 | impl TrustedModelManifest {
+      | ------------------------- method in this implementation
+...
+13435 |     fn matches_proof(&self, ops: &[Op], proof: &CommittedShardDagProof) -> bool {
+      |        ^^^^^^^^^^^^^
+
+warning: function `aux_batch_whir` is never used
+     --> crates/zkie-ops/src/compose.rs:15667:4
+      |
+15667 | fn aux_batch_whir(descriptor: &AuxDescriptor) -> Option<(zkie_core::pcs::whir::Whir, zkie_core::pcs::whir::OpeningProtocol)> {
+      |    ^^^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 85 warnings (run `cargo fix --lib -p zkie-ops` to apply 67 suggestions)
+   Compiling zkie-models-timesfm v0.1.0 (/data/zkie-soundness-fix/models/timesfm)
+warning: unused import: `Field`
+ --> models/timesfm/src/lib.rs:8:32
+  |
+8 | use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
+  |                                ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `silu_t`
+  --> models/timesfm/src/lib.rs:89:5
+   |
+89 |     silu_t: usize,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_silu_t`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-timesfm` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-timesfm` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.83s
+     Running `target/release/examples/prove_bundle`
+TimesFM still hits the fail-closed LayerNormCentered gap; no bundle written

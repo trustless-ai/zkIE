@@ -44,12 +44,21 @@ pub fn partial_eval(values: &[Goldilocks], fix: &[Goldilocks]) -> Vec<Goldilocks
 pub fn eq_evals(r: &[Goldilocks]) -> Vec<Goldilocks> {
     let d = r.len();
     let n = 1 << d;
+    // Doubling construction: after processing bit j, `eq[..2^j]` holds the
+    // product over bits 0..j. Each step derives the upper half from the lower
+    // half, so the total work is O(2^d) field multiplications instead of
+    // O(d * 2^d). The values are identical to the direct product (exact field
+    // arithmetic), so proofs and transcripts are unchanged.
     let mut eq = vec![Goldilocks::ONE; n];
-    for j in 0..d {
-        let one_minus = Goldilocks::ONE - r[j];
-        for i in 0..n {
-            eq[i] = eq[i] * if (i >> j) & 1 == 1 { r[j] } else { one_minus };
+    let mut size = 1usize;
+    for &rj in r.iter().take(d) {
+        let one_minus = Goldilocks::ONE - rj;
+        for i in 0..size {
+            let v = eq[i];
+            eq[i] = v * one_minus;
+            eq[i + size] = v * rj;
         }
+        size <<= 1;
     }
     eq
 }
@@ -79,5 +88,33 @@ mod tests {
         let via_partial = eval(&rest, &point[2..]);
         let full = eval(&values, &point);
         assert_eq!(via_partial, full);
+    }
+
+    /// The O(2^d) doubling construction must match the direct product formula
+    /// bit-for-bit (it is a pure reordering of exact field multiplications).
+    #[test]
+    fn eq_evals_matches_direct_product() {
+        let mut rng = XorShift64::new(0x9e_e1);
+        for d in 0..=8usize {
+            let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+            let fast = eq_evals(&r);
+            assert_eq!(fast.len(), 1 << d);
+            for (i, &got) in fast.iter().enumerate() {
+                let mut want = Goldilocks::ONE;
+                for (j, &rj) in r.iter().enumerate() {
+                    let one_minus = Goldilocks::ONE - rj;
+                    want = want * if (i >> j) & 1 == 1 { rj } else { one_minus };
+                }
+                assert_eq!(got, want, "d={d} i={i}");
+            }
+            // And each entry agrees with the single-point eq polynomial at the
+            // corresponding boolean vertex.
+            for (i, &got) in fast.iter().enumerate() {
+                let xb: Vec<Goldilocks> = (0..d)
+                    .map(|j| if (i >> j) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO })
+                    .collect();
+                assert_eq!(got, eq_poly(&r, &xb), "point eq mismatch d={d} i={i}");
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! everything absorbed, so the prover cannot choose favourable points and the
 //! verifier can replay the exact same challenges from the proof.
 
-use crate::common::field::{Goldilocks, PrimeCharacteristicRing, PrimeField64, P};
+use crate::common::field::{BasedVectorSpace, Ef, Goldilocks, PrimeCharacteristicRing, PrimeField64, P};
 use sha2::{Digest, Sha256};
 
 /// A deterministic challenge stream over absorbed bytes.
@@ -66,6 +66,32 @@ impl Transcript {
     /// Sample a vector of canonical field elements.
     pub fn field_vec(&mut self, n: usize) -> Vec<Goldilocks> {
         (0..n).map(|_| self.field()).collect()
+    }
+
+    /// Absorb one extension-field element as its two base-field lanes (S9).
+    /// This is the canonical wire form used by the EF outer reductions.
+    pub fn absorb_ef(&mut self, x: Ef) {
+        for &c in x.as_basis_coefficients_slice() {
+            self.absorb_field(c);
+        }
+    }
+
+    pub fn absorb_efs(&mut self, xs: &[Ef]) {
+        for &x in xs {
+            self.absorb_ef(x);
+        }
+    }
+
+    /// Sample one extension-field challenge from two base-field squeezes.
+    /// The extension is quadratic, so two independent base-field squeezes
+    /// supply the full ~128 bits of challenge entropy; the element is never
+    /// derived from a single lane.
+    pub fn ef_field(&mut self) -> Ef {
+        Ef::new([self.field(), self.field()])
+    }
+
+    pub fn ef_field_vec(&mut self, n: usize) -> Vec<Ef> {
+        (0..n).map(|_| self.ef_field()).collect()
     }
 
     /// Sample a raw `u64` (no rejection sampling); used for non-challenge

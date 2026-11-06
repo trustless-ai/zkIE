@@ -1,5 +1,7 @@
 //! zkie-ops: op-level proof primitives.
 pub mod compose;
+pub mod bundle;
+pub mod tables;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
 pub mod par;

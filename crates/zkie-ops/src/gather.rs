@@ -7,7 +7,8 @@ use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, 
 use zkie_core::common::fixed_point::from_i64;
 use zkie_core::common::logup_gkr::{prove_fractional, verify_fractional, verify_lookup_split, FractionalProof};
 use zkie_core::common::mle;
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use zkie_core::common::transcript::Transcript;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ScatterAddProof {
@@ -54,16 +55,45 @@ pub fn prove_scatter_add(
     out: &[Goldilocks],
     m: usize,
     h: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ScatterAddProof {
+    prove_scatter_add_with_mode(weighted, token_id, gate, out, m, h, transcript, crate::compose::FracMode::Plain)
+}
+
+/// The challenge-dependent Gather columns, built after `alpha`/`gamma` are
+/// derived from the transcript that binds the independent commitments.
+pub struct ScatterAddColumns {
+    pub num_source: Vec<Goldilocks>,
+    pub den_source: Vec<Goldilocks>,
+    pub num_target: Vec<Goldilocks>,
+    pub den_target: Vec<Goldilocks>,
+}
+
+/// Build `num_source`/`den_source`/`num_target`/`den_target` from an already
+/// derived `alpha`/`gamma`. This is deliberately separate from proving: the
+/// committed path commits the `alpha`/`gamma`-independent columns first,
+/// derives the challenges, and only then builds and commits these columns.
+#[allow(clippy::too_many_arguments)]
+pub fn build_scatter_add_columns(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    m: usize,
+    h: usize,
+    alpha: Goldilocks,
+    gamma: &[Goldilocks],
+) -> ScatterAddColumns {
     let s = token_id.len();
     assert_eq!(weighted.len(), s * h);
     assert_eq!(gate.len(), s);
     assert_eq!(out.len(), m * h);
-    let alpha = rng.field();
-    let gamma: Vec<Goldilocks> = (0..h).map(|_| rng.field()).collect();
-    let src_total = (s * h).next_power_of_two();
-    let tgt_total = (m * h).next_power_of_two();
+    assert_eq!(gamma.len(), h);
+    // WHIR folding needs arity >= 5: pad the fractional domains (num=0 /
+    // den=alpha padding contributes 0 to the logUp sum, so the roots
+    // relation is unaffected).
+    let src_total = (s * h).next_power_of_two().max(32);
+    let tgt_total = (m * h).next_power_of_two().max(32);
     let mut num_source = vec![Goldilocks::ZERO; src_total];
     let mut den_source = vec![alpha; src_total];
     let mut num_target = vec![Goldilocks::ZERO; tgt_total];
@@ -80,13 +110,50 @@ pub fn prove_scatter_add(
             den_target[t * h + d] = alpha - Goldilocks::from_u64(t as u64);
         }
     }
-    let source_side = prove_fractional(num_source.clone(), den_source.clone(), rng);
-    let target_side = prove_fractional(num_target.clone(), den_target.clone(), rng);
+    // Den continuation into the padding: the verifier checks
+    // den_target = alpha - (index at the point), so padded entries keep the
+    // same formula (index = idx >> h_log); num stays 0 there.
+    let h_log = h.trailing_zeros() as usize;
+    for idx in m * h..tgt_total {
+        den_target[idx] = alpha - Goldilocks::from_u64((idx >> h_log) as u64);
+    }
+    ScatterAddColumns {
+        num_source,
+        den_source,
+        num_target,
+        den_target,
+    }
+}
 
-    // Product check (source): num_source[pos*h+d] == gamma[d]*weighted[pos*h+d]*gate[pos]
+/// Product sumchecks for the Gather columns. They are generated only after
+/// the challenge-dependent columns have been committed (and therefore run on
+/// the committed transcript), so the early-challenge columns are never used
+/// to produce a proof.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scatter_add_products(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    num_source: &[Goldilocks],
+    num_target: &[Goldilocks],
+    gamma: &[Goldilocks],
+    m: usize,
+    h: usize,
+    transcript: &mut Transcript,
+) -> (VirtualProof, Vec<Goldilocks>, VirtualProof, Vec<Goldilocks>) {
+    let s = token_id.len();
+    let src_total = (s * h).next_power_of_two().max(32);
+    let tgt_total = (m * h).next_power_of_two().max(32);
+    assert_eq!(gamma.len(), h);
+    assert_eq!(num_source.len(), src_total);
+    assert_eq!(num_target.len(), tgt_total);
+    // Product check (source): num_source[pos*h+d] == gamma[d]*weighted[pos*h+d]*gate[pos].
+    // The eq point is squeezed upfront (the eq table needs it); the sumcheck
+    // challenges are derived per-round (S1) and stored as r_prod_source.
     let src_arity = src_total.trailing_zeros() as usize;
-    let r_prod_source: Vec<Goldilocks> = (0..src_arity).map(|_| rng.field()).collect();
-    let eq_src = mle::eq_evals(&r_prod_source);
+    let r_prod_eq_src: Vec<Goldilocks> = transcript.field_vec(src_arity);
+    let eq_src = mle::eq_evals(&r_prod_eq_src);
     let mut gamma_b = vec![Goldilocks::ZERO; src_total];
     let mut gate_b = vec![Goldilocks::ZERO; src_total];
     let mut num_src = vec![Goldilocks::ZERO; src_total];
@@ -100,20 +167,20 @@ pub fn prove_scatter_add(
             weighted_pad[idx] = weighted[idx];
         }
     }
-    let prod_source = prove_virtual(
+    let (prod_source, r_prod_source) = prove_virtual(
         &[&eq_src, &num_src, &gamma_b, &weighted_pad, &gate_b],
         &[
             (Goldilocks::ONE, vec![0usize, 1usize]),
             (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize, 4usize]),
         ],
         Goldilocks::ZERO,
-        &r_prod_source,
+        transcript,
     );
 
     // Product check (target): num_target[t*h+d] == gamma[d]*out[t*h+d]
     let tgt_arity = tgt_total.trailing_zeros() as usize;
-    let r_prod_target: Vec<Goldilocks> = (0..tgt_arity).map(|_| rng.field()).collect();
-    let eq_tgt = mle::eq_evals(&r_prod_target);
+    let r_prod_eq_tgt: Vec<Goldilocks> = transcript.field_vec(tgt_arity);
+    let eq_tgt = mle::eq_evals(&r_prod_eq_tgt);
     let mut gamma_b2 = vec![Goldilocks::ZERO; tgt_total];
     let mut num_tgt = vec![Goldilocks::ZERO; tgt_total];
     let mut out_pad = vec![Goldilocks::ZERO; tgt_total];
@@ -125,25 +192,92 @@ pub fn prove_scatter_add(
             out_pad[idx] = out[idx];
         }
     }
-    let prod_target = prove_virtual(
+    let (prod_target, r_prod_target) = prove_virtual(
         &[&eq_tgt, &num_tgt, &gamma_b2, &out_pad],
         &[
             (Goldilocks::ONE, vec![0usize, 1usize]),
             (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize]),
         ],
         Goldilocks::ZERO,
-        &r_prod_target,
+        transcript,
     );
+    (prod_source, r_prod_source, prod_target, r_prod_target)
+}
 
+fn empty_fractional() -> FractionalProof {
+    FractionalProof { layers: Vec::new() }
+}
+
+fn empty_virtual() -> VirtualProof {
+    VirtualProof { rounds: Vec::new(), final_evals: Vec::new() }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scatter_add_with_mode(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    m: usize,
+    h: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> ScatterAddProof {
+    let s = token_id.len();
+    assert_eq!(weighted.len(), s * h);
+    assert_eq!(gate.len(), s);
+    assert_eq!(out.len(), m * h);
+    if mode == crate::compose::FracMode::Committed {
+        // Witness-only stage: keep the alpha/gamma-independent columns. The
+        // committed section commits them, derives alpha/gamma, then builds
+        // and commits the dependent columns and generates the fractional and
+        // product proofs exactly once on the committed transcript. No proof
+        // is generated here (and therefore none is discarded).
+        return ScatterAddProof {
+            source_side: empty_fractional(),
+            target_side: empty_fractional(),
+            alpha: Goldilocks::ZERO,
+            gamma: Vec::new(),
+            num_source: Vec::new(),
+            den_source: Vec::new(),
+            num_target: Vec::new(),
+            den_target: Vec::new(),
+            prod_source: empty_virtual(),
+            prod_target: empty_virtual(),
+            r_prod_source: Vec::new(),
+            r_prod_target: Vec::new(),
+            weighted: weighted.to_vec(),
+            gate: gate.to_vec(),
+            out: out.to_vec(),
+            token_id: token_id.to_vec(),
+        };
+    }
+    let alpha = transcript.field();
+    let gamma: Vec<Goldilocks> = transcript.field_vec(h);
+    let cols = build_scatter_add_columns(weighted, token_id, gate, out, m, h, alpha, &gamma);
+    let source_side = prove_fractional(cols.num_source.clone(), cols.den_source.clone(), transcript);
+    let target_side = prove_fractional(cols.num_target.clone(), cols.den_target.clone(), transcript);
+    let (prod_source, r_prod_source, prod_target, r_prod_target) = prove_scatter_add_products(
+        weighted,
+        token_id,
+        gate,
+        out,
+        &cols.num_source,
+        &cols.num_target,
+        &gamma,
+        m,
+        h,
+        transcript,
+    );
     ScatterAddProof {
         source_side,
         target_side,
         alpha,
         gamma,
-        num_source,
-        den_source,
-        num_target,
-        den_target,
+        num_source: cols.num_source,
+        den_source: cols.den_source,
+        num_target: cols.num_target,
+        den_target: cols.den_target,
         prod_source,
         prod_target,
         r_prod_source,
@@ -155,31 +289,79 @@ pub fn prove_scatter_add(
     }
 }
 
-pub fn verify_scatter_add(proof: &ScatterAddProof) -> bool {
-    if !verify_lookup_split(&proof.source_side, &proof.target_side) {
+pub fn verify_scatter_add(proof: &ScatterAddProof, transcript: &mut Transcript) -> bool {
+    verify_scatter_add_with_mode(proof, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn verify_scatter_add_with_mode(
+    proof: &ScatterAddProof,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> bool {
+    // Plain: replay the alpha/gamma preamble, then the fractional and
+    // product proofs. Committed: the shard stage is witness-only; alpha/gamma
+    // and every final proof are generated on the committed gather transcript
+    // after its independent column roots are absorbed, so nothing is
+    // replayed on this shard transcript.
+    if mode != crate::compose::FracMode::Plain {
+        // Committed: the witness-only shard stage carries no frac/product
+        // proofs; every final proof is generated on the committed gather
+        // transcript after the independent roots are absorbed.
+        return true;
+    }
+    if transcript.field() != proof.alpha {
+        return false;
+    }
+    let gamma: Vec<Goldilocks> = transcript.field_vec(proof.gamma.len());
+    if gamma != proof.gamma {
+        return false;
+    }
+    // S3: each side's depth comes from its (padded, proof-carried)
+    // column length.
+    let t_src = proof.num_source.len().trailing_zeros() as usize;
+    let t_tgt = proof.num_target.len().trailing_zeros() as usize;
+    if !verify_lookup_split(
+        &proof.source_side,
+        &proof.target_side,
+        t_src,
+        t_tgt,
+        transcript,
+    ) {
         return false;
     }
     // Product checks: sumcheck self-consistency on the stored final_evals.
-    // The final_evals are authenticated by the committed openings.
-    verify_virtual(
+    // The final_evals are authenticated by the committed openings. The eq
+    // point squeezes only advance the transcript (the eq evals are stored).
+    let src_terms = [
+        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize, 4usize]),
+    ];
+    let src_arity = proof.r_prod_source.len();
+    let _: Vec<Goldilocks> = transcript.field_vec(src_arity);
+    let (ok, r, fc) = verify_virtual(
         &proof.prod_source,
-        &[
-            (Goldilocks::ONE, vec![0usize, 1usize]),
-            (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize, 4usize]),
-        ],
+        &src_terms,
         Goldilocks::ZERO,
-        &proof.r_prod_source,
-        &proof.prod_source.final_evals,
-    ) && verify_virtual(
+        src_arity,
+        transcript,
+    );
+    if !ok || r != proof.r_prod_source || fc != virtual_eval(&src_terms, &proof.prod_source.final_evals) {
+        return false;
+    }
+    let tgt_terms = [
+        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize]),
+    ];
+    let tgt_arity = proof.r_prod_target.len();
+    let _: Vec<Goldilocks> = transcript.field_vec(tgt_arity);
+    let (ok, r, fc) = verify_virtual(
         &proof.prod_target,
-        &[
-            (Goldilocks::ONE, vec![0usize, 1usize]),
-            (Goldilocks::ZERO - Goldilocks::ONE, vec![0usize, 2usize, 3usize]),
-        ],
+        &tgt_terms,
         Goldilocks::ZERO,
-        &proof.r_prod_target,
-        &proof.prod_target.final_evals,
-    )
+        tgt_arity,
+        transcript,
+    );
+    ok && r == proof.r_prod_target && fc == virtual_eval(&tgt_terms, &proof.prod_target.final_evals)
 }
 
 #[cfg(test)]
@@ -205,8 +387,12 @@ mod tests {
             }
         }
         assert_eq!(out, expect);
-        let proof = prove_scatter_add(&weighted, &token_id, &ones, &out, m, h, &mut rng);
-        assert!(verify_scatter_add(&proof));
+        let mut tp = Transcript::new(b"zkie-gather-test");
+        tp.absorb_u64(0x777);
+        let proof = prove_scatter_add(&weighted, &token_id, &ones, &out, m, h, &mut tp);
+        let mut tv = Transcript::new(b"zkie-gather-test");
+        tv.absorb_u64(0x777);
+        assert!(verify_scatter_add(&proof, &mut tv));
     }
 }
 
@@ -235,8 +421,12 @@ mod tests {
             }
         }
         assert_eq!(out, expect);
-        let proof = prove_scatter_add(&weighted, &token_id, &gate, &out, m, h, &mut rng);
-        assert!(verify_scatter_add(&proof));
+        let mut tp = Transcript::new(b"zkie-gather-test");
+        tp.absorb_u64(0x888);
+        let proof = prove_scatter_add(&weighted, &token_id, &gate, &out, m, h, &mut tp);
+        let mut tv = Transcript::new(b"zkie-gather-test");
+        tv.absorb_u64(0x888);
+        assert!(verify_scatter_add(&proof, &mut tv));
     }
 
 
@@ -299,10 +489,18 @@ mod moe_minimal {
         }
         assert_eq!(out, reference);
 
-        let sp = crate::scatter::prove_scatter(&sel, &token_id, &expert_of, m, n, &mut rng);
-        assert!(crate::scatter::verify_scatter(&sp, m, n));
-        let gp = prove_scatter_add(&weighted, &token_id, &ones, &out, m, h, &mut rng);
-        assert!(verify_scatter_add(&gp));
+        let mut tsp = Transcript::new(b"zkie-gather-scatter-test");
+        tsp.absorb_u64(0x999);
+        let sp = crate::scatter::prove_scatter(&sel, &token_id, &expert_of, m, n, &mut tsp);
+        let mut tsv = Transcript::new(b"zkie-gather-scatter-test");
+        tsv.absorb_u64(0x999);
+        assert!(crate::scatter::verify_scatter(&sp, m, n, &mut tsv));
+        let mut tp = Transcript::new(b"zkie-gather-test");
+        tp.absorb_u64(0x999);
+        let gp = prove_scatter_add(&weighted, &token_id, &ones, &out, m, h, &mut tp);
+        let mut tv = Transcript::new(b"zkie-gather-test");
+        tv.absorb_u64(0x999);
+        assert!(verify_scatter_add(&gp, &mut tv));
 
     }
 }
@@ -374,24 +572,45 @@ mod moe_bmm {
         }
         assert_eq!(out, reference);
 
-        let sp = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut rng);
-        assert!(verify_scatter(&sp, m, n));
+        let mut tsp = Transcript::new(b"zkie-gather-scatter-test");
+        tsp.absorb_u64(0x1234);
+        let sp = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut tsp);
+        let mut tsv = Transcript::new(b"zkie-gather-scatter-test");
+        tsv.absorb_u64(0x1234);
+        assert!(verify_scatter(&sp, m, n, &mut tsv));
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..p.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * h).trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let bp = batched_matmul::prove(&seg, &eg, &g, s, h, p, &u, &v, &ch);
-        assert!(batched_matmul::verify(&bp, s, h, &u, &ch));
+        let mut tp_bmm = Transcript::new(b"zkie-bmm-test");
+        tp_bmm.absorb_u64(0x1234);
+        let u: Vec<Goldilocks> = tp_bmm.field_vec(s.trailing_zeros() as usize);
+        let v: Vec<Goldilocks> = tp_bmm.field_vec(p.trailing_zeros() as usize);
+        let (bp, ch) = batched_matmul::prove(&seg, &eg, &g, s, h, p, &u, &v, &mut tp_bmm);
+        let mut tv_bmm = Transcript::new(b"zkie-bmm-test");
+        tv_bmm.absorb_u64(0x1234);
+        for _ in 0..s.trailing_zeros() {
+            tv_bmm.field();
+        }
+        for _ in 0..p.trailing_zeros() {
+            tv_bmm.field();
+        }
+        let (ok, ch_v) = batched_matmul::verify(&bp, s, h, &u, &mut tv_bmm);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
-        let gp = prove_scatter_add(&weighted, &token_id, &ones, &out, m, p, &mut rng);
-        assert!(verify_scatter_add(&gp));
+        let mut tp = Transcript::new(b"zkie-gather-test");
+        tp.absorb_u64(0x1234);
+        let gp = prove_scatter_add(&weighted, &token_id, &ones, &out, m, p, &mut tp);
+        let mut tv = Transcript::new(b"zkie-gather-test");
+        tv.absorb_u64(0x1234);
+        assert!(verify_scatter_add(&gp, &mut tv));
 
         let mut bad_tid = token_id.clone();
         bad_tid[0] = (bad_tid[0] + 1) % m as u32;
-        let bad_sp = prove_scatter(&sel, &bad_tid, &expert_of, m, n, &mut rng);
-        assert!(!verify_scatter(&bad_sp, m, n));
+        let mut tsp2 = Transcript::new(b"zkie-gather-scatter-test");
+        tsp2.absorb_u64(0x1234);
+        let bad_sp = prove_scatter(&sel, &bad_tid, &expert_of, m, n, &mut tsp2);
+        let mut tsv2 = Transcript::new(b"zkie-gather-scatter-test");
+        tsv2.absorb_u64(0x1234);
+        assert!(!verify_scatter(&bad_sp, m, n, &mut tsv2));
     }
 }
 

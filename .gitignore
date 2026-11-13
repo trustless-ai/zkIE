@@ -14,3 +14,18 @@
 /zkie-evm-verifier-poc/contracts/cache
 /zkie-evm-verifier-poc/contracts/lib
 /zkie-evm-verifier-poc/logs
+
+# python working env
+.venv
+
+# large test artifacts stay on disk, textual traces are committed
+docs/benchmarks/**/*.bin
+
+# Agent collaboration material lives outside this repository; never commit it
+.expert-notes/
+expert-notes/
+.bridge/
+bridge/
+
+# Confidential development method (local only, never committed)
+.dev-method/

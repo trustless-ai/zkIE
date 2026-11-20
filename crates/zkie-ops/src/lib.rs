@@ -4,6 +4,7 @@ pub mod layer_norm_centered;
 pub mod layernorm_chain;
 pub mod par;
 pub mod projection;
+pub mod proof_size;
 pub mod rms_norm;
 pub mod rope;
 pub mod gather;

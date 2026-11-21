@@ -1204,15 +1204,27 @@ pub(crate) fn rel_map(
             let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
             let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
             let (start, width, digits, value, offset) = match relation {
-                30 => (rms_slots.s_ll_digits, 5usize, &limb.s_ll_digits, row.sum, 0i128),
+                30 => (
+                    rms_slots.s_ll_digits,
+                    rms_slots.widths.s_ll,
+                    &limb.s_ll_digits,
+                    row.sum,
+                    0i128,
+                ),
                 31 => (
                     rms_slots.s_lh_digits,
-                    6,
+                    rms_slots.widths.s_lh,
                     &limb.s_lh_digits,
                     row.squares,
                     crate::proof::rms_limbs::CROSS_OFFSET,
                 ),
-                _ => (rms_slots.s_hh_digits, 6, &limb.s_hh_digits, row.mean as i128, 0),
+                _ => (
+                    rms_slots.s_hh_digits,
+                    rms_slots.widths.s_hh,
+                    &limb.s_hh_digits,
+                    row.mean as i128,
+                    0,
+                ),
             };
             let _ = start;
             if width >= columns || digits.len() > width {

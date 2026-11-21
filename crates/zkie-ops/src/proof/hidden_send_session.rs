@@ -295,7 +295,7 @@ use crate::proof::proximity_iopp::{
 /// difference row that replaces the per-position equality rows and, when the
 /// trusted plan selects it, the presence-flagged output-closure block (the
 /// slack, packed-bit, product and mask messages and their samples).
-const HIDDEN_SEND_SCHEMA_VERSION: u64 = 4;
+const HIDDEN_SEND_SCHEMA_VERSION: u64 = 5;
 
 /// The plan tag appended to the send statement when the Dot activation is the
 /// norm hidden-output object. The tag is absent on the independently
@@ -8232,6 +8232,112 @@ fn value_group_answers(
     Ok(answers)
 }
 
+/// The sample cube bits of one stacked closure class: every position block
+/// is a contiguous virtual range of `bits_columns` entries, so the sample
+/// form reads the same number of coordinates as the packed width.
+fn stacked_sample_bits(plan: &ClosurePlan) -> Result<u32> {
+    if !plan.bits_columns.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(plan.bits_columns.trailing_zeros())
+}
+
+/// The first-stage answers of one stacked closure class: one answer per
+/// position block, each the equality-weighted sum over the position's own
+/// virtual range of the one committed message. The pad cell sits on the last
+/// block's last entry, which the plan keeps zero, so no pad correction is
+/// applied.
+fn stacked_value_group_answers(
+    shape: &WShape,
+    block_columns: u64,
+    blocks: u32,
+    message: &[Vec<Fp3>],
+    seed: &SampleSeed,
+) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    if message.len() != rows || message.iter().any(|row| row.len() != ell) {
+        return Err(Error::ShapeMismatch);
+    }
+    if block_columns == 0 || !block_columns.is_power_of_two() || blocks == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let entries = (block_columns as usize)
+        .checked_mul(blocks as usize)
+        .ok_or(Error::ResourceLimit)?;
+    if rows.checked_mul(ell) != Some(entries) {
+        return Err(Error::ShapeMismatch);
+    }
+    let columns = usize::try_from(block_columns).map_err(|_| Error::ResourceLimit)?;
+    if seed.z.len() != block_columns.trailing_zeros() as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq = crate::proof::output_closure::eq_vector(&seed.z)?;
+    if eq.len() != columns {
+        return Err(Error::ShapeMismatch);
+    }
+    if rows % blocks as usize != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let block_rows = rows / blocks as usize;
+    let mut answers = Vec::with_capacity(blocks as usize);
+    for block in 0..blocks as usize {
+        let base_row = block.checked_mul(block_rows).ok_or(Error::ResourceLimit)?;
+        let mut answer = Fp3::ZERO;
+        for (column, weight) in eq.iter().enumerate() {
+            let value = message
+                .get(base_row + column % block_rows)
+                .and_then(|row| row.get(column / block_rows))
+                .ok_or(Error::ShapeMismatch)?;
+            if !value.is_zero() {
+                answer = answer.add(&weight.mul(value));
+            }
+        }
+        answers.push(answer);
+    }
+    Ok(answers)
+}
+
+/// Opens the drawn position lists of one stacked closure group against its
+/// one tree. The codewords are derived once from the single message and its
+/// tail vector; every drawn list is then opened from the same parts.
+fn open_stacked_openings(
+    shape: &WShape,
+    messages: &[Vec<Vec<Fp3>>],
+    tails: &[Vec<Fp3>],
+    salts: &[Vec<Vec<u8>>],
+    positions: &[Vec<u64>],
+    trees: &RetainedTrees,
+) -> Result<Vec<RuntimeTreeOpening>> {
+    if messages.len() != 1 || tails.len() != 1 || salts.len() != 1 || trees.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let tree = trees.get(0).ok_or(Error::ShapeMismatch)?;
+    if tree.plan() != &shape.tree_plan(0)? {
+        return Err(Error::StatementMismatch);
+    }
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let message_rows = messages.first().ok_or(Error::ShapeMismatch)?;
+    let flat = tails.first().ok_or(Error::ShapeMismatch)?;
+    let mut codewords = Vec::with_capacity(message_rows.len());
+    for (row, message) in message_rows.iter().enumerate() {
+        let tail = flat
+            .get(row * tail_len..(row + 1) * tail_len)
+            .ok_or(Error::ShapeMismatch)?;
+        codewords.push(encode_row_fp3(&shape.code, message, tail)?);
+    }
+    let parts = RuntimePartRows {
+        main: codewords,
+        mask: Vec::new(),
+        main_deg: E_DEGREE as u32,
+    };
+    let mut openings = Vec::with_capacity(positions.len());
+    for list in positions {
+        openings.push(tree.open_parts(list, std::slice::from_ref(&parts))?);
+    }
+    Ok(openings)
+}
+
 /// Absorbs one closure group before its sample seed is drawn.
 fn absorb_closure_group(chain: &mut Chain, tag: u64, group: &SendGroup) -> Result<()> {
     let mut message = chain.message();
@@ -8402,7 +8508,24 @@ fn open_value_group_openings(
             if tree.plan() != &shape.tree_plan(position as u32)? {
                 return Err(Error::StatementMismatch);
             }
-            tree.open(&positions[position])
+            let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+            let message_rows = messages.get(position).ok_or(Error::ShapeMismatch)?;
+            let flat = tails.get(position).ok_or(Error::ShapeMismatch)?;
+            let mut codewords = Vec::with_capacity(message_rows.len());
+            for (row, message) in message_rows.iter().enumerate() {
+                let tail = flat
+                    .get(row * tail_len..(row + 1) * tail_len)
+                    .ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&shape.code, message, tail)?);
+            }
+            tree.open_parts(
+                &positions[position],
+                &[RuntimePartRows {
+                    main: codewords,
+                    mask: Vec::new(),
+                    main_deg: E_DEGREE as u32,
+                }],
+            )
         },
     )
 }
@@ -8788,6 +8911,11 @@ pub struct HiddenProximityPlan {
     pub column_work_bits: u8,
     pub shared_base_positions: usize,
     pub own_base_positions: usize,
+    /// Whether the own proximity registers its sample rows deferred and emits
+    /// them during the streamed BAT run instead of materializing them. The
+    /// verifier's own sample claims are empty in this mode: it is the plan
+    /// fact, not a silent discard.
+    pub own_deferred_samples: bool,
     /// The trusted multi-stage IOPP stage lists for the two groups. Empty
     /// keeps the current single-stage path.
     pub shared_stages: Vec<IoppStagePlan>,
@@ -9733,6 +9861,7 @@ impl HiddenLinPlan {
         writer.put_u64(self.proximity.column_work_bits as u64);
         writer.put_u64(self.proximity.shared_base_positions as u64);
         writer.put_u64(self.proximity.own_base_positions as u64);
+        writer.put_u64(self.proximity.own_deferred_samples as u64);
         match &self.output_relation {
             Some(digest) => {
                 writer.put_u64(1);
@@ -9851,6 +9980,10 @@ pub struct HiddenLinOutcome {
     pub group: SendGroup,
     pub eval_rows: Vec<EvalSampleRow>,
     pub shared_claims: Vec<GuRelationRow>,
+    /// The own sample claims of the materialized mode. The own group runs the
+    /// deferred-sample mode whenever the plan sets `own_deferred_samples` (the
+    /// production plans do): the streaming BAT run consumes the rows and this
+    /// vector is empty by plan fact, not by a silent discard.
     pub own_claims: Vec<GuRelationRow>,
     pub psi: Vec<Vec<Fp3>>,
     pub shared_point: Vec<Fp3>,
@@ -9972,6 +10105,38 @@ impl ProximityMemberProver {
             tree,
             opening,
         })
+    }
+
+    /// Opens the drawn positions by re-deriving each column from the member's
+    /// committed message rows and their tails. Works for retained and
+    /// released trees alike.
+    fn open_positions(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        let mut parts = Vec::new();
+        if self.member.main_rows > 0 {
+            let mut codewords = Vec::with_capacity(self.member.message.len());
+            for (row, message) in self.member.message.iter().enumerate() {
+                let tail = self.member.tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.member.main_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: codewords,
+                mask: Vec::new(),
+                main_deg: E_DEGREE as u32,
+            });
+        }
+        if self.member.mask_rows > 0 {
+            let mut codewords = Vec::with_capacity(self.member.mask_message.len());
+            for (row, message) in self.member.mask_message.iter().enumerate() {
+                let tail = self.member.mask_tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.member.mask_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            });
+        }
+        self.tree.open_parts(positions, &parts)
     }
 }
 
@@ -10193,6 +10358,39 @@ fn adapt_sample_row(
     }
     out.target = row.target;
     Ok(out)
+}
+
+/// Registers the sample rows of one group from either source. The materialized
+/// path adapts every row against its member; the deferred path registers only
+/// the answer count and lets the streaming run supply the rows.
+fn register_sample_rows(
+    statement: &mut BatStatement,
+    members: &[ProximityMember],
+    samples: &SampleRowsSource<'_>,
+) -> Result<()> {
+    match samples {
+        SampleRowsSource::Materialized(sample_rows) => {
+            if sample_rows.len() != members.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, member) in members.iter().enumerate() {
+                let rows = sample_rows[index]
+                    .iter()
+                    .map(|row| adapt_sample_row(row, member))
+                    .collect::<Result<Vec<_>>>()?;
+                if rows.len() != member.answers as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                statement.sample(member.bat_oracle, rows)?;
+            }
+        }
+        SampleRowsSource::Deferred => {
+            for member in members {
+                statement.sample_deferred(member.bat_oracle, member.answers as u64)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builds the group main table in the FOLD layout order from the committed
@@ -13898,6 +14096,30 @@ pub(crate) fn table_key_group_verify(
 /// verifier needs is in the returned messages; the member rows never leave the
 /// prover.
 #[allow(clippy::too_many_arguments)]
+/// Ownership of the own-stage plain rows. The prover and verifier can hand
+/// their rows over as a materialized vector or emit them during the BAT
+/// combine; the combine consumes either form in the same row order.
+pub(crate) enum PlainRows<'a> {
+    Materialized(Vec<BatRow>),
+    Streamed(
+        &'a mut dyn FnMut(
+            &[ProximityMember],
+            &mut dyn FnMut(BatRow) -> Result<()>,
+        ) -> Result<()>,
+    ),
+}
+
+/// Source of the registered sample rows of one proximity group. Materialized
+/// rows are adapted and checked before the run; deferred rows are registered
+/// by count only and the streaming closure emits them in member order, so at
+/// most one member's rows are alive at a time.
+pub(crate) enum SampleRowsSource<'a> {
+    Materialized(&'a [Vec<GuRelationRow>]),
+    Deferred,
+}
+
+/// Materialized-row entry of the proximity prover.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn proximity_prove(
     chain: Chain,
     fold: FoldShape,
@@ -13911,8 +14133,102 @@ pub(crate) fn proximity_prove(
     base_positions: usize,
     iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Materialized(plain_rows),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Streaming-row entry of the proximity prover.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_prove_streaming(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    sample_rows: &[Vec<GuRelationRow>],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Streamed(run),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Deferred-sample streaming entry of the proximity prover: the run closure
+/// emits each member's sample rows after the plain rows, in member order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_prove_streaming_deferred(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        SampleRowsSource::Deferred,
+        PlainRows::Streamed(run),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+fn proximity_prove_rows(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    samples: SampleRowsSource<'_>,
+    plain: PlainRows<'_>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
     let _profile_proximity = zkie_engine::profile::Scope::new("prox.proximity_prove");
-    if members.is_empty() || sample_rows.len() != members.len() {
+    if members.is_empty() {
         return Err(Error::ShapeMismatch);
     }
     let omega_opening = trees.omega_opening();
@@ -13922,36 +14238,42 @@ pub(crate) fn proximity_prove(
         statement.add_oracle(member_bat_shape(member))
             ?;
     }
-    for (index, member) in members.iter().enumerate() {
-        let rows = sample_rows[index]
-            .iter()
-            .map(|row| adapt_sample_row(row, member))
-            .collect::<Result<Vec<_>>>()?;
-        if rows.len() != member.answers as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        statement.sample(member.bat_oracle, rows)
-            ?;
-    }
+    register_sample_rows(&mut statement, &members, &samples)?;
     let group = statement.new_group(fold.code, fold.mask_code)
         ?;
     for member in &members {
         statement.join(group, member.bat_oracle, false)
             ?;
     }
-    let planned = plain_rows.len() as u64
+    let (planned_plain, mut stream) = match plain {
+        PlainRows::Materialized(rows) => {
+            let count = rows.len() as u64;
+            for row in rows {
+                statement.add_row(group, row)?;
+            }
+            (count, None)
+        }
+        PlainRows::Streamed(run) => (0u64, Some(run)),
+    };
+    let planned = planned_plain
         + members.iter().map(|member| member.answers as u64).sum::<u64>();
-    for row in plain_rows {
-        statement.add_row(group, row)
-            ?;
-    }
     let layout = statement.layout(group)
         ?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)
         ?;
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
-    let combined = bat.finish_run(input)?;
+    let combined = match stream.as_mut() {
+        Some(run) => {
+            let run: &mut dyn FnMut(
+                &[ProximityMember],
+                &mut dyn FnMut(BatRow) -> Result<()>,
+            ) -> Result<()> = &mut **run;
+            let members_ref: &[ProximityMember] = &members[..];
+            bat.finish_run_streaming(input, |sink| run(members_ref, sink))?
+        }
+        None => bat.finish_run(input)?,
+    };
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()
         ?;
@@ -14084,6 +14406,19 @@ pub(crate) fn proximity_prove(
             .iter()
             .map(|member| trees.tree_for(member))
             .collect::<Result<Vec<_>>>()?;
+        let member_rows: Vec<Option<crate::proof::multi_stage_iopp::IoppRowsSource>> = members
+            .iter()
+            .map(|member| {
+                Some(crate::proof::multi_stage_iopp::IoppRowsSource {
+                    main: &member.message,
+                    main_tails: &member.tails,
+                    main_code: member.main_code,
+                    mask: &member.mask_message,
+                    mask_tails: &member.mask_tails,
+                    mask_code: member.mask_code,
+                })
+            })
+            .collect();
         let stage_zero_rows = SingleRows {
             code: handoff.code,
             mask_code: handoff.mask_code,
@@ -14116,6 +14451,7 @@ pub(crate) fn proximity_prove(
                 basis,
                 rows: stage_zero_rows,
                 member_trees,
+                member_rows,
                 old_mask_tree: None,
                 fresh_tree: stage_zero_tree,
                 member_opening,
@@ -14181,12 +14517,8 @@ pub(crate) fn proximity_prove(
     let positions = verifier.draw_base_positions(base_positions)?;
     let unique = unique_sorted(&positions);
     let mut provers = Vec::with_capacity(members.len());
-    for mut member in members {
+    for member in members {
         let tree = trees.tree_for(&member)?;
-        member.message = Vec::new();
-        member.tails = Vec::new();
-        member.mask_message = Vec::new();
-        member.mask_tails = Vec::new();
         let opening = omega_opening
             .as_ref()
             .filter(|count| {
@@ -14206,9 +14538,12 @@ pub(crate) fn proximity_prove(
             if let Some(opening) = &member.opening {
                 opening.reserve(unique.len())?;
             }
-            member.tree.open(&unique)
+            member.open_positions(&unique)
         },
     )?;
+    // The base openings are the last read of the member rows; drop them before
+    // the tail is assembled.
+    drop(provers);
     let mask_positions: Vec<u64> = positions
         .iter()
         .map(|position| position % fold.mask_code.n())
@@ -14255,6 +14590,8 @@ pub(crate) fn proximity_prove(
 /// FOLD start and rounds, and runs BASE against its own member roots. It never
 /// reads a member message row.
 #[allow(clippy::too_many_arguments)]
+/// Materialized-row entry of the proximity verifier.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn proximity_verify(
     chain: Chain,
     fold: FoldShape,
@@ -14267,8 +14604,96 @@ pub(crate) fn proximity_verify(
     base_positions: usize,
     iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Materialized(plain_rows),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Streaming-row entry of the proximity verifier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_verify_streaming(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    sample_rows: &[Vec<GuRelationRow>],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Streamed(run),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Deferred-sample streaming entry of the proximity verifier; the run closure
+/// emits the sample rows exactly as the prover's does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_verify_streaming_deferred(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        SampleRowsSource::Deferred,
+        PlainRows::Streamed(run),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+fn proximity_verify_rows(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    samples: SampleRowsSource<'_>,
+    plain: PlainRows<'_>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
     let _profile = zkie_engine::profile::Scope::new("verify.proximity");
-    if members.is_empty() || sample_rows.len() != members.len() {
+    if members.is_empty() {
         return Err(Error::ShapeMismatch);
     }
     let _profile_statement = zkie_engine::profile::Scope::light("verify.proximity.statement");
@@ -14276,32 +14701,40 @@ pub(crate) fn proximity_verify(
     for member in members {
         statement.add_oracle(member_bat_shape(member))?;
     }
-    for (index, member) in members.iter().enumerate() {
-        let rows = sample_rows[index]
-            .iter()
-            .map(|row| adapt_sample_row(row, member))
-            .collect::<Result<Vec<_>>>()?;
-        if rows.len() != member.answers as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        statement.sample(member.bat_oracle, rows)?;
-    }
+    register_sample_rows(&mut statement, members, &samples)?;
     let group = statement.new_group(fold.code, fold.mask_code)?;
     for member in members {
         statement.join(group, member.bat_oracle, false)?;
     }
-    let planned = plain_rows.len() as u64
+    let (planned_plain, mut stream) = match plain {
+        PlainRows::Materialized(rows) => {
+            let count = rows.len() as u64;
+            for row in rows {
+                statement.add_row(group, row)?;
+            }
+            (count, None)
+        }
+        PlainRows::Streamed(run) => (0u64, Some(run)),
+    };
+    let planned = planned_plain
         + members.iter().map(|member| member.answers as u64).sum::<u64>();
-    for row in plain_rows {
-        statement.add_row(group, row)?;
-    }
     let layout = statement.layout(group)?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
     drop(_profile_statement);
     let _profile_bat = zkie_engine::profile::Scope::new("verify.proximity.bat");
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
-    let combined = bat.finish_run(input)?;
+    let combined = match stream.as_mut() {
+        Some(run) => {
+            let run: &mut dyn FnMut(
+                &[ProximityMember],
+                &mut dyn FnMut(BatRow) -> Result<()>,
+            ) -> Result<()> = &mut **run;
+            let members_ref: &[ProximityMember] = &members[..];
+            bat.finish_run_streaming(input, |sink| run(members_ref, sink))?
+        }
+        None => bat.finish_run(input)?,
+    };
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()?;
     drop(_profile_bat);
@@ -15031,7 +15464,7 @@ fn prove_first(
             )?;
             drop(_profile_slack);
             let _profile_bits = zkie_engine::profile::Scope::new("first.closure_bits_commit");
-            let bits = commit_value_group(
+            let bits = crate::proof::output_closure::commit_merged_value_group(
                 &closure_plan.bits,
                 closure_plan.bits_columns,
                 closure_plan.bits_oracle_base,
@@ -15040,7 +15473,6 @@ fn prove_first(
                 &closure_randomness.bits_pads,
                 &closure_randomness.bits_tails,
                 &closure_randomness.bits_salts,
-                plan.send.positions(),
             )?;
             drop(_profile_bits);
             let _profile_mask = zkie_engine::profile::Scope::new("first.closure_mask_commit");
@@ -15261,8 +15693,8 @@ fn prove_first(
             let bits_seeds = draw_closure_seed_set(
                 &mut chain,
                 28,
-                closure_plan.bits.sample_bits()?,
-                closure_plan.bits.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             let mask_seeds = draw_closure_seed_set(
                 &mut chain,
@@ -15279,12 +15711,16 @@ fn prove_first(
                 &closure.slack.messages,
                 &slack_seeds,
             )?;
-            let bits_answers = value_group_answers(
+            let bits_answers = stacked_value_group_answers(
                 &closure_plan.bits,
-                closure_plan.bits_oracle_base,
-                plan.send.group,
-                &closure.bits.messages,
-                &bits_seeds,
+                closure_plan.bits_columns,
+                plan.send.positions(),
+                closure
+                    .bits
+                    .messages
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?,
+                &bits_seeds[0],
             )?;
             let mask_answer =
                 closure_mask_answer(&closure_plan.mask, &closure.mask.rows, &mask_seeds[0])?;
@@ -15323,7 +15759,7 @@ fn prove_first(
             drop(_profile_map_values);
             let _profile_map_commit =
                 zkie_engine::profile::Scope::new("first.closure_map_commit");
-            let map = commit_value_group(
+            let map = crate::proof::output_closure::commit_merged_value_group(
                 &closure_plan.map,
                 closure_plan.bits_columns,
                 closure_plan.map_oracle_base,
@@ -15332,35 +15768,37 @@ fn prove_first(
                 &closure_randomness.map_pads,
                 &closure_randomness.map_tails,
                 &closure_randomness.map_salts,
-                plan.send.positions(),
             )?;
             drop(_profile_map_commit);
             absorb_closure_group(&mut chain, 26, &map.group)?;
             let map_seeds = draw_closure_seed_set(
                 &mut chain,
                 35,
-                closure_plan.map.sample_bits()?,
-                closure_plan.map.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             let _profile_map_answers =
                 zkie_engine::profile::Scope::new("first.closure_map_answers");
-            let map_answers = value_group_answers(
+            let map_answers = stacked_value_group_answers(
                 &closure_plan.map,
-                closure_plan.map_oracle_base,
-                plan.send.group,
-                &map.messages,
-                &map_seeds,
+                closure_plan.bits_columns,
+                plan.send.positions(),
+                map.messages.first().ok_or(Error::ShapeMismatch)?,
+                &map_seeds[0],
             )?;
             drop(_profile_map_answers);
             absorb_tagged_answers(&mut chain, 36, &map_answers)?;
             let _profile_closure_check =
                 zkie_engine::profile::Scope::new("first.closure_check");
-            closure.map = map.clone();
+            // The committed map group moves into the witness: the openings
+            // below read the same copy, so the message rows exist once until
+            // the second stage hands them to the own members.
+            closure.map = map;
             closure.map_values = map_values;
             closure.r_bool = r_bool.clone();
             closure.check(closure_plan, &plan.send)?;
             drop(_profile_closure_check);
-            Some((map, map_seeds, map_answers, r_bool))
+            Some((map_seeds, map_answers, r_bool))
         }
         (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
@@ -15407,7 +15845,7 @@ fn prove_first(
                 mask_seeds,
                 mask_answer,
             )),
-            Some((map, map_seeds, map_answers, _r_bool)),
+            Some((map_seeds, map_answers, _r_bool)),
         ) => {
             let _profile_closure_openings =
                 zkie_engine::profile::Scope::new("first.closure_openings");
@@ -15438,7 +15876,7 @@ fn prove_first(
             )?;
             let _profile_bits_open =
                 zkie_engine::profile::Scope::new("first.closure_bits_openings");
-            let bits_openings = open_value_group_openings(
+            let bits_openings = open_stacked_openings(
                 &closure_plan.bits,
                 &closure.bits.messages,
                 &closure.bits_tails,
@@ -15461,13 +15899,13 @@ fn prove_first(
             )?;
             let _profile_map_open =
                 zkie_engine::profile::Scope::new("first.closure_map_openings");
-            let map_openings = open_value_group_openings(
+            let map_openings = open_stacked_openings(
                 &closure_plan.map,
-                &map.messages,
+                &closure.map.messages,
                 &closure.map_tails,
                 &closure.map_salts,
                 &map_positions,
-                &map.trees,
+                &closure.map.trees,
             )?;
             drop(_profile_map_open);
             Some(ClosureFirstMessages {
@@ -15485,7 +15923,7 @@ fn prove_first(
                 },
                 bits_positions,
                 bits_openings,
-                map: CommittedGroupMessage::new(map.group.clone()),
+                map: CommittedGroupMessage::new(closure.map.group.clone()),
                 map_sample: SendSamples {
                     seed: map_seeds,
                     answers: map_answers,
@@ -15613,6 +16051,9 @@ fn prove_first(
     witness.request_w = request_w_commit;
     witness.chain_mask = chain_mask_witness;
     witness.source_data = source_data_witness;
+    // The first-stage answers and openings consumed the encoded closure
+    // value-group messages; only their retained trees and the PSC inputs
+    // survive into the own stage.
     Ok((messages, first_seal, witness, chain_rows, section_outputs))
 }
 
@@ -15784,20 +16225,20 @@ fn verify_first(
     match (&plan.closure, &messages.closure) {
         (Some(closure_plan), Some(closure)) => {
             if closure.slack.group.fault(plan.send.positions()).is_some()
-                || closure.bits.group.fault(plan.send.positions()).is_some()
+                || closure.bits.group.fault(1).is_some()
+                || closure.map.group.fault(1).is_some()
                 || closure.slack.group.group != plan.send.group
                 || closure.bits.group.group != plan.send.group
+                || closure.map.group.group != plan.send.group
                 || closure.mask.tree != closure_plan.mask.tree
                 || closure.mask.root == Digest::ZERO
                 || closure.slack_sample.seed.len() != closure_plan.slack.answers as usize
                 || closure.slack_sample.answers.len() != plan.send.positions() as usize
-                || closure.bits_sample.seed.len() != closure_plan.bits.answers as usize
+                || closure.bits_sample.seed.len() != 1
                 || closure.bits_sample.answers.len() != plan.send.positions() as usize
                 || closure.mask.sample.seed.len() != closure_plan.mask.answers as usize
                 || closure.mask.sample.answers.len() != closure_plan.mask.answers as usize
-                || closure.map.group.fault(plan.send.positions()).is_some()
-                || closure.map.group.group != plan.send.group
-                || closure.map_sample.seed.len() != closure_plan.map.answers as usize
+                || closure.map_sample.seed.len() != 1
                 || closure.map_sample.answers.len() != plan.send.positions() as usize
             {
                 return Err(Error::StatementMismatch);
@@ -15816,29 +16257,24 @@ fn verify_first(
                     return Err(Error::StatementMismatch);
                 }
             }
-            for (position, entry) in closure.bits.group.entries.iter().enumerate() {
-                if entry.position != position as u32
-                    || entry.oracle
-                        != closure_plan
-                            .bits_oracle_base
-                            .checked_add(position as u64)
-                            .ok_or(Error::ResourceLimit)?
-                    || entry.shape != closure_plan.bits.oracle_shape()
-                    || entry.tree != closure_plan.bits.tree_plan(position as u32)?
-                    || entry.root == Digest::ZERO
-                {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-            for (position, entry) in closure.map.group.entries.iter().enumerate() {
-                if entry.position != position as u32
-                    || entry.oracle
-                        != closure_plan
-                            .map_oracle_base
-                            .checked_add(position as u64)
-                            .ok_or(Error::ResourceLimit)?
-                    || entry.shape != closure_plan.map.oracle_shape()
-                    || entry.tree != closure_plan.map.tree_plan(position as u32)?
+            // The bit and map classes carry one stacked message each.
+            for (entry, shape, oracle) in [
+                (
+                    closure.bits.group.entries.first(),
+                    &closure_plan.bits,
+                    closure_plan.bits_oracle_base,
+                ),
+                (
+                    closure.map.group.entries.first(),
+                    &closure_plan.map,
+                    closure_plan.map_oracle_base,
+                ),
+            ] {
+                let entry = entry.ok_or(Error::StatementMismatch)?;
+                if entry.position != 0
+                    || entry.oracle != oracle
+                    || entry.shape != shape.oracle_shape()
+                    || entry.tree != shape.tree_plan(0)?
                     || entry.root == Digest::ZERO
                 {
                     return Err(Error::StatementMismatch);
@@ -15907,8 +16343,8 @@ fn verify_first(
         let bits_seeds = draw_closure_seed_set(
             &mut chain,
             28,
-            closure_plan.bits.sample_bits()?,
-            closure_plan.bits.answers,
+            stacked_sample_bits(closure_plan)?,
+            1,
         )?;
         if bits_seeds != closure.bits_sample.seed {
             return Err(Error::InvalidProof);
@@ -15936,8 +16372,8 @@ fn verify_first(
             let map_seeds = draw_closure_seed_set(
                 &mut chain,
                 35,
-                closure_plan.map.sample_bits()?,
-                closure_plan.map.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             if map_seeds != closure.map_sample.seed {
                 return Err(Error::InvalidProof);
@@ -16034,20 +16470,16 @@ fn verify_first(
         {
             return Err(Error::InvalidProof);
         }
-        for (position, (list, opening)) in bits_positions
-            .iter()
-            .zip(&closure.bits_openings)
-            .enumerate()
-        {
+        for (list, opening) in bits_positions.iter().zip(&closure.bits_openings) {
             if opening.positions != *list {
                 return Err(Error::InvalidIndex);
             }
-            let tree = closure_plan.bits.tree_plan(position as u32)?;
+            let tree = closure_plan.bits.tree_plan(0)?;
             let root = closure
                 .bits
                 .group
                 .entries
-                .get(position)
+                .first()
                 .map(|entry| entry.root)
                 .ok_or(Error::ShapeMismatch)?;
             verify_runtime_opening(&tree, &root, list, opening)?;
@@ -16076,20 +16508,16 @@ fn verify_first(
         {
             return Err(Error::InvalidProof);
         }
-        for (position, (list, opening)) in map_positions
-            .iter()
-            .zip(&closure.map_openings)
-            .enumerate()
-        {
+        for (list, opening) in map_positions.iter().zip(&closure.map_openings) {
             if opening.positions != *list {
                 return Err(Error::InvalidIndex);
             }
-            let tree = closure_plan.map.tree_plan(position as u32)?;
+            let tree = closure_plan.map.tree_plan(0)?;
             let root = closure
                 .map
                 .group
                 .entries
-                .get(position)
+                .first()
                 .map(|entry| entry.root)
                 .ok_or(Error::ShapeMismatch)?;
             verify_runtime_opening(&tree, &root, list, opening)?;
@@ -17150,6 +17578,22 @@ fn relation_row_bat(row: &GuRelationRow, member: &ProximityMember) -> Result<Bat
     );
     out.target = row.target;
     Ok(out)
+}
+
+/// Opens one committed lookup bits tree at the drawn positions by re-deriving
+/// its columns from the retained message rows and flat tails.
+fn open_lookup_bits(
+    messages: &crate::proof::lookup_messages::LookupMessages,
+    shape: &WShape,
+    tree: &RuntimeTree,
+    positions: &[u64],
+) -> Result<RuntimeTreeOpening> {
+    if *tree.root() != messages.bits_root() {
+        return Err(Error::StatementMismatch);
+    }
+    messages
+        .bits
+        .open_position(shape, &messages.bits_tails, 0, positions)
 }
 
 fn commit_rows_tree(
@@ -18495,31 +18939,37 @@ fn own_members(
                 mask_tails: Vec::new(),
             });
         }
-        for position in 0..positions {
-            let root = closure_first
+        // The stacked bit message: one member over the merged table, one
+        // sample answer per position block.
+        {
+            let shape = &closure_plan.bits;
+            let entry = closure_first
                 .bits
                 .group
                 .entries
-                .get(position as usize)
-                .ok_or(Error::ShapeMismatch)?
-                .root;
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if entry.oracle != closure_plan.bits_oracle_base
+                || closure_first.bits.group.entries.len() != 1
+                || entry.tree != shape.tree_plan(0)?
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let root = entry.root;
             let (message, tails) = match witness {
                 Some(witness) => {
                     let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
                     let message = closure
                         .bits
                         .messages
-                        .get(position as usize)
+                        .first()
                         .ok_or(Error::ShapeMismatch)?
                         .clone();
-                    let rows = usize::try_from(closure_plan.bits.main_rows)
+                    let rows = usize::try_from(shape.main_rows)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let tail_len = usize::try_from(closure_plan.bits.code.r)
+                    let tail_len = usize::try_from(shape.code.r)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let flat = closure
-                        .bits_tails
-                        .get(position as usize)
-                        .ok_or(Error::ShapeMismatch)?;
+                    let flat = closure.bits_tails.first().ok_or(Error::ShapeMismatch)?;
                     let mut tails = Vec::with_capacity(rows);
                     for row in 0..rows {
                         tails.push(
@@ -18534,48 +18984,49 @@ fn own_members(
             };
             members.push(ProximityMember {
                 bat_oracle: 0,
-                source_oracle: closure_plan
-                    .bits_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-                main_code: closure_plan.bits.code,
+                source_oracle: closure_plan.bits_oracle_base,
+                main_code: shape.code,
                 mask_code: plan.proximity.mask_code,
-                main_rows: closure_plan.bits.main_rows,
+                main_rows: shape.main_rows,
                 mask_rows: 0,
-                answers: closure_plan.bits.answers,
+                answers: positions,
                 root,
-                tree_plan: closure_plan.bits.tree_plan(position)?,
+                tree_plan: shape.tree_plan(0)?,
                 message,
                 tails,
                 mask_message: Vec::new(),
                 mask_tails: Vec::new(),
             });
         }
-        for position in 0..positions {
-            let root = closure_first
+        {
+            let shape = &closure_plan.map;
+            let entry = closure_first
                 .map
                 .group
                 .entries
-                .get(position as usize)
-                .ok_or(Error::ShapeMismatch)?
-                .root;
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if entry.oracle != closure_plan.map_oracle_base
+                || closure_first.map.group.entries.len() != 1
+                || entry.tree != shape.tree_plan(0)?
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let root = entry.root;
             let (message, tails) = match witness {
                 Some(witness) => {
                     let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
                     let message = closure
                         .map
                         .messages
-                        .get(position as usize)
+                        .first()
                         .ok_or(Error::ShapeMismatch)?
                         .clone();
-                    let rows = usize::try_from(closure_plan.map.main_rows)
+                    let rows = usize::try_from(shape.main_rows)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let tail_len = usize::try_from(closure_plan.map.code.r)
+                    let tail_len = usize::try_from(shape.code.r)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let flat = closure
-                        .map_tails
-                        .get(position as usize)
-                        .ok_or(Error::ShapeMismatch)?;
+                    let flat = closure.map_tails.first().ok_or(Error::ShapeMismatch)?;
                     let mut tails = Vec::with_capacity(rows);
                     for row in 0..rows {
                         tails.push(
@@ -18590,17 +19041,14 @@ fn own_members(
             };
             members.push(ProximityMember {
                 bat_oracle: 0,
-                source_oracle: closure_plan
-                    .map_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-                main_code: closure_plan.map.code,
+                source_oracle: closure_plan.map_oracle_base,
+                main_code: shape.code,
                 mask_code: plan.proximity.mask_code,
-                main_rows: closure_plan.map.main_rows,
+                main_rows: shape.main_rows,
                 mask_rows: 0,
-                answers: closure_plan.map.answers,
+                answers: positions,
                 root,
-                tree_plan: closure_plan.map.tree_plan(position)?,
+                tree_plan: shape.tree_plan(0)?,
                 message,
                 tails,
                 mask_message: Vec::new(),
@@ -18630,7 +19078,360 @@ fn own_members(
             mask_tails,
         });
     }
-    members.extend(norm_members(plan, first, witness)?);
+
+    if let Some(norm_plan) = &plan.norm {
+        let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
+        let positions = plan.send.positions();
+        // The member list follows the plan's own group order, including the
+        // RMS limb groups when the plan carries them.
+        let mut groups = vec![(&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x))];
+        match (&norm_first.low, &norm_first.high) {
+            (Some(low), Some(high)) => {
+                let rms = norm_plan.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                groups.push((low, &rms.low, norm_witness.and_then(|w| w.low.as_ref())));
+                groups.push((high, &rms.high, norm_witness.and_then(|w| w.high.as_ref())));
+            }
+            (None, None) if norm_plan.rms.is_none() => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        groups.extend([
+            (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
+            (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
+            (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
+            (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
+        ]);
+        if let (Some(round_message), Some(round_plan)) =
+            (&norm_first.round, &norm_plan.round)
+        {
+            groups.push((
+                round_message,
+                &round_plan.group,
+                norm_witness.and_then(|witness| witness.round.as_ref()),
+            ));
+        }
+        if let (Some(output_message), Some(output_plan)) =
+            (&norm_first.output, &norm_plan.output)
+        {
+            let output_witness = norm_witness.and_then(|witness| witness.output.as_ref());
+            groups.push((
+                &output_message.broadcast,
+                &output_plan.broadcast,
+                output_witness.map(|witness| &witness.broadcast),
+            ));
+            groups.push((
+                &output_message.product,
+                &output_plan.product,
+                output_witness.map(|witness| &witness.product),
+            ));
+            groups.push((
+                &output_message.image,
+                &output_plan.image,
+                output_witness.map(|witness| &witness.image),
+            ));
+            groups.push((
+                &output_message.out,
+                &output_plan.out,
+                output_witness.map(|witness| &witness.out),
+            ));
+        }
+        if let (Some(tail_message), Some(output_plan)) = (&norm_first.tail, &norm_plan.output) {
+            if let Some(tail_plan) = &output_plan.tail {
+                let tail_witness = norm_witness
+                    .and_then(|witness| witness.output.as_ref())
+                    .and_then(|witness| witness.tail.as_ref());
+                groups.push((
+                    &tail_message.group,
+                    &tail_plan.group,
+                    tail_witness.map(|witness| &witness.committed),
+                ));
+            }
+        }
+        for (message, group_plan, group_witness) in groups {
+            if message.message.group.group != group_plan.group
+                || message.message.roots.len() != positions as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            for position in 0..positions {
+                let root = message
+                    .message
+                    .group
+                    .entries
+                    .get(position as usize)
+                    .ok_or(Error::ShapeMismatch)?
+                    .root;
+                let (message_rows, tails) = match group_witness {
+                    Some(group_witness) => {
+                        let rows = group_witness
+                            .messages
+                            .get(position as usize)
+                            .ok_or(Error::ShapeMismatch)?
+                            .clone();
+                        let row_count = usize::try_from(group_plan.shape.main_rows)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        let tail_len = usize::try_from(group_plan.shape.code.r)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        let flat = group_witness
+                            .tails
+                            .get(position as usize)
+                            .ok_or(Error::ShapeMismatch)?;
+                        let mut tails = Vec::with_capacity(row_count);
+                        for row in 0..row_count {
+                            tails.push(
+                                flat.get(row * tail_len..(row + 1) * tail_len)
+                                    .ok_or(Error::ShapeMismatch)?
+                                    .to_vec(),
+                            );
+                        }
+                        (rows, tails)
+                    }
+                    None => (Vec::new(), Vec::new()),
+                };
+                members.push(ProximityMember {
+                    bat_oracle: 0,
+                    source_oracle: group_plan
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?,
+                    main_code: group_plan.shape.code,
+                    mask_code: plan.proximity.mask_code,
+                    main_rows: group_plan.shape.main_rows,
+                    mask_rows: 0,
+                    answers: group_plan.shape.answers,
+                    root,
+                    tree_plan: group_plan.shape.tree_plan(position)?,
+                    message: message_rows,
+                    tails,
+                    mask_message: Vec::new(),
+                    mask_tails: Vec::new(),
+                });
+            }
+        }
+        if let Some(mask_plan) = &norm_plan.mask {
+            let mask_first = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            if mask_first.tree != mask_plan.tree {
+                return Err(Error::StatementMismatch);
+            }
+            let (mask_rows, mask_tails) = match norm_witness {
+                Some(witness) => match &witness.mask {
+                    Some(mask) => (mask.committed.rows.clone(), mask.committed.tails.clone()),
+                    None => (Vec::new(), Vec::new()),
+                },
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: mask_plan.oracle,
+                main_code: plan.proximity.code,
+                mask_code: mask_plan.mask_code,
+                main_rows: 0,
+                mask_rows: mask_plan.mask_rows,
+                answers: mask_plan.answers,
+                root: mask_first.root,
+                tree_plan: mask_plan.tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: mask_rows,
+                mask_tails,
+            });
+        }
+        if let Some(lookup_plan) = &norm_plan.lookup {
+            let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            let bits_entry = lookup_first
+                .bits
+                .message
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if bits_entry.tree != commit.bits_shape.tree_plan(0)?
+                || lookup_first.mask.tree != commit.mask_tree
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let lookup_messages = norm_witness
+                .and_then(|witness| witness.lookup.as_ref())
+                .and_then(|lookup| lookup.messages.as_ref());
+            let row_count = usize::try_from(commit.bits_shape.main_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            let tail_len = usize::try_from(commit.bits_shape.code.r)
+                .map_err(|_| Error::ResourceLimit)?;
+            let (bits_message, bits_tails) = match lookup_messages {
+                Some(messages) => {
+                    let message = messages
+                        .bits
+                        .messages
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?
+                        .clone();
+                    let mut tails = Vec::with_capacity(row_count);
+                    for row in 0..row_count {
+                        tails.push(
+                            messages
+                                .bits_tails
+                                .get(row * tail_len..(row + 1) * tail_len)
+                                .ok_or(Error::ShapeMismatch)?
+                                .to_vec(),
+                        );
+                    }
+                    (message, tails)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
+                Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.bits_oracle,
+                main_code: commit.bits_shape.code,
+                mask_code: plan.proximity.mask_code,
+                main_rows: commit.bits_shape.main_rows,
+                mask_rows: 0,
+                answers: commit.bits_shape.answers,
+                root: lookup_first
+                    .bits
+                    .message
+                    .roots
+                    .first()
+                    .copied()
+                    .ok_or(Error::ShapeMismatch)?,
+                tree_plan: commit.bits_shape.tree_plan(0)?,
+                message: bits_message,
+                tails: bits_tails,
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            });
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.mask_oracle,
+                main_code: plan.proximity.code,
+                mask_code: commit.mask_code,
+                main_rows: 0,
+                mask_rows: commit.mask_rows,
+                answers: 1,
+                root: lookup_first.mask.root,
+                tree_plan: commit.mask_tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: lookup_mask_rows,
+                mask_tails: lookup_mask_tails,
+            });
+        }
+
+        // frozen-table lookup: own members
+        if let Some(lookup_plan) = &norm_plan.rstd {
+            let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            let bits_entry = lookup_first
+                .bits
+                .message
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if bits_entry.tree != commit.bits_shape.tree_plan(0)?
+                || lookup_first.mask.tree != commit.mask_tree
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let lookup_messages = norm_witness
+                .and_then(|witness| witness.rstd.as_ref())
+                .and_then(|lookup| lookup.messages.as_ref());
+            let row_count = usize::try_from(commit.bits_shape.main_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            let tail_len = usize::try_from(commit.bits_shape.code.r)
+                .map_err(|_| Error::ResourceLimit)?;
+            let (bits_message, bits_tails) = match lookup_messages {
+                Some(messages) => {
+                    let message = messages
+                        .bits
+                        .messages
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?
+                        .clone();
+                    let mut tails = Vec::with_capacity(row_count);
+                    for row in 0..row_count {
+                        tails.push(
+                            messages
+                                .bits_tails
+                                .get(row * tail_len..(row + 1) * tail_len)
+                                .ok_or(Error::ShapeMismatch)?
+                                .to_vec(),
+                        );
+                    }
+                    (message, tails)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
+                Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.bits_oracle,
+                main_code: commit.bits_shape.code,
+                mask_code: plan.proximity.mask_code,
+                main_rows: commit.bits_shape.main_rows,
+                mask_rows: 0,
+                answers: commit.bits_shape.answers,
+                root: lookup_first
+                    .bits
+                    .message
+                    .roots
+                    .first()
+                    .copied()
+                    .ok_or(Error::ShapeMismatch)?,
+                tree_plan: commit.bits_shape.tree_plan(0)?,
+                message: bits_message,
+                tails: bits_tails,
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            });
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.mask_oracle,
+                main_code: plan.proximity.code,
+                mask_code: commit.mask_code,
+                main_rows: 0,
+                mask_rows: commit.mask_rows,
+                answers: 1,
+                root: lookup_first.mask.root,
+                tree_plan: commit.mask_tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: lookup_mask_rows,
+                mask_tails: lookup_mask_tails,
+            });
+        }
+    }
+    for input in norm_param_claim_inputs(plan, first, witness.and_then(|w| w.norm.as_ref()))? {
+        let gu = &input.claim.gu;
+        let (message, tails) = match &input.material {
+            Some(material) => (material.message.clone(), material.tails.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: gu.oracle,
+            main_code: gu.u.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: gu.u.main_rows,
+            mask_rows: 0,
+            answers: gu.u.answers,
+            root: input.message.root,
+            tree_plan: gu.tree.clone(),
+            message,
+            tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
+
     // The isolated FOLD fixture places blocks in registration order, so the
     // member order must follow the BAT block order: larger main blocks first,
     // and among mask-only members the larger mask block first.
@@ -18645,84 +19446,126 @@ fn own_members(
     Ok((members, order))
 }
 
-fn own_sample_rows(
-    plan: &HiddenLinPlan,
-    members: &[ProximityMember],
-    first: &HiddenSendMessages,
-    shared: Option<&HiddenSharedMessages>,
-) -> Result<Vec<Vec<GuRelationRow>>> {
-    let shape = plan.send.w.oracle_shape();
-    zkie_engine::scheduling::try_map_bounded(
-        members,
-        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
-        |member| -> Result<Vec<GuRelationRow>> {
-        if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
-            if member.source_oracle == rw.oracle {
-                if message.sample.seed.len() != message.sample.answers.len()
-                    || message.sample.seed.len() != member.answers as usize
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-                let mut rows = Vec::with_capacity(message.sample.seed.len());
-                for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
-                    rows.push(oracle_sample_row(
-                        rw.oracle,
-                        rw.group,
-                        &rw.shape.oracle_shape(),
-                        std::slice::from_ref(seed),
-                        0,
-                        *answer,
+
+fn member_sample_rows(
+plan: &HiddenLinPlan,
+member: &ProximityMember,
+first: &HiddenSendMessages,
+shared: &HiddenSharedMessages,
+) -> Result<Vec<GuRelationRow>> {
+let shape = plan.send.w.oracle_shape();
+    if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
+        if member.source_oracle == rw.oracle {
+            if message.sample.seed.len() != message.sample.answers.len()
+                || message.sample.seed.len() != member.answers as usize
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(message.sample.seed.len());
+            for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+                rows.push(oracle_sample_row(
+                    rw.oracle,
+                    rw.group,
+                    &rw.shape.oracle_shape(),
+                    std::slice::from_ref(seed),
+                    0,
+                    *answer,
+                )?);
+            }
+            return Ok(rows);
+        }
+    }
+    if let Some(norm_plan) = &plan.norm {
+        if let Some(params_plan) = &norm_plan.params {
+            let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+            let message_params = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
+            let claims = [
+                (
+                    params_plan.gain_claim.as_ref(),
+                    Some(&message_params.gain),
+                ),
+                (
+                    params_plan.bias_claim.as_ref(),
+                    message_params.bias.as_ref(),
+                ),
+            ];
+            for (claim, message) in claims {
+                let (claim, message) = match (claim, message) {
+                    (Some(claim), Some(message)) => (claim, message),
+                    _ => continue,
+                };
+                if member.source_oracle == claim.gu.oracle {
+                    let registry = norm_param_registry(claim, message)?;
+                    return Ok(sample_rows_of(
+                        &claim.gu,
+                        &registry,
+                        &message.seeds,
+                        &message.answers,
+
                     )?);
                 }
-                return Ok(rows);
             }
         }
-        if let Some(norm_plan) = &plan.norm {
-            if let Some(params_plan) = &norm_plan.params {
-                let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
-                let message_params = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
-                let claims = [
-                    (
-                        params_plan.gain_claim.as_ref(),
-                        Some(&message_params.gain),
-                    ),
-                    (
-                        params_plan.bias_claim.as_ref(),
-                        message_params.bias.as_ref(),
-                    ),
-                ];
-                for (claim, message) in claims {
-                    let (claim, message) = match (claim, message) {
-                        (Some(claim), Some(message)) => (claim, message),
-                        _ => continue,
-                    };
-                    if member.source_oracle == claim.gu.oracle {
-                        let registry = norm_param_registry(claim, message)?;
-                        return Ok(sample_rows_of(
-                            &claim.gu,
-                            &registry,
-                            &message.seeds,
-                            &message.answers,
-                        )?);
-                    }
-                }
+    }
+    if let Some(norm_plan) = &plan.norm {
+        let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let groups = norm_group_plans(norm_plan);
+        // The message list follows the plan's group order, with the RMS limb
+        // groups in the same place as the plan and witness lists.
+        let mut messages = vec![&norm_first.x];
+        match (&norm_first.low, &norm_first.high) {
+            (Some(low), Some(high)) => {
+                messages.push(low);
+                messages.push(high);
+            }
+            (None, None) if norm_plan.rms.is_none() => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        messages.extend([
+            &norm_first.sum,
+            &norm_first.squares,
+            &norm_first.mean,
+            &norm_first.variance,
+        ]);
+        if let Some(round) = &norm_first.round {
+            messages.push(round);
+        }
+        if messages.len() != groups.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let positions = plan.send.positions() as u64;
+        for (group_plan, message) in groups.iter().zip(messages.iter()) {
+            let base = group_plan.oracle_base;
+            if member.source_oracle >= base
+                && member.source_oracle < base.saturating_add(positions)
+            {
+                let position = (member.source_oracle - base) as usize;
+                let target = *message
+                    .sample
+                    .answers
+                    .get(position)
+                    .ok_or(Error::ShapeMismatch)?;
+                return Ok(vec![oracle_sample_row(
+                    member.source_oracle,
+                    plan.send.group,
+                    &group_plan.shape.oracle_shape(),
+                    &message.sample.seed,
+                    0,
+                    target,
+                )?]);
             }
         }
-        if let Some(norm_plan) = &plan.norm {
-            let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
-            let groups = norm_group_plans(norm_plan);
-            let mut messages = vec![
-                &norm_first.x,
-                &norm_first.sum,
-                &norm_first.squares,
-                &norm_first.mean,
-                &norm_first.variance,
+        if let (Some(output_message), Some(output_plan)) =
+            (&norm_first.output, &norm_plan.output)
+        {
+            let outputs = [
+                (&output_message.broadcast, &output_plan.broadcast),
+                (&output_message.product, &output_plan.product),
+                (&output_message.image, &output_plan.image),
+                (&output_message.out, &output_plan.out),
             ];
-            if let Some(round) = &norm_first.round {
-                messages.push(round);
-            }
             let positions = plan.send.positions() as u64;
-            for (group_plan, message) in groups.iter().zip(messages.iter()) {
+            for (message, group_plan) in outputs {
                 let base = group_plan.oracle_base;
                 if member.source_oracle >= base
                     && member.source_oracle < base.saturating_add(positions)
@@ -18743,312 +19586,491 @@ fn own_sample_rows(
                     )?]);
                 }
             }
-            if let (Some(output_message), Some(output_plan)) =
-                (&norm_first.output, &norm_plan.output)
-            {
-                let outputs = [
-                    (&output_message.broadcast, &output_plan.broadcast),
-                    (&output_message.product, &output_plan.product),
-                    (&output_message.image, &output_plan.image),
-                    (&output_message.out, &output_plan.out),
-                ];
+        }
+        if let (Some(tail_message), Some(output_plan)) =
+            (&norm_first.tail, &norm_plan.output)
+        {
+            if let Some(tail_plan) = &output_plan.tail {
+                let base = tail_plan.group.oracle_base;
                 let positions = plan.send.positions() as u64;
-                for (message, group_plan) in outputs {
-                    let base = group_plan.oracle_base;
-                    if member.source_oracle >= base
-                        && member.source_oracle < base.saturating_add(positions)
-                    {
-                        let position = (member.source_oracle - base) as usize;
-                        let target = *message
-                            .sample
-                            .answers
-                            .get(position)
-                            .ok_or(Error::ShapeMismatch)?;
-                        return Ok(vec![oracle_sample_row(
-                            member.source_oracle,
-                            plan.send.group,
-                            &group_plan.shape.oracle_shape(),
-                            &message.sample.seed,
-                            0,
-                            target,
-                        )?]);
-                    }
-                }
-            }
-            if let (Some(tail_message), Some(output_plan)) =
-                (&norm_first.tail, &norm_plan.output)
-            {
-                if let Some(tail_plan) = &output_plan.tail {
-                    let base = tail_plan.group.oracle_base;
-                    let positions = plan.send.positions() as u64;
-                    if member.source_oracle >= base
-                        && member.source_oracle < base.saturating_add(positions)
-                    {
-                        let position = (member.source_oracle - base) as usize;
-                        let target = *tail_message
-                            .group
-                            .sample
-                            .answers
-                            .get(position)
-                            .ok_or(Error::ShapeMismatch)?;
-                        return Ok(vec![oracle_sample_row(
-                            member.source_oracle,
-                            plan.send.group,
-                            &tail_plan.group.shape.oracle_shape(),
-                            &tail_message.group.sample.seed,
-                            0,
-                            target,
-                        )?]);
-                    }
-                }
-            }
-            if let Some(mask_plan) = &norm_plan.mask {
-                if member.source_oracle == mask_plan.oracle {
-                    let message = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                    let target = *message
+                if member.source_oracle >= base
+                    && member.source_oracle < base.saturating_add(positions)
+                {
+                    let position = (member.source_oracle - base) as usize;
+                    let target = *tail_message
+                        .group
                         .sample
                         .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let mut row = norm_mask_sample_row(mask_plan, message, target)?;
-                    row.group = plan.send.group;
-                    return Ok(vec![row]);
-                }
-            }
-            if let Some(lookup_plan) = &norm_plan.lookup {
-                let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
-                let commit = &lookup_plan.commit;
-                if member.source_oracle == commit.bits_oracle {
-                    let target = *lookup_first
-                        .bits
-                        .sample
-                        .answers
-                        .first()
+                        .get(position)
                         .ok_or(Error::ShapeMismatch)?;
                     return Ok(vec![oracle_sample_row(
                         member.source_oracle,
-                        lookup_first.bits.message.group.group,
-                        &commit.bits_shape.oracle_shape(),
-                        &lookup_first.bits.sample.seed,
+                        plan.send.group,
+                        &tail_plan.group.shape.oracle_shape(),
+                        &tail_message.group.sample.seed,
                         0,
                         target,
                     )?]);
-                }
-                if member.source_oracle == commit.mask_oracle {
-                    let target = *lookup_first
-                        .mask
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let row =
-                        lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
-                    return Ok(vec![row]);
-                }
-            }
-            // frozen-table lookup: own sample rows
-            if let Some(lookup_plan) = &norm_plan.rstd {
-                let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
-                let commit = &lookup_plan.commit;
-                if member.source_oracle == commit.bits_oracle {
-                    let target = *lookup_first
-                        .bits
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    return Ok(vec![oracle_sample_row(
-                        member.source_oracle,
-                        lookup_first.bits.message.group.group,
-                        &commit.bits_shape.oracle_shape(),
-                        &lookup_first.bits.sample.seed,
-                        0,
-                        target,
-                    )?]);
-                }
-                if member.source_oracle == commit.mask_oracle {
-                    let target = *lookup_first
-                        .mask
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let row =
-                        lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
-                    return Ok(vec![row]);
                 }
             }
         }
-        if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
-            let positions = plan.send.positions() as u64;
-            let slack_base = closure_plan.slack_oracle_base;
-            let bits_base = closure_plan.bits_oracle_base;
-            if member.source_oracle >= slack_base
-                && member.source_oracle < slack_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - slack_base) as usize;
-                let target = *closure_first
-                    .slack_sample
+        if let Some(mask_plan) = &norm_plan.mask {
+            if member.source_oracle == mask_plan.oracle {
+                let message = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                let target = *message
+                    .sample
                     .answers
-                    .get(position)
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                let mut row = norm_mask_sample_row(mask_plan, message, target)?;
+                row.group = plan.send.group;
+                return Ok(vec![row]);
+            }
+        }
+        if let Some(lookup_plan) = &norm_plan.lookup {
+            let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            if member.source_oracle == commit.bits_oracle {
+                let target = *lookup_first
+                    .bits
+                    .sample
+                    .answers
+                    .first()
                     .ok_or(Error::ShapeMismatch)?;
                 return Ok(vec![oracle_sample_row(
                     member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.slack.oracle_shape(),
-                    &closure_first.slack_sample.seed,
+                    lookup_first.bits.message.group.group,
+                    &commit.bits_shape.oracle_shape(),
+                    &lookup_first.bits.sample.seed,
                     0,
                     target,
                 )?]);
             }
-            if member.source_oracle >= bits_base
-                && member.source_oracle < bits_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - bits_base) as usize;
-                let target = *closure_first
-                    .bits_sample
-                    .answers
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![oracle_sample_row(
-                    member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.bits.oracle_shape(),
-                    &closure_first.bits_sample.seed,
-                    0,
-                    target,
-                )?]);
-            }
-            let map_base = closure_plan.map_oracle_base;
-            if member.source_oracle >= map_base
-                && member.source_oracle < map_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - map_base) as usize;
-                let target = *closure_first
-                    .map_sample
-                    .answers
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![oracle_sample_row(
-                    member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.map.oracle_shape(),
-                    &closure_first.map_sample.seed,
-                    0,
-                    target,
-                )?]);
-            }
-            if member.source_oracle == closure_plan.mask.oracle {
-                let target = *closure_first
+            if member.source_oracle == commit.mask_oracle {
+                let target = *lookup_first
                     .mask
                     .sample
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![closure_mask_sample_row(
-                    &closure_plan.mask,
-                    &closure_first.mask,
-                    target,
-                )?]);
+                let row =
+                    lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
+                return Ok(vec![row]);
             }
         }
-        if let (Some(source_plan), Some(message)) = (&plan.send.source_data, &first.source_data) {
-            if member.source_oracle == source_plan.oracle {
-                if message.sample.seed.len() != message.sample.answers.len()
-                    || message.sample.seed.len() != member.answers as usize
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-                let mut rows = Vec::with_capacity(message.sample.seed.len());
-                for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
-                    rows.push(oracle_sample_row(
-                        source_plan.oracle,
-                        source_plan.group,
-                        &source_plan.shape.oracle_shape(),
-                        std::slice::from_ref(seed),
-                        0,
-                        *answer,
-                    )?);
-                }
-                return Ok(rows);
-            }
-        }
-        if let Some(chain_plan) = &plan.send.chain_mask {
-            if member.source_oracle == chain_plan.oracle {
-                let message = first.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
-                    .sample
-                    .answers
-                    .first()
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![chain_mask_sample_row(chain_plan, message, target)?]);
-            }
-        }
-        if let Some(index) = &plan.send.index_mask {
-            if member.source_oracle == index.oracle {
-                let message = first.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
-                    .sample
-                    .answers
-                    .first()
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![index_mask_sample_row(index, message, target)?]);
-            }
-        }
-        if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
-            if member.source_oracle == dot.oracle {
-                let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
+        // frozen-table lookup: own sample rows
+        if let Some(lookup_plan) = &norm_plan.rstd {
+            let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            if member.source_oracle == commit.bits_oracle {
+                let target = *lookup_first
+                    .bits
                     .sample
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
                 return Ok(vec![oracle_sample_row(
-                    dot.oracle,
-                    dot.group,
-                    &dot.oracle_shape(),
-                    &message.sample.seed,
+                    member.source_oracle,
+                    lookup_first.bits.message.group.group,
+                    &commit.bits_shape.oracle_shape(),
+                    &lookup_first.bits.sample.seed,
                     0,
                     target,
                 )?]);
             }
+            if member.source_oracle == commit.mask_oracle {
+                let target = *lookup_first
+                    .mask
+                    .sample
+                    .answers
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                let row =
+                    lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
+                return Ok(vec![row]);
+            }
         }
-        if member.source_oracle == plan.proximity.omega.oracle {
-            let shared = shared.ok_or(Error::InvalidConfig)?;
-            let mut list = Vec::with_capacity(shared.omega_answers.len());
-            for (answer, target) in shared.omega_answers.iter().enumerate() {
-                list.push(oracle_sample_row(
-                    plan.proximity.omega.oracle,
-                    plan.proximity.omega.group,
-                    &plan.proximity.omega.u,
-                    &shared.omega_seeds,
-                    answer as u32,
-                    *target,
-                )?);
-            }
-            return Ok(list);
-        } else {
-            let position = (member.source_oracle - plan.send.oracle_base) as usize;
-            if position >= plan.send.positions() as usize {
-                return Err(Error::StatementMismatch);
-            }
-            let index = position * plan.send.w.answers as usize;
-            let target = *first
-                .samples
+
+    }
+    if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
+        let positions = plan.send.positions() as u64;
+        let slack_base = closure_plan.slack_oracle_base;
+        let bits_base = closure_plan.bits_oracle_base;
+        if member.source_oracle >= slack_base
+            && member.source_oracle < slack_base.saturating_add(positions)
+        {
+            let position = (member.source_oracle - slack_base) as usize;
+            let target = *closure_first
+                .slack_sample
+
                 .answers
-                .get(index)
+                .get(position)
                 .ok_or(Error::ShapeMismatch)?;
             return Ok(vec![oracle_sample_row(
                 member.source_oracle,
                 plan.send.group,
-                &shape,
-                &first.samples.seed,
+                &closure_plan.slack.oracle_shape(),
+                &closure_first.slack_sample.seed,
                 0,
                 target,
             )?]);
         }
-        },
-    )
+        if member.source_oracle == bits_base {
+            // The stacked bit message emits one block-addressed run row per
+            // position through the streaming builder; the materialized list
+            // never carries it.
+            let _ = bits_base;
+            return Err(Error::InvalidConfig);
+        }
+        if member.source_oracle == closure_plan.map_oracle_base {
+            // The stacked map message emits one block-addressed run row per
+            // position through the streaming builder; the materialized list
+            // never carries it.
+            return Err(Error::InvalidConfig);
+        }
+        if member.source_oracle == closure_plan.mask.oracle {
+            let target = *closure_first
+                .mask
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![closure_mask_sample_row(
+                &closure_plan.mask,
+                &closure_first.mask,
+                target,
+            )?]);
+        }
+    }
+    if let (Some(source_plan), Some(message)) = (&plan.send.source_data, &first.source_data) {
+        if member.source_oracle == source_plan.oracle {
+            if message.sample.seed.len() != message.sample.answers.len()
+                || message.sample.seed.len() != member.answers as usize
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(message.sample.seed.len());
+            for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+                rows.push(oracle_sample_row(
+                    source_plan.oracle,
+                    source_plan.group,
+                    &source_plan.shape.oracle_shape(),
+                    std::slice::from_ref(seed),
+                    0,
+                    *answer,
+                )?);
+            }
+            return Ok(rows);
+        }
+    }
+    if let Some(chain_plan) = &plan.send.chain_mask {
+        if member.source_oracle == chain_plan.oracle {
+            let message = first.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![chain_mask_sample_row(chain_plan, message, target)?]);
+        }
+    }
+    if let Some(index) = &plan.send.index_mask {
+        if member.source_oracle == index.oracle {
+            let message = first.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![index_mask_sample_row(index, message, target)?]);
+        }
+    }
+    if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
+        if member.source_oracle == dot.oracle {
+            let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![oracle_sample_row(
+                dot.oracle,
+                dot.group,
+                &dot.oracle_shape(),
+                &message.sample.seed,
+                0,
+                target,
+            )?]);
+        }
+    }
+    if member.source_oracle == plan.proximity.omega.oracle {
+        let mut list = Vec::with_capacity(shared.omega_answers.len());
+        for (answer, target) in shared.omega_answers.iter().enumerate() {
+            list.push(oracle_sample_row(
+                plan.proximity.omega.oracle,
+                plan.proximity.omega.group,
+                &plan.proximity.omega.u,
+                &shared.omega_seeds,
+                answer as u32,
+                *target,
+            )?);
+        }
+        return Ok(list);
+    } else {
+        let position = (member.source_oracle - plan.send.oracle_base) as usize;
+        if position >= plan.send.positions() as usize {
+            return Err(Error::StatementMismatch);
+        }
+        let index = position * plan.send.w.answers as usize;
+        let target = *first
+            .samples
+            .answers
+            .get(index)
+            .ok_or(Error::ShapeMismatch)?;
+        return Ok(vec![oracle_sample_row(
+            member.source_oracle,
+            plan.send.group,
+            &shape,
+            &first.samples.seed,
+            0,
+            target,
+        )?]);
+    }
+}
+
+/// The materialized sample rows of every member, in member order. The own
+/// stage defers them into the streamed run and does not call this; the
+/// materialized proximity entries keep using it.
+/// Adds one position block's coefficients as column-major row-band runs: one
+/// run per row of the block, stepping by the merged message's row count over
+/// the full place range. The contiguous block form is row-major in the
+/// message's virtual space and cannot be placed by the column-major scatter.
+fn push_block_runs(
+    row: &mut BatRow,
+    oracle: u64,
+    position: usize,
+    block_rows: usize,
+    rows: u64,
+    coefficients: &[Fp3],
+) -> Result<()> {
+    if block_rows == 0
+        || coefficients.is_empty()
+        || coefficients.len() % block_rows != 0
+        || rows % block_rows as u64 != 0
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let places = coefficients.len() / block_rows;
+    let base_row = (position as u64)
+        .checked_mul(block_rows as u64)
+        .ok_or(Error::ResourceLimit)?;
+    for local in 0..block_rows {
+        let mut values = Vec::with_capacity(places);
+        for place in 0..places {
+            values.push(coefficients[local + block_rows * place]);
+        }
+        row.add_run(
+            oracle,
+            BatPart::Main,
+            base_row
+                .checked_add(local as u64)
+                .ok_or(Error::ResourceLimit)?,
+            rows,
+            values,
+        );
+    }
+    Ok(())
+}
+
+/// Emits the sample rows of one member as BAT rows. The stacked closure
+/// classes emit one block-addressed run row per position block from the
+/// shared seed; every other member keeps the shared relation-row builder.
+/// The own group's member row-block sum from the trusted plan alone: every
+/// member `own_members` pushes contributes `next_power_of_two(rows)` to its
+/// main or mask part. The BAT layout derives the same blocks and the FOLD k
+/// from this set, so the own stages are planned against this sum instead of
+/// a hand-set fold shape. The segment builders leave the request, source,
+/// range and digit attachments empty; a plan that carries them is rejected
+/// here rather than silently mis-sized.
+pub fn own_member_k(plan: &HiddenLinPlan) -> Result<u32> {
+    if plan.send.range.is_some()
+        || !plan.send.digit_lookups.is_empty()
+        || plan.send.request_chain.is_some()
+        || plan.send.chain_mask.is_some()
+    {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    let mut main_rows = 0u64;
+    let mut mask_rows = 0u64;
+    let mut add = |main: u64, mask: u64| -> Result<()> {
+        for (total, rows) in [(&mut main_rows, main), (&mut mask_rows, mask)] {
+            if rows > 0 {
+                let block = rows.checked_next_power_of_two().ok_or(Error::ResourceLimit)?;
+                *total = total.checked_add(block).ok_or(Error::ResourceLimit)?;
+            }
+        }
+        Ok(())
+    };
+    let positions = plan.send.positions() as u64;
+    for _ in 0..positions {
+        add(plan.send.w.main_rows, 0)?;
+    }
+    add(plan.proximity.omega.u.main_rows, 0)?;
+    if let Some(rw) = &plan.send.request_w {
+        add(rw.shape.main_rows, 0)?;
+    }
+    if let Some(source) = &plan.send.source_data {
+        add(source.shape.main_rows, 0)?;
+    }
+    if let Some(dot) = &plan.send.dot {
+        if !plan.send.activation_source.is_norm_hd() {
+            add(dot.shape.main_rows, 0)?;
+        }
+    }
+    if let Some(index) = &plan.send.index_mask {
+        add(0, index.mask_rows)?;
+    }
+    if let Some(closure) = &plan.closure {
+        for _ in 0..positions {
+            add(closure.slack.main_rows, 0)?;
+        }
+        add(closure.bits.main_rows, 0)?;
+        add(closure.map.main_rows, 0)?;
+        add(0, closure.mask.mask_rows)?;
+    }
+    if let Some(norm) = &plan.norm {
+        let mut groups: Vec<&WShape> = vec![
+            &norm.x.shape,
+            &norm.sum.shape,
+            &norm.squares.shape,
+            &norm.mean.shape,
+            &norm.variance.shape,
+        ];
+        if let Some(rms) = &norm.rms {
+            groups.push(&rms.low.shape);
+            groups.push(&rms.high.shape);
+        }
+        if let Some(round) = &norm.round {
+            groups.push(&round.group.shape);
+        }
+        if let Some(output) = &norm.output {
+            for group in [
+                &output.broadcast,
+                &output.product,
+                &output.image,
+                &output.out,
+            ] {
+                groups.push(&group.shape);
+            }
+            if let Some(tail) = &output.tail {
+                groups.push(&tail.group.shape);
+            }
+        }
+        for shape in groups {
+            for _ in 0..positions {
+                add(shape.main_rows, 0)?;
+            }
+        }
+        if let Some(mask) = &norm.mask {
+            add(0, mask.mask_rows)?;
+        }
+        if let Some(lookup) = &norm.lookup {
+            add(lookup.commit.bits_shape.main_rows, 0)?;
+            add(0, lookup.commit.mask_rows)?;
+        }
+        if let Some(rstd) = &norm.rstd {
+            add(rstd.commit.bits_shape.main_rows, 0)?;
+            add(0, rstd.commit.mask_rows)?;
+        }
+    }
+    let bits = |rows: u64| -> u32 {
+        if rows <= 1 {
+            0
+        } else {
+            64 - (rows - 1).leading_zeros()
+        }
+    };
+    Ok(bits(main_rows).max(bits(mask_rows)).max(1))
+}
+
+fn member_samples_into(
+    plan: &HiddenLinPlan,
+    member: &ProximityMember,
+    first: &HiddenSendMessages,
+    shared: &HiddenSharedMessages,
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
+    if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
+        let classes = [
+            (
+                &closure_plan.bits,
+                closure_plan.bits_oracle_base,
+                &closure_first.bits_sample,
+            ),
+            (
+                &closure_plan.map,
+                closure_plan.map_oracle_base,
+                &closure_first.map_sample,
+            ),
+        ];
+        for (shape, base, sample) in classes {
+            if member.source_oracle != base {
+                continue;
+            }
+            let blocks = plan.send.positions() as usize;
+            if sample.seed.len() != 1 || sample.answers.len() != blocks {
+                return Err(Error::ShapeMismatch);
+            }
+            if member.main_rows != shape.main_rows {
+                return Err(Error::ShapeMismatch);
+            }
+            let seed = &sample.seed[0];
+            let columns = usize::try_from(closure_plan.bits_columns)
+                .map_err(|_| Error::ResourceLimit)?;
+            if seed.z.len() != columns.trailing_zeros() as usize {
+                return Err(Error::ShapeMismatch);
+            }
+            let eq = crate::proof::output_closure::eq_vector(&seed.z)?;
+            if eq.len() != columns {
+                return Err(Error::ShapeMismatch);
+            }
+            let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            if rows % blocks != 0 {
+                return Err(Error::ShapeMismatch);
+            }
+            let block_rows = rows / blocks;
+            for (block, target) in sample.answers.iter().enumerate() {
+                let mut row = BatRow::new(BatRowKind::Sample);
+                push_block_runs(
+                    &mut row,
+                    member.bat_oracle,
+                    block,
+                    block_rows,
+                    shape.main_rows,
+                    &eq,
+                )?;
+                row.target = *target;
+                emit(row)?;
+            }
+            return Ok(());
+        }
+    }
+    for row in member_sample_rows(plan, member, first, shared)? {
+        emit(adapt_sample_row(&row, member)?)?;
+    }
+    Ok(())
+}
+
+fn own_sample_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    shared: &HiddenSharedMessages,
+) -> Result<Vec<Vec<GuRelationRow>>> {
+    members
+        .iter()
+        .map(|member| member_sample_rows(plan, member, first, shared))
+        .collect()
 }
 
 
@@ -19061,6 +20083,24 @@ fn own_sample_rows(
 // ---------------------------------------------------------------------------
 
 const NORM_ROOT_TAGS: [u64; 5] = [60, 61, 62, 63, 64];
+const NORM_LOW_ROOT_TAG: u64 = 160;
+const NORM_HIGH_ROOT_TAG: u64 = 161;
+const NORM_LOW_SEED_TAG: u64 = 162;
+const NORM_HIGH_SEED_TAG: u64 = 163;
+const NORM_LOW_ANSWER_TAG: u64 = 164;
+const NORM_HIGH_ANSWER_TAG: u64 = 165;
+const NORM_LOW_POSITION_TAG: u64 = 166;
+const NORM_HIGH_POSITION_TAG: u64 = 167;
+
+/// The group tags in the committed group order: the trusted x row, the two
+/// limb rows when the RMS form carries them, then the four statistic rows.
+fn norm_group_tags(plan: &NormPlan, base: &[u64; 5], low: u64, high: u64) -> Vec<u64> {
+    if plan.rms.is_some() {
+        vec![base[0], low, high, base[1], base[2], base[3], base[4]]
+    } else {
+        base.to_vec()
+    }
+}
 const NORM_MASK_ROOT_TAG: u64 = 65;
 const NORM_SEED_TAGS: [u64; 5] = [66, 67, 68, 69, 70];
 const NORM_MASK_SEED_TAG: u64 = 71;
@@ -19141,13 +20181,17 @@ const NORM_OUTPUT_POSITION_TAGS: [u64; 4] = [
 ];
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
-    let mut groups = vec![
-        &plan.x,
+    let mut groups = vec![&plan.x];
+    if let Some(rms) = &plan.rms {
+        groups.push(&rms.low);
+        groups.push(&rms.high);
+    }
+    groups.extend([
         &plan.sum,
         &plan.squares,
         &plan.mean,
         &plan.variance,
-    ];
+    ]);
     if let Some(round) = &plan.round {
         groups.push(&round.group);
     }
@@ -19155,13 +20199,21 @@ fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
 }
 
 fn norm_group_witnesses(witness: &NormWitness) -> Vec<&NormGroupWitness> {
-    let mut groups = vec![
-        &witness.x,
+    let mut groups = vec![&witness.x];
+    match (&witness.low, &witness.high) {
+        (Some(low), Some(high)) => {
+            groups.push(low);
+            groups.push(high);
+        }
+        (None, None) => {}
+        _ => return Vec::new(),
+    }
+    groups.extend([
         &witness.sum,
         &witness.squares,
         &witness.mean,
         &witness.variance,
-    ];
+    ]);
     if let Some(round) = &witness.round {
         groups.push(round);
     }
@@ -19299,7 +20351,7 @@ fn prove_norm_lookup_first(
     if bits_tree.plan() != &bits_shape.tree_plan(0)? {
         return Err(Error::StatementMismatch);
     }
-    let bits_opening = bits_tree.open(&bits_positions[0])?;
+    let bits_opening = open_lookup_bits(&messages, bits_shape, bits_tree, &bits_positions[0])?;
     let mask_positions = draw_lookup_mask_positions(chain, lookup_plan, tags.mask_position)?;
     let mask_tree = messages.mask_tree(&lookup_plan.commit)?;
     if *mask_tree.root() != messages.mask_root {
@@ -19923,7 +20975,8 @@ fn prove_norm_first(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
-    for (tag, group_witness) in NORM_ROOT_TAGS.iter().zip(group_witnesses.iter()) {
+    let root_tags = norm_group_tags(norm, &NORM_ROOT_TAGS, NORM_LOW_ROOT_TAG, NORM_HIGH_ROOT_TAG);
+    for (tag, group_witness) in root_tags.iter().zip(group_witnesses.iter()) {
         absorb_closure_group(chain, *tag, &group_witness.committed.group)?;
     }
     let round_group = match (&norm.round, &witness.round) {
@@ -20005,8 +21058,9 @@ fn prove_norm_first(
     if let (Some(mask_plan), Some(mask_witness)) = (&norm.mask, mask_witness) {
         absorb_norm_mask_root(chain, mask_plan, &mask_witness.committed.root)?;
     }
+    let seed_tags = norm_group_tags(norm, &NORM_SEED_TAGS, NORM_LOW_SEED_TAG, NORM_HIGH_SEED_TAG);
     let mut seeds = Vec::with_capacity(groups.len());
-    for (tag, group_plan) in NORM_SEED_TAGS.iter().zip(groups.iter()) {
+    for (tag, group_plan) in seed_tags.iter().zip(groups.iter()) {
         seeds.push(draw_closure_seed_set(
             chain,
             *tag,
@@ -20047,7 +21101,13 @@ fn prove_norm_first(
             &group_witness.committed.messages,
             seed_set,
         )?;
-        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &values)?;
+        let answer_tags = norm_group_tags(
+            norm,
+            &NORM_ANSWER_TAGS,
+            NORM_LOW_ANSWER_TAG,
+            NORM_HIGH_ANSWER_TAG,
+        );
+        absorb_tagged_answers(chain, answer_tags[index], &values)?;
         answers.push(values);
     }
     let round_answers = match (&norm.round, round_group, round_seed.as_ref()) {
@@ -20086,9 +21146,15 @@ fn prove_norm_first(
         .zip(seeds.iter())
         .enumerate()
     {
+        let position_tags = norm_group_tags(
+            norm,
+            &NORM_POSITION_TAGS,
+            NORM_LOW_POSITION_TAG,
+            NORM_HIGH_POSITION_TAG,
+        );
         let positions = draw_closure_group_positions(
             chain,
-            NORM_POSITION_TAGS[index],
+            position_tags[index],
             positions,
             group_plan.openings,
             group_plan.shape.code.log_n,
@@ -20247,7 +21313,8 @@ fn prove_norm_first(
             if bits_tree.plan() != &bits_shape.tree_plan(0)? {
                 return Err(Error::StatementMismatch);
             }
-            let bits_opening = bits_tree.open(&bits_positions[0])?;
+            let bits_opening =
+                open_lookup_bits(&messages, bits_shape, bits_tree, &bits_positions[0])?;
             let mask_positions = draw_rstd_mask_positions(chain, rstd_plan)?;
             let mask_tree = messages.mask_tree(&rstd_plan.commit)?;
             if *mask_tree.root() != messages.mask_root {
@@ -20603,9 +21670,20 @@ fn prove_norm_first(
         _ => return Err(Error::ShapeMismatch),
     };
     let mut iter = group_messages.into_iter();
+    let x = iter.next().ok_or(Error::ShapeMismatch)?;
+    let (low, high) = if norm.rms.is_some() {
+        (
+            Some(iter.next().ok_or(Error::ShapeMismatch)?),
+            Some(iter.next().ok_or(Error::ShapeMismatch)?),
+        )
+    } else {
+        (None, None)
+    };
     Ok((
         NormFirstMessages {
-            x: iter.next().ok_or(Error::ShapeMismatch)?,
+            x,
+            low,
+            high,
             sum: iter.next().ok_or(Error::ShapeMismatch)?,
             squares: iter.next().ok_or(Error::ShapeMismatch)?,
             mean: iter.next().ok_or(Error::ShapeMismatch)?,
@@ -20632,13 +21710,21 @@ fn verify_norm_first(
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = norm.shape.positions;
     let groups = norm_group_plans(norm);
-    let messages = [
-        &message.x,
+    let mut messages = vec![&message.x];
+    match (&message.low, &message.high) {
+        (Some(low), Some(high)) => {
+            messages.push(low);
+            messages.push(high);
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    messages.extend([
         &message.sum,
         &message.squares,
         &message.mean,
         &message.variance,
-    ];
+    ]);
     for (group_plan, message) in groups.iter().zip(messages.iter()) {
         if message.message.group.group != group_plan.group
             || message.fault(&group_plan.shape, positions).is_some()
@@ -20709,7 +21795,8 @@ fn verify_norm_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
-    for (tag, message) in NORM_ROOT_TAGS.iter().zip(messages.iter()) {
+    let root_tags = norm_group_tags(norm, &NORM_ROOT_TAGS, NORM_LOW_ROOT_TAG, NORM_HIGH_ROOT_TAG);
+    for (tag, message) in root_tags.iter().zip(messages.iter()) {
         absorb_closure_group(chain, *tag, &message.message.group)?;
     }
     if let (Some(round_plan), Some(message)) = (&norm.round, round) {
@@ -20719,7 +21806,8 @@ fn verify_norm_first(
     if let (Some(mask_plan), Some(mask)) = (&norm.mask, &message.mask) {
         absorb_norm_mask_root(chain, mask_plan, &mask.root)?;
     }
-    for (tag, (group_plan, message)) in NORM_SEED_TAGS
+    let seed_tags = norm_group_tags(norm, &NORM_SEED_TAGS, NORM_LOW_SEED_TAG, NORM_HIGH_SEED_TAG);
+    for (tag, (group_plan, message)) in seed_tags
         .iter()
         .zip(groups.iter().zip(messages.iter()))
     {
@@ -20759,7 +21847,13 @@ fn verify_norm_first(
         if message.sample.answers.len() != positions as usize {
             return Err(Error::ShapeMismatch);
         }
-        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &message.sample.answers)?;
+        let answer_tags = norm_group_tags(
+            norm,
+            &NORM_ANSWER_TAGS,
+            NORM_LOW_ANSWER_TAG,
+            NORM_HIGH_ANSWER_TAG,
+        );
+        absorb_tagged_answers(chain, answer_tags[index], &message.sample.answers)?;
     }
     if let Some(round) = round {
         absorb_tagged_answers(chain, NORM_ROUND_ANSWER_TAG, &round.sample.answers)?;
@@ -20768,9 +21862,15 @@ fn verify_norm_first(
         absorb_tagged_answers(chain, NORM_MASK_ANSWER_TAG, &mask.sample.answers)?;
     }
     for (index, (group_plan, message)) in groups.iter().zip(messages.iter()).enumerate() {
+        let position_tags = norm_group_tags(
+            norm,
+            &NORM_POSITION_TAGS,
+            NORM_LOW_POSITION_TAG,
+            NORM_HIGH_POSITION_TAG,
+        );
         let positions = draw_closure_group_positions(
             chain,
-            NORM_POSITION_TAGS[index],
+            position_tags[index],
             positions,
             group_plan.openings,
             group_plan.shape.code.log_n,
@@ -22169,13 +23269,9 @@ pub(crate) fn lookup_group_rows(
     multiplicity.add_term(
         bits_oracle,
         BatPart::Main,
-        scatter_message_coefficients(
-            &commit.bits_shape,
-            bits_columns as u64,
-            &claims.multiplicity.0,
-        )?,
+        scatter_multiplicity(&commit.bits_shape, &claims.multiplicity)?,
     );
-    multiplicity.target = claims.multiplicity.1;
+    multiplicity.target = claims.multiplicity.total;
     rows.push(multiplicity);
 
     // The leaf kept-map row and the bit summand's hiding and shown-end claims
@@ -22300,7 +23396,8 @@ fn lookup_plain_rows(
     lookup_plan: &dyn crate::proof::hidden_norm_psc::NormLookupView,
     members: &[ProximityMember],
     binding: &NormLookupSecond,
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let round_plan = norm.round.as_ref().ok_or(Error::UnsupportedPrimitive)?;
     let lookup = lookup_plan.lookup_plan();
@@ -22308,9 +23405,6 @@ fn lookup_plain_rows(
     let claims = &binding.claims;
     let planes = lookup.planes()?;
     let table_rows = lookup.table_rows()?;
-    let bits_columns = planes
-        .checked_mul(table_rows)
-        .ok_or(Error::ResourceLimit)?;
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
         bat_of.insert(member.source_oracle, member);
@@ -22333,7 +23427,6 @@ fn lookup_plain_rows(
     {
         return Err(Error::StatementMismatch);
     }
-    let mut rows = Vec::new();
 
     // The key-leaf claim expanded on the committed key group cells. The
     // frozen-table view keeps no group of its own and uses the rounding group;
@@ -22372,23 +23465,25 @@ fn lookup_plain_rows(
             columns: group.columns,
         });
     }
-    rows.push(lookup_plan.key_plan().registration_row(
+    emit(lookup_plan.key_plan().registration_row(
         lookup,
         &claims.key,
         claims.theta,
         &key_members,
         mask_member.bat_oracle,
         &|slot| lookup_mask_virtual_index(commit, slot),
-    )?);
+    )?)?;
 
-    rows.extend(lookup_group_rows(
+    for row in lookup_group_rows(
         lookup,
         commit,
         claims,
         bits_member.bat_oracle,
         mask_member.bat_oracle,
-    )?);
-    Ok(rows)
+    )? {
+        emit(row)?;
+    }
+    Ok(())
 }
 
 /// The mask-form sample row of a lookup mask message: the equality table
@@ -22553,13 +23648,9 @@ fn digit_lookup_rows(
     multiplicity.add_term(
         bits_member.bat_oracle,
         BatPart::Main,
-        scatter_message_coefficients(
-            &commit.bits_shape,
-            bits_columns as u64,
-            &claims.multiplicity.0,
-        )?,
+        scatter_multiplicity(&commit.bits_shape, &claims.multiplicity)?,
     );
-    multiplicity.target = claims.multiplicity.1;
+    multiplicity.target = claims.multiplicity.total;
     rows.push(multiplicity);
     let leaf_index = (planes - 1)
         .checked_add(lookup.key_bits as usize)
@@ -22810,17 +23901,16 @@ struct RequestRows {
     psi_star: Vec<Fp3>,
 }
 
-fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
-    let mut rows = Vec::with_capacity(2);
-    rows.push(request_eval_row(
+fn request_rows(request: &RequestRows, emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
+    emit(request_eval_row(
         request.w_layout,
         request.w_columns,
         request.w_oracle,
         &request.psi,
         &request.masks,
         request.target,
-    )?);
-    rows.push(request_dot_row(
+    )?)?;
+    emit(request_dot_row(
         request.omega_layout,
         request.omega_columns,
         request.omega_oracle,
@@ -22829,8 +23919,8 @@ fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
         request.w_columns,
         request.w_oracle,
         &request.psi_star,
-    )?);
-    Ok(rows)
+    )?)?;
+    Ok(())
 }
 
 /// The trusted-layout binding of the pending claim's mask terms: for each term,
@@ -22921,20 +24011,21 @@ fn request_rows_bundle(
     }))
 }
 
-fn scatter_message_coefficients(
+fn scatter_message_coefficients_with<F>(
     shape: &WShape,
     columns: u64,
-    coefficients: &[Fp3],
-) -> Result<Vec<Fp3>> {
+    mut coefficient: F,
+) -> Result<Vec<Fp3>>
+where
+    F: FnMut(usize) -> Result<Fp3>,
+{
     let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
     let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
-    for (column, coefficient) in coefficients
-        .iter()
-        .enumerate()
-        .take(usize::try_from(columns).map_err(|_| Error::ResourceLimit)?)
-    {
-        if coefficient.is_zero() {
+    let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    for column in 0..count {
+        let value = coefficient(column)?;
+        if value.is_zero() {
             continue;
         }
         let row = column % rows;
@@ -22942,9 +24033,35 @@ fn scatter_message_coefficients(
         let slot = values
             .get_mut(row * ell + place)
             .ok_or(Error::ShapeMismatch)?;
-        *slot = *coefficient;
+        *slot = value;
     }
     to_bat_table(&values, shape.main_rows, shape.code.ell)
+}
+
+fn scatter_message_coefficients(
+    shape: &WShape,
+    columns: u64,
+    coefficients: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    scatter_message_coefficients_with(shape, columns, |column| {
+        Ok(coefficients.get(column).copied().unwrap_or(Fp3::ZERO))
+    })
+}
+
+/// The multiplicity row's coefficients on the committed multiplicity bits:
+/// entry `plane + planes * row` weighs `2^plane`, filled from the rule so the
+/// derivable payload vector is never materialized.
+fn scatter_multiplicity(
+    shape: &WShape,
+    rule: &crate::proof::lookup::MultiplicityRule,
+) -> Result<Vec<Fp3>> {
+    let columns = rule
+        .planes
+        .checked_mul(rule.rows)
+        .ok_or(Error::ResourceLimit)?;
+    scatter_message_coefficients_with(shape, columns as u64, |column| {
+        rule.coefficient(column % rule.planes, column / rule.planes)
+    })
 }
 
 fn scalar_message_coefficients(shape: &WShape, coefficient: Fp3) -> Result<Vec<Fp3>> {
@@ -22974,7 +24091,8 @@ fn norm_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &NormRowBinding,
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let mask_plan = norm.mask.as_ref().ok_or(Error::InvalidConfig)?;
     let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
@@ -23001,7 +24119,6 @@ fn norm_plain_rows(
     }
     let valid = norm.shape.valid as usize;
     let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
-    let mut rows = Vec::with_capacity(binding.positions.len());
     for (index, word) in binding.positions.iter().enumerate() {
         let position = index / relations;
         let relation_index = index % relations;
@@ -23101,7 +24218,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 row.target = word.output.ends[0].value;
-                rows.push(row);
+                emit(row)?;
 
                 let constant = eq_sum.add(&eq[columns]);
                 let mut row = BatRow::new(BatRowKind::Plain);
@@ -23112,7 +24229,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 row.target = word.output.ends[1].value.sub(&constant);
-                rows.push(row);
+                emit(row)?;
             }
             1 => {
                 let mean_member = bat_of
@@ -23162,7 +24279,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_term(
@@ -23185,7 +24302,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
-                rows.push(right);
+                emit(right)?;
             }
             2 => {
                 let sum_member = bat_of
@@ -23229,7 +24346,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23240,7 +24357,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             3 => {
                 let squares_member = bat_of
@@ -23290,7 +24407,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23301,7 +24418,326 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
+            }
+            26..=28 => {
+                // The three bounded partial sums: both factors are one limb
+                // row and the extra slot subtracts the committed scalar.
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let limb_member = |oracle: u64| -> Result<&ProximityMember> {
+                    bat_of
+                        .get(&oracle)
+                        .copied()
+                        .ok_or(Error::StatementMismatch)
+                };
+                let (left_group, right_group, scalar_group) = match word.relation {
+                    26 => (&rms.low, &rms.low, &norm.sum),
+                    27 => (&rms.low, &rms.high, &norm.squares),
+                    _ => (&rms.high, &rms.high, &norm.mean),
+                };
+                let left_member =
+                    limb_member(left_group.oracle_base + position as u64)?;
+                let right_member =
+                    limb_member(right_group.oracle_base + position as u64)?;
+                let scalar_member = bat_of
+                    .get(
+                        &scalar_group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    left_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &left_group.shape,
+                        norm.columns,
+                        &x_coefficients,
+                    )?,
+                );
+                left.add_term(
+                    scalar_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &scalar_group.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                emit(left)?;
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_term(
+                    right_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &right_group.shape,
+                        norm.columns,
+                        &x_coefficients,
+                    )?,
+                );
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&eq[columns]);
+                emit(right)?;
+            }
+            29 => {
+                // x - lo - 2^16 hi = 0 on the valid columns. The left form
+                // carries all three committed groups; the right form is the
+                // public valid-column sum.
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let limb_member = |oracle: u64| -> Result<&ProximityMember> {
+                    bat_of
+                        .get(&oracle)
+                        .copied()
+                        .ok_or(Error::StatementMismatch)
+                };
+                let low_member = limb_member(rms.low.oracle_base + position as u64)?;
+                let high_member = limb_member(rms.high.oracle_base + position as u64)?;
+                let mut low_coefficients = vec![Fp3::ZERO; 2 * columns];
+                let mut high_coefficients = vec![Fp3::ZERO; 2 * columns];
+                let factor = crate::proof::output_closure::fp3_signed(1 << 16)?;
+                for entry in 0..valid.min(columns) {
+                    low_coefficients[entry] = Fp3::ZERO.sub(&eq[entry]);
+                    high_coefficients[entry] = Fp3::ZERO.sub(&eq[entry].mul(&factor));
+                }
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&norm.x.shape, norm.columns, &x_coefficients)?,
+                );
+                left.add_term(
+                    low_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&rms.low.shape, norm.columns, &low_coefficients)?,
+                );
+                left.add_term(
+                    high_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &rms.high.shape,
+                        norm.columns,
+                        &high_coefficients,
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                emit(left)?;
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&eq_sum);
+                emit(right)?;
+            }
+            30..=32 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let (start, width, value_group, offset) = match word.relation {
+                    30 => (rms_slots.s_ll_digits, 5usize, &norm.sum, 0i128),
+                    31 => (
+                        rms_slots.s_lh_digits,
+                        6,
+                        &norm.squares,
+                        crate::proof::rms_limbs::CROSS_OFFSET,
+                    ),
+                    _ => (rms_slots.s_hh_digits, 6, &norm.mean, 0),
+                };
+                let value_member = bat_of
+                    .get(
+                        &value_group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                if width >= columns {
+                    return Err(Error::ShapeMismatch);
+                }
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let mut power = Fp3::ONE;
+                for index in 0..width {
+                    let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
+                    *entry = power.mul(&eq[index]);
+                    power = power.mul(&Fp3::from_u64(256));
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut constant = eq[..width]
+                    .iter()
+                    .fold(Fp3::ZERO, |sum, value| sum.add(value))
+                    .add(&eq[columns]);
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_term(
+                    value_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &value_group.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                if offset != 0 {
+                    left.target = word.output.ends[0].value.add(
+                        &crate::proof::output_closure::fp3_signed(offset)?
+                            .mul(&eq[width]),
+                    );
+                    constant = constant.add(&eq[width]);
+                } else {
+                    left.target = word.output.ends[0].value;
+                }
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                emit(left)?;
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                emit(right)?;
+            }
+            33..=72 | 73..=92 | 94..=95 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let (terms, constant) =
+                    crate::proof::hidden_norm_psc::rms_relation_terms(word.relation, &rms_slots)?;
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let mut constant_sum = Fp3::ZERO;
+                for (index, (slot, coefficient)) in terms.iter().enumerate() {
+                    let entry = dense.get_mut(*slot).ok_or(Error::ShapeMismatch)?;
+                    *entry = entry.add(&crate::proof::output_closure::fp3_signed(*coefficient)?
+                        .mul(&eq[index]));
+                    constant_sum = constant_sum.add(&eq[index]);
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0]
+                    .value
+                    .sub(&crate::proof::output_closure::fp3_signed(constant)?.mul(&eq[columns]));
+                emit(left)?;
+
+                let constant = constant_sum.add(&eq[columns]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                emit(right)?;
+            }
+            93 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let variance_member = bat_of
+                    .get(
+                        &norm
+                            .variance
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let (terms, _constant) =
+                    crate::proof::hidden_norm_psc::rms_relation_terms(93, &rms_slots)?;
+                for (index, (slot, coefficient)) in terms.iter().enumerate() {
+                    let entry = dense.get_mut(*slot).ok_or(Error::ShapeMismatch)?;
+                    *entry = entry.add(
+                        &crate::proof::output_closure::fp3_signed(*coefficient)?.mul(&eq[index]),
+                    );
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_term(
+                    variance_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.variance.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                emit(left)?;
+                let constant = eq[..8]
+                    .iter()
+                    .fold(Fp3::ZERO, |sum, value| sum.add(value))
+                    .add(&eq[columns]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                emit(right)?;
             }
             26 => {
                 // The RMS statistic: both factors are the committed x row,
@@ -23394,7 +24830,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value.add(&constant);
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23405,7 +24841,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             6 | 7 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23437,7 +24873,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value.add(&constant);
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23448,7 +24884,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             8..=15 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23609,7 +25045,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown0)?,
                     word.output.ends[0].mask_scale,
                 );
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_unit(
@@ -23619,7 +25055,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             16..=25 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23782,8 +25218,8 @@ fn norm_plain_rows(
                             eq[2],
                             &mut left_slots,
                         );
-                        left_slots.push((layout.slots.coarse_r + 1, eq[3]));
-                        left_slots.push((layout.slots.coarse_r, eq[4]));
+                        left_slots.push((layout.slots.coarse_r, eq[3]));
+                        left_slots.push((layout.slots.coarse_r + 1, eq[4]));
                         push_digit_coefficients(
                             layout.slots.raw_digits,
                             widths.raw(),
@@ -23793,8 +25229,8 @@ fn norm_plain_rows(
                         right_constant = right_constant
                             .add(&eq[1].mul(&signed(-(RSQRT_COARSE_END as i128))?))
                             .add(&eq[2].mul(&signed(-65_536)?))
-                            .add(&eq[3].mul(&signed(-256)?))
-                            .sub(&eq[4]);
+                            .sub(&eq[3])
+                            .add(&eq[4].mul(&signed(-256)?));
                     }
                     24 => {
                         left_slots.push((layout.slots.index_value, eq[0]));
@@ -23868,7 +25304,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown0)?,
                     word.output.ends[0].mask_scale,
                 );
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 if !right_slots.is_empty() {
@@ -23885,7 +25321,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown1)?,
                     word.output.ends[1].mask_scale,
                 );
-                rows.push(right);
+                emit(right)?;
             }
             _ => return Err(Error::UnsupportedPrimitive),
         }
@@ -23900,9 +25336,9 @@ fn norm_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn closure_plain_rows(
@@ -23910,13 +25346,21 @@ fn closure_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &ClosureRowBinding,
-) -> Result<Vec<BatRow>> {
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     let closure_plan = plan.closure.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = plan.send.positions() as usize;
+    // The plan's own fault allows the unmasked form, where the full padded
+    // domain is valid (valid == vocab) and the mask constant is zero; the
+    // masked form requires a proper boundary below the padded domain.
+    let vocabulary = if closure_plan.masked {
+        closure_plan.valid > 0 && closure_plan.valid < closure_plan.vocab
+    } else {
+        closure_plan.valid == closure_plan.vocab
+    };
     if binding.positions.len() != positions
         || closure_plan.winner.len() != positions
-        || closure_plan.valid == 0
-        || closure_plan.valid >= closure_plan.vocab
+        || !vocabulary
     {
         return Err(Error::ShapeMismatch);
     }
@@ -23930,12 +25374,11 @@ fn closure_plain_rows(
         usize::try_from(closure_plan.slack.main_rows).map_err(|_| Error::ResourceLimit)?;
     let slack_ell =
         usize::try_from(closure_plan.slack.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let bits_rows =
-        usize::try_from(closure_plan.bits.main_rows).map_err(|_| Error::ResourceLimit)?;
-    let bits_ell =
-        usize::try_from(closure_plan.bits.code.ell).map_err(|_| Error::ResourceLimit)?;
     let bits_columns = usize::try_from(closure_plan.bits_columns)
         .map_err(|_| Error::ResourceLimit)?;
+    let bit_block_rows = usize::try_from(closure_plan.bits.main_rows)
+        .map_err(|_| Error::ResourceLimit)?
+        / positions;
     let k = closure_plan.boolean_variables as usize;
     let k_col = closure_plan.vocab.trailing_zeros() as usize;
     let offset = closure_plan.offset()? as i128;
@@ -23955,7 +25398,6 @@ fn closure_plain_rows(
         .map(|word| word.r_bool.as_slice())
         .unwrap_or(&[]);
     let eq_r = crate::proof::output_closure::eq_vector(shared_r_bool)?;
-    let mut rows = Vec::with_capacity(positions * 7);
     for position in 0..positions {
         let word = &binding.positions[position];
         if word.r_bool.len() != k
@@ -23978,21 +25420,13 @@ fn closure_plain_rows(
                     .ok_or(Error::ResourceLimit)?,
             )
             .ok_or(Error::StatementMismatch)?;
+        // The stacked classes carry one member each; every position's rows
+        // address the same member through the block offset.
         let bits_member = bat_of
-            .get(
-                &closure_plan
-                    .bits_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-            )
+            .get(&closure_plan.bits_oracle_base)
             .ok_or(Error::StatementMismatch)?;
         let map_member = bat_of
-            .get(
-                &closure_plan
-                    .map_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-            )
+            .get(&closure_plan.map_oracle_base)
             .ok_or(Error::StatementMismatch)?;
         let winner = closure_plan.winner[position] as usize;
 
@@ -24030,7 +25464,7 @@ fn closure_plain_rows(
                 .mul(&masked_sum)
                 .add(&low_sum),
         );
-        rows.push(row);
+        emit(row)?;
 
         // Reconstruction at one random point: u = Y + A, v = A - Y and the
         // slack bit vector equal the committed slack message.
@@ -24041,7 +25475,7 @@ fn closure_plain_rows(
             return Err(Error::ShapeMismatch);
         }
         for (which, target) in [(0u8, offset), (1u8, offset), (2u8, 0i128)] {
-            let mut bit_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
+            let mut bit_coefficients = vec![Fp3::ZERO; bits_columns];
             let mut main_coefficients = if which < 2 {
                 vec![Fp3::ZERO; w_rows * w_ell]
             } else {
@@ -24072,14 +25506,21 @@ fn closure_plain_rows(
                 }
             }
             let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_term(bits_member.bat_oracle, BatPart::Main, bit_coefficients);
+            push_block_runs(
+                &mut row,
+                bits_member.bat_oracle,
+                position,
+                bit_block_rows,
+                closure_plan.bits.main_rows,
+                &bit_coefficients,
+            )?;
             if which < 2 {
                 row.add_term(w_member.bat_oracle, BatPart::Main, main_coefficients);
             } else {
                 row.add_term(slack_member.bat_oracle, BatPart::Main, main_coefficients);
             }
             row.target = crate::proof::output_closure::fp3_signed(target)?;
-            rows.push(row);
+            emit(row)?;
         }
 
         let shown0 = closure_plan.mask.shown_slot(position as u32, 0)?;
@@ -24093,10 +25534,15 @@ fn closure_plain_rows(
         if eq_point.len() != bits_columns {
             return Err(Error::InvalidProof);
         }
-        let mut coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        coefficients[..bits_columns].copy_from_slice(&eq_point);
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(map_member.bat_oracle, BatPart::Main, coefficients);
+        push_block_runs(
+            &mut row,
+            map_member.bat_oracle,
+            position,
+            bit_block_rows,
+            closure_plan.map.main_rows,
+            &eq_point,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24104,13 +25550,18 @@ fn closure_plain_rows(
             word.output.ends[0].mask_scale,
         );
         row.target = word.output.ends[0].value;
-        rows.push(row);
+        emit(row)?;
 
         // The committed bit map at the booleanity point, one-time masked.
-        let mut coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        coefficients[..bits_columns].copy_from_slice(&eq_point);
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(bits_member.bat_oracle, BatPart::Main, coefficients);
+        push_block_runs(
+            &mut row,
+            bits_member.bat_oracle,
+            position,
+            bit_block_rows,
+            closure_plan.bits.main_rows,
+            &eq_point,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24118,7 +25569,7 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.b_point;
-        rows.push(row);
+        emit(row)?;
 
         // The virtual second map is affine in the committed bits:
         // Omega(pt) = 1 - B(pt).
@@ -24141,7 +25592,7 @@ fn closure_plain_rows(
             .value
             .sub(&Fp3::ONE)
             .add(&word.b_point);
-        rows.push(row);
+        emit(row)?;
 
         // (U): the hiding coefficients against the last-round target.
         let mut row = BatRow::new(BatRowKind::Plain);
@@ -24155,7 +25606,7 @@ fn closure_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
 
         // D = eq(r, .) B at a fresh point, checked by two public linear
         // functionals of the committed messages and one equality row.
@@ -24166,14 +25617,19 @@ fn closure_plain_rows(
         if eq_q.len() != bits_columns || eq_r.len() != bits_columns {
             return Err(Error::InvalidProof);
         }
-        let mut d_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        d_coefficients[..bits_columns].copy_from_slice(&eq_q);
-        let mut b_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
+        let mut b_coefficients = vec![Fp3::ZERO; bits_columns];
         for entry in 0..bits_columns {
             b_coefficients[entry] = eq_q[entry].mul(&eq_r[entry]);
         }
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(map_member.bat_oracle, BatPart::Main, d_coefficients);
+        push_block_runs(
+            &mut row,
+            map_member.bat_oracle,
+            position,
+            bit_block_rows,
+            closure_plan.map.main_rows,
+            &eq_q,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24181,9 +25637,16 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.d_value;
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(bits_member.bat_oracle, BatPart::Main, b_coefficients);
+        push_block_runs(
+            &mut row,
+            bits_member.bat_oracle,
+            position,
+            bit_block_rows,
+            closure_plan.bits.main_rows,
+            &b_coefficients,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24191,7 +25654,7 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.bq_value;
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_unit(
             mask.bat_oracle,
@@ -24206,9 +25669,9 @@ fn closure_plain_rows(
             Fp3::ZERO.sub(&Fp3::ONE),
         );
         row.target = word.d_value.sub(&word.bq_value);
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// The committed column message of one output group as a BAT coefficient
@@ -24240,7 +25703,8 @@ fn output_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &[crate::proof::hidden_norm_psc::NormOutputBinding],
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
     let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
@@ -24284,7 +25748,6 @@ fn output_plain_rows(
         .gain_claim
         .as_ref()
         .ok_or(Error::InvalidConfig)?;
-    let mut rows = Vec::with_capacity(binding.len() * 4);
     for word in binding {
         let position = word.position as usize;
         if position >= positions || word.kind > 1 {
@@ -24323,7 +25786,7 @@ fn output_plain_rows(
             Fp3::ONE,
         );
         row.target = word.claim;
-        rows.push(row);
+        emit(row)?;
 
         let shown0 = mask_plan.pointwise_shown_slot(instances, instance, 0)?;
         let shown1 = mask_plan.pointwise_shown_slot(instances, instance, 1)?;
@@ -24394,7 +25857,7 @@ fn output_plain_rows(
             mask_plan.entry_virtual_index(shown0)?,
             end0.mask_scale,
         );
-        rows.push(row);
+        emit(row)?;
 
         let mut row = BatRow::new(BatRowKind::Plain);
         match word.kind {
@@ -24424,7 +25887,7 @@ fn output_plain_rows(
             mask_plan.entry_virtual_index(shown1)?,
             end1.mask_scale,
         );
-        rows.push(row);
+        emit(row)?;
 
         let mut row = BatRow::new(BatRowKind::Plain);
         for (index, coefficient) in word.output.hiding_form.iter().enumerate() {
@@ -24445,9 +25908,9 @@ fn output_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Adds one tail relation factor to its coefficient vector: a committed tail
@@ -24493,6 +25956,21 @@ fn output_tail_plain_rows(
     first: &HiddenSendMessages,
     binding: &[crate::proof::hidden_norm_psc::NormTailBinding],
 ) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::new();
+    output_tail_plain_rows_each(plan, members, first, binding, &mut |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+fn output_tail_plain_rows_each(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    binding: &[crate::proof::hidden_norm_psc::NormTailBinding],
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     use crate::proof::hidden_norm_psc::{
         output_rel_terms, output_tail_variables, NORM_OUTPUT_TAIL_PAIRS,
     };
@@ -24546,7 +26024,6 @@ fn output_tail_plain_rows(
             .copied()
             .ok_or(Error::StatementMismatch)
     };
-    let mut rows = Vec::with_capacity(binding.len() * 3);
     for word in binding {
         let position = word.position as usize;
         if position >= positions || word.relation >= crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS {
@@ -24621,7 +26098,7 @@ fn output_tail_plain_rows(
             end0.mask_scale,
         );
         row.target = end0.value.sub(&left_constant);
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(tail_member.bat_oracle, BatPart::Main, tail_right);
         row.add_term(image_member.bat_oracle, BatPart::Main, image_right);
@@ -24633,7 +26110,7 @@ fn output_tail_plain_rows(
             end1.mask_scale,
         );
         row.target = end1.value.sub(&right_constant);
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         for (index, coefficient) in output.hiding_form.iter().enumerate() {
             let slot = mask_plan.tail_hiding_slot(instances, instance, index)?;
@@ -24645,7 +26122,7 @@ fn output_tail_plain_rows(
             );
         }
         row.target = output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
     // The clamp distance rows: one per position and column binds each
     // committed distance row to pre_clamp minus low (and the high side) over
@@ -24699,12 +26176,12 @@ fn output_tail_plain_rows(
                     row.target = crate::proof::output_closure::fp3_signed(
                         bound_half as i128 - pre_half as i128 - bound,
                     )?;
-                    rows.push(row);
+                    emit(row)?;
                 }
             }
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// The BAT rows of the bias addition: `pre_clamp = shifted + bias` at one
@@ -24879,6 +26356,10 @@ fn output_tail_padding_rows(
                 );
                 power = power.mul(&Fp3::from_u64(256));
             }
+
+            let mut row = BatRow::new(BatRowKind::Plain);
+            row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
+
             if let (Some(claim), Some(bias_member)) = (bias_claim, bias_member) {
                 let mut unit = vec![Fp3::ZERO; bits];
                 for bit in 0..bits {
@@ -24886,21 +26367,29 @@ fn output_tail_padding_rows(
                         unit[bit] = Fp3::ONE;
                     }
                 }
-                let index = gu_vector_bat_index(&claim.gu, column as u64)?;
-                let eq = crate::proof::output_closure::eq_vector(&unit)?;
-                let coefficient = eq.get(column).copied().ok_or(Error::ShapeMismatch)?;
-                row.add_unit(
-                    bias_member.bat_oracle,
-                    BatPart::Main,
-                    u64::try_from(index).map_err(|_| Error::ResourceLimit)?,
-                    Fp3::ZERO.sub(&coefficient),
-                );
+
+                let bias_coefficients =
+                    norm_param_eval_coefficients(&claim.gu, norm.columns, &unit)?;
+                let negated: Vec<Fp3> = bias_coefficients
+                    .iter()
+                    .map(|value| Fp3::ZERO.sub(value))
+                    .collect();
+                row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+
             }
             row.target = target;
             rows.push(row);
         }
     }
     Ok(rows)
+}
+
+/// Ownership of the request-chain rows the own stage rebinds and appends.
+/// The prover hands its rows over so the rebind reuses the same allocation;
+/// a verifier that still reads its rows keeps a borrowed copy.
+enum ChainRows<'a> {
+    Borrowed(&'a [BatRow]),
+    Owned(Vec<BatRow>),
 }
 
 fn own_plain_rows(
@@ -24913,8 +26402,41 @@ fn own_plain_rows(
     closure: Option<&ClosureRowBinding>,
     norm: Option<&NormRowBinding>,
     request: Option<&RequestRows>,
-    chain_rows: &[BatRow],
+    chain_rows: ChainRows<'_>,
 ) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::new();
+    own_plain_rows_each(
+        plan,
+        members,
+        first,
+        shared_point,
+        tilde,
+        dot,
+        closure,
+        norm,
+        request,
+        chain_rows,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
+
+fn own_plain_rows_each(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    shared_point: &[Fp3],
+    tilde: &[Fp3],
+    dot: Option<&DotRowBinding>,
+    closure: Option<&ClosureRowBinding>,
+    norm: Option<&NormRowBinding>,
+    request: Option<&RequestRows>,
+    chain_rows: ChainRows<'_>,
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
         bat_of.insert(member.source_oracle, member);
@@ -24958,8 +26480,8 @@ fn own_plain_rows(
         usize::try_from(plan.proximity.omega.u.main_rows).map_err(|_| Error::ResourceLimit)?;
     let omega_ell =
         usize::try_from(plan.proximity.omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let mut rows = Vec::with_capacity(2 * plan.send.positions() as usize);
     let eq_bits = plan.send.columns.trailing_zeros() as usize;
+    let _profile_eval_rows = zkie_engine::profile::Scope::new("second.plain.eval");
     for position in 0..plan.send.positions() {
         let member = bat_of
             .get(&plan.send.oracle(position)?)
@@ -24989,7 +26511,7 @@ fn own_plain_rows(
             );
         }
         row.target = first.eval_targets[position as usize];
-        rows.push(row);
+        emit(row)?;
     }
     if let Some(index) = &plan.send.index_mask {
         if tilde.len() != plan.send.positions() as usize {
@@ -25019,7 +26541,7 @@ fn own_plain_rows(
                 Fp3::ONE,
             );
             row.target = tilde[position as usize];
-            rows.push(row);
+            emit(row)?;
         }
     }
     // The diagnostic Dot row is linear in the reduced row with the public
@@ -25058,53 +26580,75 @@ fn own_plain_rows(
             let mut row = BatRow::new(BatRowKind::Plain);
             row.add_term(omega.bat_oracle, BatPart::Main, omega_coefficients);
             row.add_term(w_member.bat_oracle, BatPart::Main, w_coefficients);
-            rows.push(row);
+            emit(row)?;
         }
     }
+    drop(_profile_eval_rows);
     if let Some(binding) = dot {
-        rows.extend(dot_plain_rows(plan, members, binding)?);
+        let _scope = zkie_engine::profile::Scope::new("second.plain.dot");
+        for row in dot_plain_rows(plan, members, binding)? {
+            emit(row)?;
+        }
     }
     if let Some(request) = request {
-        rows.extend(request_rows(request)?);
+        let _scope = zkie_engine::profile::Scope::new("second.plain.request");
+        request_rows(request, emit)?;
     }
     if let Some(binding) = closure {
-        rows.extend(closure_plain_rows(plan, members, first, binding)?);
+        let _scope = zkie_engine::profile::Scope::new("second.plain.closure");
+        closure_plain_rows(plan, members, first, binding, emit)?;
     }
     if let Some(binding) = norm {
-        rows.extend(norm_plain_rows(plan, members, first, binding)?);
+        let _scope = zkie_engine::profile::Scope::new("second.plain.norm");
+        norm_plain_rows(plan, members, first, binding, emit)?;
         if let Some(output) = &binding.output {
-            rows.extend(output_plain_rows(plan, members, first, output)?);
+            let _scope = zkie_engine::profile::Scope::new("second.plain.output");
+            output_plain_rows(plan, members, first, output, emit)?;
         }
         if let Some(tail) = &binding.tail {
-            rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
+            let _scope = zkie_engine::profile::Scope::new("second.plain.tail");
+            output_tail_plain_rows_each(plan, members, first, tail, emit)?;
         }
         if let Some(point) = &binding.bias_point {
-            rows.extend(output_tail_bias_rows(plan, members, point)?);
-            rows.extend(output_tail_padding_rows(plan, members)?);
+            let _scope = zkie_engine::profile::Scope::new("second.plain.bias");
+            for row in output_tail_bias_rows(plan, members, point)? {
+                emit(row)?;
+            }
+            for row in output_tail_padding_rows(plan, members)? {
+                emit(row)?;
+            }
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
-            rows.extend(lookup_plain_rows(
+            let _scope = zkie_engine::profile::Scope::new("second.plain.lookup");
+            lookup_plain_rows(
                 plan,
                 norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 lookup,
-            )?);
+                emit,
+            )?;
         }
         if let Some(rstd) = &binding.rstd {
-            rows.extend(lookup_plain_rows(
+            let _scope = zkie_engine::profile::Scope::new("second.plain.rstd");
+            lookup_plain_rows(
                 plan,
                 norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 rstd,
-            )?);
+                emit,
+            )?;
         }
     }
     // The request chain segment's remaining relations ride the same own group,
     // on the segment's committed mask table. Their units name the plan's
     // source oracle; the group's BAT registration id is the member's.
-    let mut rebound = chain_rows.to_vec();
-    for row in &mut rebound {
+    let _profile_chain_rows = zkie_engine::profile::Scope::new("second.plain.chain");
+    let mut chain_rows = match chain_rows {
+        ChainRows::Borrowed(rows) => rows.to_vec(),
+        ChainRows::Owned(rows) => rows,
+    };
+    for row in &mut chain_rows {
         for unit in &mut row.units {
             let member = bat_of
                 .get(&unit.oracle)
@@ -25112,8 +26656,10 @@ fn own_plain_rows(
             unit.oracle = member.bat_oracle;
         }
     }
-    rows.extend_from_slice(&rebound);
-    Ok(rows)
+    for row in chain_rows {
+        emit(row)?;
+    }
+    Ok(())
 }
 
 /// The masked Dot right-hand side: `W_t(psi*) + g_t` from the committed `W`
@@ -25779,12 +27325,12 @@ fn prove_second(
     first_query: &Digest,
     shared: &HiddenSharedMessages,
     shared_witness: &SharedWitness,
-    witness: &HiddenSendWitness,
+    witness: &mut HiddenSendWitness,
     shared_point: &[Fp3],
     seed: &Digest,
     bind_residual: bool,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
-    chain_rows: &[BatRow],
+    chain_rows: Vec<BatRow>,
 ) -> Result<OwnProveResult> {
     let _profile_second = zkie_engine::profile::Scope::new("second.prove_second");
     let _profile_own_members = zkie_engine::profile::Scope::new("second.own_members");
@@ -25795,6 +27341,11 @@ fn prove_second(
         Some(witness),
         Some((&shared_witness.omega_message, &shared_witness.omega_tails)),
     )?;
+    // The own members own their message rows now; the encoded closure
+    // value-group messages and their private randomness are not read again.
+    if let Some(closure) = witness.closure.as_mut() {
+        closure.release_committed_messages();
+    }
     drop(_profile_own_members);
     let _profile_tilde = zkie_engine::profile::Scope::light("second.tilde");
     let tilde = match &plan.send.index_mask {
@@ -25858,24 +27409,41 @@ fn prove_second(
         (None, None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
-    let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
-    let sample_rows = own_sample_rows(plan, &members, first, Some(shared))?;
-    drop(_profile_sample_rows);
-    let _profile_plain_rows = zkie_engine::profile::Scope::new("second.plain_rows");
+
+
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
-    let plain_rows = own_plain_rows(
-        plan,
-        &members,
-        first,
-        shared_point,
-        &tilde,
-        dot_binding.as_ref(),
-        closure_binding.as_ref(),
-        norm_binding.as_ref(),
-        request_bundle.as_ref(),
-        chain_rows,
-    )?;
-    drop(_profile_plain_rows);
+    let deferred_samples = plan.proximity.own_deferred_samples;
+    if plan.closure.is_some() && !deferred_samples {
+        return Err(Error::InvalidConfig);
+    }
+    let mut streaming_chain_rows = Some(chain_rows);
+    let mut plain_stream =
+        |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
+            let chain_rows = streaming_chain_rows
+                .take()
+                .ok_or(Error::InvalidSessionState)?;
+            own_plain_rows_each(
+                plan,
+                members,
+                first,
+                shared_point,
+                &tilde,
+                dot_binding.as_ref(),
+                closure_binding.as_ref(),
+                norm_binding.as_ref(),
+                request_bundle.as_ref(),
+                ChainRows::Owned(chain_rows),
+                sink,
+            )?;
+            if deferred_samples {
+                let _profile_sample_rows =
+                    zkie_engine::profile::Scope::new("second.sample_rows");
+                for member in members {
+                    member_samples_into(plan, member, first, shared, sink)?;
+                }
+            }
+            Ok(())
+        };
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -25890,27 +27458,53 @@ fn prove_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
-    let proximity = proximity_prove(
-        chain,
-        fold,
-        members,
-        ProximityTreeSource::Retained {
-            witness,
-            shared_witness,
-            first,
-            plan,
-            norm: None,
-        },
-        &sample_rows,
-        plain_rows,
-        plan.proximity.own_fresh,
-        plan.proximity.own_mask_tree,
-        derive_run_seed(seed, 5, 0)?,
-        plan.proximity.own_base_positions,
-        iopp.as_ref(),
-    )?;
+
+    let mut claims = Vec::new();
+    let proximity = if deferred_samples {
+        proximity_prove_streaming_deferred(
+            chain,
+            fold,
+            members,
+            ProximityTreeSource::Retained {
+                witness,
+                shared_witness,
+                first,
+                plan,
+            },
+            &mut plain_stream,
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            derive_run_seed(seed, 5, 0)?,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?
+    } else {
+        let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
+        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+        drop(_profile_sample_rows);
+        let proximity = proximity_prove_streaming(
+            chain,
+            fold,
+            members,
+            ProximityTreeSource::Retained {
+                witness,
+                shared_witness,
+                first,
+                plan,
+            },
+            &sample_rows,
+            &mut plain_stream,
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            derive_run_seed(seed, 5, 0)?,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?;
+        claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
+        proximity
+    };
+
     drop(_profile_proximity);
-    let mut claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
     let _ = order;
     Ok(OwnProveResult {
         messages: HiddenSecondMessages {
@@ -26200,7 +27794,7 @@ fn verify_second(
     messages: &HiddenSecondMessages,
     closure_r: Option<&[Fp3]>,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
-    chain_rows: &[BatRow],
+    chain_rows: Vec<BatRow>,
 ) -> Result<(
     Digest,
     Vec<GuRelationRow>,
@@ -26292,22 +27886,41 @@ fn verify_second(
         _ => return Err(Error::ShapeMismatch),
     };
     let (members, _order) = own_members(plan, first, shared, None, None)?;
-    let sample_rows = own_sample_rows(plan, &members, first, Some(shared))?;
-    let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
+
+    let deferred_samples = plan.proximity.own_deferred_samples;
+    if plan.closure.is_some() && !deferred_samples {
+        return Err(Error::InvalidConfig);
+    }
+
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
-    let plain_rows = own_plain_rows(
-        plan,
-        &members,
-        first,
-        shared_point,
-        &messages.tilde,
-        dot_binding.as_ref(),
-        closure_binding.as_ref(),
-        norm_binding.as_ref(),
-        request_bundle.as_ref(),
-        chain_rows,
-    )?;
-    drop(_profile_plain_rows);
+    let mut streaming_chain_rows = Some(chain_rows);
+    let mut plain_stream =
+        |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
+            let chain_rows = streaming_chain_rows
+                .take()
+                .ok_or(Error::InvalidSessionState)?;
+            own_plain_rows_each(
+                plan,
+                members,
+                first,
+                shared_point,
+                &messages.tilde,
+                dot_binding.as_ref(),
+                closure_binding.as_ref(),
+                norm_binding.as_ref(),
+                request_bundle.as_ref(),
+                ChainRows::Owned(chain_rows),
+                sink,
+            )?;
+            if deferred_samples {
+                let _profile_sample_rows =
+                    zkie_engine::profile::Scope::new("verify.second.sample_rows");
+                for member in members {
+                    member_samples_into(plan, member, first, shared, sink)?;
+                }
+            }
+            Ok(())
+        };
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -26322,29 +27935,51 @@ fn verify_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
-        let proximity = proximity_verify(
-        chain,
-        fold,
-        &members,
-        &sample_rows,
-        plain_rows,
-        &ProximityMessages {
-            fold_start: messages.fold_start.clone(),
-            fold_rounds: messages.fold_rounds.clone(),
-            tail: messages.tail.clone(),
-        },
-        plan.proximity.own_fresh,
-        plan.proximity.own_mask_tree,
-        plan.proximity.own_base_positions,
-        iopp.as_ref(),
-    )?;
+    let mut own_claims = Vec::new();
+    let proximity = if deferred_samples {
+        proximity_verify_streaming_deferred(
+            chain,
+            fold,
+            &members,
+            &mut plain_stream,
+            &ProximityMessages {
+                fold_start: messages.fold_start.clone(),
+                fold_rounds: messages.fold_rounds.clone(),
+                tail: messages.tail.clone(),
+            },
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?
+    } else {
+        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+        let proximity = proximity_verify_streaming(
+            chain,
+            fold,
+            &members,
+            &sample_rows,
+            &mut plain_stream,
+            &ProximityMessages {
+                fold_start: messages.fold_start.clone(),
+                fold_rounds: messages.fold_rounds.clone(),
+                tail: messages.tail.clone(),
+            },
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?;
+        own_claims = sample_rows.into_iter().flatten().collect();
+        proximity
+    };
     drop(_profile_proximity);
     if proximity.seal != messages.seal {
         return Err(Error::InvalidProof);
     }
     Ok((
         proximity.seal,
-        sample_rows.into_iter().flatten().collect(),
+        own_claims,
         proximity.base,
         dot_binding,
         closure_binding,
@@ -26356,6 +27991,25 @@ fn verify_second(
 // ---------------------------------------------------------------------------
 // Public entries
 // ---------------------------------------------------------------------------
+
+/// Emits one memory checkpoint when `ZKIE_MEM_TRACE` is set. The values are
+/// the process resident size and peak, read from procfs, in KiB.
+pub fn mem_trace(label: &str) {
+    if std::env::var_os("ZKIE_MEM_TRACE").is_none() {
+        return;
+    }
+    let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut rss = 0u64;
+    let mut hwm = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            hwm = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+        }
+    }
+    eprintln!("MEMTRACE {label} rss_kib={rss} hwm_kib={hwm}");
+}
 
 fn prove_hidden_lin_inner(
     plan: &HiddenLinPlan,
@@ -26386,7 +28040,8 @@ fn prove_hidden_lin_inner(
         plan.closure.as_ref(),
     )?;
     drop(_profile_randomness);
-    let (first, first_seal, send_witness, chain_rows, _section_outputs) =
+    mem_trace("after_randomness");
+    let (first, first_seal, mut send_witness, chain_rows, _section_outputs) =
         prove_first(
             plan,
             activation,
@@ -26400,6 +28055,7 @@ fn prove_hidden_lin_inner(
             true,
         )
         ?;
+    mem_trace("after_first");
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(
         plan,
@@ -26412,6 +28068,7 @@ fn prove_hidden_lin_inner(
         send_witness.fold_charge.as_ref(),
     )
     ?;
+    mem_trace("after_shared");
     let own = prove_second(
         plan,
         &reader,
@@ -26419,14 +28076,15 @@ fn prove_hidden_lin_inner(
         &first_query,
         &shared.messages,
         &shared.witness,
-        &send_witness,
+        &mut send_witness,
         &shared.points.psi,
         &seed,
         bind_residual,
         rstd_table,
-        &chain_rows,
+        chain_rows,
     )
     ?;
+    mem_trace("after_second");
     let messages = HiddenLinMessages {
         first: first.clone(),
         first_seal,
@@ -26441,6 +28099,7 @@ fn prove_hidden_lin_inner(
         omega_message: shared.witness.omega_message,
         omega_tail: shared.witness.omega_tails.concat(),
     };
+    mem_trace("after_messages");
     let _ = (&mut coins, own.claims);
     Ok((messages, witness))
 }
@@ -26685,7 +28344,7 @@ fn verify_hidden_lin_inner(
         &messages.second,
         closure_r.as_deref(),
         rstd_table,
-        &chain_rows,
+        chain_rows,
     )?;
     drop(_profile_second);
     Ok(HiddenLinOutcome {
@@ -29364,7 +31023,12 @@ mod tests {
             weights: weights.to_vec(),
             psi_star: psi_star.to_vec(),
         };
-        let rows = super::request_rows(&request).unwrap();
+        let mut rows = Vec::new();
+        super::request_rows(&request, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].target, Fp3::from_u64(99));
         assert_eq!(rows[0].terms.len(), 1);
@@ -30151,6 +31815,7 @@ mod merged_tests {
                 column_work_bits: 0,
                 shared_base_positions: 2,
                 own_base_positions: 2,
+                own_deferred_samples: true,
                 shared_stages: Vec::new(),
                 own_stages: Vec::new(),
                 planner_checked: false,
@@ -30255,6 +31920,7 @@ mod merged_tests {
             x_roots: (0..POSITIONS)
                 .map(|position| Digest([0x90 + position as u8; 32]))
                 .collect(),
+            rms: None,
             sum: norm_group(1, 81, 9100, 60100),
             squares: norm_group(1, 82, 9200, 60200),
             mean: norm_group(1, 83, 9300, 60300),
@@ -30566,6 +32232,7 @@ mod merged_tests {
             ],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
+            rms: None,
             sum: group(1, GROUP, 9100, 60100),
             squares: group(1, GROUP, 9200, 60200),
             mean: group(1, GROUP, 9300, 60300),
@@ -30710,6 +32377,8 @@ mod merged_tests {
         let witness = NormWitness {
             rows,
             core,
+            low: None,
+            high: None,
             x,
             sum,
             squares,
@@ -31107,11 +32776,13 @@ mod merged_tests {
         let activation = activation();
         let mut table = table();
         let (plan, witness, mut params) = norm_params_fixture(&activation);
+        // The two column draws must land on distinct table columns for the
+        // swap check below; the seed is the fixture's choice, not a plan value.
         let (messages, _) = prove_hidden_lin_hidden_with_norm_and_params(
             &plan,
             &activation,
             &mut table,
-            Digest([0x71; 32]),
+            Digest([0x72; 32]),
             &witness,
             &mut params,
         )
@@ -32455,7 +34126,7 @@ mod merged_tests {
                 .as_mut()
                 .unwrap()
                 .claims;
-            claims.multiplicity.1 = claims.multiplicity.1.add(&Fp3::ONE);
+            claims.multiplicity.total = claims.multiplicity.total.add(&Fp3::ONE);
         }
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
@@ -35113,8 +36784,8 @@ mod merged_tests {
         )
         .is_err());
         let mut changed = messages.clone();
-        changed.first.digit_lookups[1].claims.multiplicity.1 =
-            changed.first.digit_lookups[1].claims.multiplicity.1.add(&Fp3::ONE);
+        changed.first.digit_lookups[1].claims.multiplicity.total =
+            changed.first.digit_lookups[1].claims.multiplicity.total.add(&Fp3::ONE);
         assert!(super::verify_hidden_lin_hidden_with_chain_segment(
             &plan,
             &verifier_table.reader,
@@ -35867,7 +37538,7 @@ mod merged_tests {
             None,
             None,
             None,
-            &[],
+            ChainRows::Borrowed(&[]),
         )
         .unwrap();
         let index = plan.send.index_mask.as_ref().unwrap();
@@ -36154,7 +37825,7 @@ mod merged_tests {
             None,
             None,
             None,
-            &[],
+            ChainRows::Borrowed(&[]),
         )
         .unwrap();
         assert_eq!(rows.len(), 2 * positions + 4);
@@ -37450,7 +39121,7 @@ mod merged_tests {
             .unwrap()
             .claims
             .multiplicity;
-        multiplicity.1 = multiplicity.1.add(&Fp3::ONE);
+        multiplicity.total = multiplicity.total.add(&Fp3::ONE);
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
         let (planes, key_bits, table_log) = {
@@ -38612,25 +40283,40 @@ mod merged_tests {
             )
             .unwrap()
         };
+        let stacked = |columns: u64, tree: u64| {
+            crate::proof::output_closure::stacked_shape(
+                columns,
+                POSITIONS,
+                plan.send.w.code,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap()
+        };
         crate::proof::output_closure::ClosurePlan {
             range_bits,
             slack_bits,
             valid: 2,
             vocab: plan.send.columns as usize,
             mask_value: -65_536,
+            masked: true,
             winner,
             slack: wshape(plan.send.columns, 63_000),
             slack_oracle_base: 42_000,
             slack_openings: 1,
-            bits: wshape(bits_columns, 63_010),
+            bits: stacked(bits_columns, 63_010),
             bits_oracle_base: 42_010,
             bits_openings: 1,
-            map: wshape(bits_columns, 63_020),
+            map: stacked(bits_columns, 63_020),
             map_oracle_base: 42_020,
             map_openings: 1,
             bits_columns,
             bits_per_cell: width as u32,
             boolean_variables: boolean_variables as u32,
+            tail_pad: true,
             mask: crate::proof::output_closure::ClosureMaskPlan {
                 oracle: 42_030,
                 group: plan.send.group,
@@ -38691,6 +40377,91 @@ mod merged_tests {
                 best as u32
             })
             .collect()
+    }
+
+    /// The stacked block placement and the column-major row-band runs must
+    /// agree exactly: a coefficient at block entry `c` of position `p` belongs
+    /// to the cell whose virtual index is row + place * rows, with
+    /// row = p * block_rows + c % block_rows and place = c / block_rows. This
+    /// fixture uses several positions and a multi-row block, where the row-major
+    /// contiguous form diverged from the column-major scatter.
+    #[test]
+    fn the_stacked_band_runs_place_entries_on_the_commit_cells() {
+        let positions = 4usize;
+        let block_columns = 32u64;
+        let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
+        let rows = usize::try_from((positions as u64 * block_columns) / code.ell).unwrap();
+        assert_eq!(rows, 16);
+        let block_rows = rows / positions;
+        assert_eq!(block_rows, 4);
+        assert_eq!(
+            u64::try_from(block_rows * positions).unwrap(),
+            positions as u64 * block_columns / code.ell
+        );
+        // One position's coefficients in entry order.
+        let coefficients: Vec<Fp3> = (0..block_columns)
+            .map(|entry| Fp3::from_u64(1 + 2 * entry + 7))
+            .collect();
+        let position = 2usize;
+        // The commit map: entry c sits at (row = p * block_rows + c % block_rows,
+        // place = c / block_rows) and its virtual index is row + place * rows.
+        let ell = usize::try_from(code.ell).unwrap();
+        let mut committed = vec![Fp3::ZERO; rows * ell];
+        for (entry, value) in coefficients.iter().enumerate() {
+            let row = position * block_rows + entry % block_rows;
+            let place = entry / block_rows;
+            committed[row + place * rows] = *value;
+        }
+        // The row-band runs: first = p * block_rows + local, step = rows,
+        // values[i] = coefficients[local + block_rows * i].
+        let mut row = BatRow::new(BatRowKind::Plain);
+        push_block_runs(&mut row, 0, position, block_rows, rows as u64, &coefficients).unwrap();
+        assert_eq!(row.runs.len(), block_rows);
+        let mut scattered = vec![Fp3::ZERO; rows * ell];
+        for (local, run) in row.runs.iter().enumerate() {
+            assert_eq!(run.step, rows as u64);
+            assert_eq!(run.first, (position * block_rows + local) as u64);
+            for (offset, value) in run.values.iter().enumerate() {
+                let index = usize::try_from(run.first).unwrap() + rows * offset;
+                scattered[index] = *value;
+            }
+        }
+        assert_eq!(scattered, committed, "the band runs and the commit cells disagree");
+        // The claim-side dense converter must produce the same vector: the
+        // row-major table of the member (rows x ell) converted by to_bat_table
+        // is the cell map the runs above must reproduce.
+        let mut table = vec![Fp3::ZERO; rows * ell];
+        for (entry, value) in coefficients.iter().enumerate() {
+            let row = position * block_rows + entry % block_rows;
+            let place = entry / block_rows;
+            table[row * ell + place] = *value;
+        }
+        let converted = crate::proof::hidden_send_session::to_bat_table(
+            &table,
+            rows as u64,
+            code.ell,
+        )
+        .unwrap();
+        assert_eq!(
+            scattered, converted,
+            "the band runs and the claim-side dense converter disagree"
+        );
+    }
+
+    #[test]
+    fn a_stacked_closure_plan_needs_its_marker() {
+        let activation = activation();
+        let (plan, _, _) = norm_hd_fixture(&activation);
+        let mut closure = norm_hd_closure_plan(&plan, vec![0u32; POSITIONS as usize]);
+        assert!(closure.fault(&plan.send).is_none());
+        // Without the plan marker the stacked fill must be refused.
+        closure.tail_pad = false;
+        assert!(closure.fault(&plan.send).is_some());
+        // With the marker, a bit message that does not exactly fill the
+        // stacked rows must be refused too.
+        let mut closure = norm_hd_closure_plan(&plan, vec![0u32; POSITIONS as usize]);
+        closure.bits.main_rows *= 2;
+        assert!(closure.fault(&plan.send).is_some());
     }
 
     #[test]

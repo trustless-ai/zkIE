@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -273,6 +274,9 @@ struct BatOracle {
     shape: BatOracleShape,
     sampled: bool,
     sample_rows: Vec<BatRow>,
+    /// The answer count registered for streaming production, when the sample
+    /// rows are not materialized. Zero means the oracle has no deferred rows.
+    deferred_samples: u64,
     mask_open: bool,
     mask_used: BTreeSet<u64>,
 }
@@ -295,6 +299,9 @@ struct BatGroup {
 pub struct BatRunInput {
     pub layout: BatGroupLayout,
     pub rows: Arc<Vec<BatRow>>,
+    /// Deferred sample answers per oracle in member order: the streaming run
+    /// must emit exactly these rows. Empty when every sample row is in `rows`.
+    pub deferred: Vec<(u64, u64)>,
 }
 
 impl BatRunInput {
@@ -367,6 +374,7 @@ impl BatStatement {
             shape,
             sampled: false,
             sample_rows: Vec::new(),
+            deferred_samples: 0,
             mask_open: shape.mask_rows > 0,
             mask_used: BTreeSet::new(),
         });
@@ -429,6 +437,28 @@ impl BatStatement {
         }
         let entry = self.oracle_mut(oracle)?;
         entry.sample_rows = rows;
+        entry.sampled = true;
+        Ok(())
+    }
+
+    /// Register the sample answer count of one oracle without materializing
+    /// its rows. The streaming run then emits exactly this many SAMPLE rows for
+    /// the oracle, in the frozen class order, and `finish_run_streaming`
+    /// checks the count, the reference oracle and every row entry. The
+    /// materialized `finish_run` refuses a deferred run.
+    pub fn sample_deferred(&mut self, oracle: u64, rows: u64) -> Result<()> {
+        let shape = {
+            let entry = self.oracle(oracle)?;
+            if entry.sampled || entry.shape.answers == 0 {
+                return Err(Error::InvalidSessionState);
+            }
+            entry.shape
+        };
+        if rows != shape.answers as u64 {
+            return Err(Error::ShapeMismatch);
+        }
+        let entry = self.oracle_mut(oracle)?;
+        entry.deferred_samples = rows;
         entry.sampled = true;
         Ok(())
     }
@@ -583,8 +613,10 @@ impl BatStatement {
         };
         for oracle in &members {
             let entry = self.oracle(*oracle)?;
+            let answers = entry.shape.answers as usize;
             if entry.shape.answers > 0
-                && entry.sample_rows.len() != entry.shape.answers as usize
+                && entry.sample_rows.len() != answers
+                && entry.deferred_samples != answers as u64
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -600,11 +632,19 @@ impl BatStatement {
         for oracle in &members {
             self.oracle_mut(*oracle)?.mask_open = false;
         }
+        let mut deferred = Vec::new();
+        for oracle in &members {
+            let entry = self.oracle(*oracle)?;
+            if entry.deferred_samples > 0 {
+                deferred.push((*oracle, entry.deferred_samples));
+            }
+        }
         let entry = self.group_mut(group)?;
         entry.in_run = true;
         Ok(BatRunInput {
             layout,
             rows: Arc::new(rows),
+            deferred,
         })
     }
 
@@ -677,7 +717,7 @@ impl BatStatement {
     /// isolated FOLD candidate checker passes and that checker's member-order
     /// implied main/mask first offsets equal BAT's actual main_first/mask_first.
     /// A legal BAT layout whose descending blocks that checker rejects is
-    /// outside this S2 subset and fails closed here; it is not a general
+    /// outside this subset and fails closed here; it is not a general
     /// GroupLayout handoff. The only BAT layout derivation is
     /// `BatStatement::layout`; production must rebuild the same
     /// members/first offsets/k/h/kept from an authenticated statement, and must
@@ -936,6 +976,9 @@ impl BatSession {
         if pending.layout != input.layout || !Arc::ptr_eq(&pending.rows, &input.rows) {
             return Err(Error::StatementMismatch);
         }
+        if !input.deferred.is_empty() {
+            return Err(Error::InvalidSessionState);
+        }
         let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
         if !self.chain.step(&prefix, 0)? {
             return Err(Error::InvalidProof);
@@ -946,6 +989,120 @@ impl BatSession {
         let x = self.chain.draw_e()?;
         self.last_x = Some(x);
         combine(&self.statement, &input.layout, input.rows.as_slice(), x)
+    }
+
+    /// Close the BAT round over rows produced during the combine. The chain
+    /// step and the x draw happen in the same order as `finish_run`; each
+    /// emitted row is scattered with its position's power of x, so the group
+    /// row is the same as the materialized path. The caller emits the rows in
+    /// the same order the frozen statement would have held them.
+    pub fn finish_run_streaming<F>(&mut self, input: BatRunInput, run: F) -> Result<BatGroupRow>
+    where
+        F: FnOnce(&mut dyn FnMut(BatRow) -> Result<()>) -> Result<()>,
+    {
+        let pending = self.pending.take().ok_or(Error::InvalidSessionState)?;
+        if pending.layout != input.layout || !Arc::ptr_eq(&pending.rows, &input.rows) {
+            return Err(Error::StatementMismatch);
+        }
+        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let x = self.chain.draw_e()?;
+        self.last_x = Some(x);
+        // Deferred sample rows are emitted by the streaming closure after the
+        // plain rows, in the registered oracle order. Mixed materialized and
+        // deferred samples in one run are refused: the trailing combine order
+        // would differ from the emitted order.
+        let mut deferred: Vec<(u64, u64)> = input.deferred.clone();
+        let planned_deferred: u64 = deferred.iter().map(|(_, rows)| *rows).sum();
+        if input.rows.len() as u64 + planned_deferred != self.planned_rows {
+            return Err(Error::StatementMismatch);
+        }
+        if !deferred.is_empty() && !input.rows.is_empty() {
+            return Err(Error::InvalidSessionState);
+        }
+        let mut out = BatGroupRow {
+            group: input.layout.group,
+            main: vec![Fp3::ZERO; input.layout.group_len(BatPart::Main)?],
+            mask: vec![Fp3::ZERO; input.layout.group_len(BatPart::Mask)?],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        let mut scale = Fp3::ONE;
+        let mut chunk: Vec<(BatRow, Fp3)> = Vec::new();
+        let mut chunk_symbols = 0usize;
+        let mut deferred_at = 0usize;
+        let mut samples_started = false;
+        let combine_started = Instant::now();
+        let mut completed_rows = 0u64;
+        let mut completed_symbols = 0u64;
+        {
+            let statement = &self.statement;
+            let layout = &input.layout;
+            let mut sink = |row: BatRow| -> Result<()> {
+                if row.kind == BatRowKind::Sample {
+                    let Some(entry) = deferred.get_mut(deferred_at) else {
+                        return Err(Error::StatementMismatch);
+                    };
+                    let oracle = entry.0;
+                    let foreign = row
+                        .terms
+                        .iter()
+                        .map(|term| term.oracle)
+                        .chain(row.units.iter().map(|unit| unit.oracle))
+                        .chain(row.runs.iter().map(|run| run.oracle))
+                        .chain(row.forms.iter().map(|form| form.oracle))
+                        .any(|referenced| referenced != oracle);
+                    if foreign {
+                        return Err(Error::StatementMismatch);
+                    }
+                    check_row_entries(&row, |referenced| {
+                        if referenced != oracle {
+                            return Err(Error::StatementMismatch);
+                        }
+                        Ok(statement.oracle(referenced)?.shape)
+                    })?;
+                    samples_started = true;
+                    entry.1 -= 1;
+                    if entry.1 == 0 {
+                        deferred_at += 1;
+                    }
+                } else if samples_started {
+                    // The deferred samples close the stream, matching the
+                    // frozen class order where they precede only the generator
+                    // rows of a materialized run.
+                    return Err(Error::StatementMismatch);
+                }
+                chunk_symbols += row_symbols(&row);
+                chunk.push((row, scale));
+                scale = scale.mul(&x);
+                if chunk_symbols >= STREAM_CHUNK_SYMBOLS {
+                    combine_chunk_into(statement, layout, &mut out, &chunk)?;
+                    completed_rows += chunk.len() as u64;
+                    completed_symbols += chunk_symbols as u64;
+                    bat_progress(completed_rows, completed_symbols, combine_started.elapsed());
+                    chunk.clear();
+                    chunk_symbols = 0;
+                }
+                Ok(())
+            };
+            run(&mut sink)?;
+        }
+        if !chunk.is_empty() {
+            combine_chunk_into(&self.statement, &input.layout, &mut out, &chunk)?;
+            completed_rows += chunk.len() as u64;
+            completed_symbols += chunk_symbols as u64;
+            bat_progress(completed_rows, completed_symbols, combine_started.elapsed());
+        }
+        for row in input.rows.iter() {
+            combine_row_into(&self.statement, &input.layout, &mut out, row, scale)?;
+            scale = scale.mul(&x);
+        }
+        if deferred_at != deferred.len() {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(out)
     }
 
     pub fn run(&mut self, group: u64) -> Result<BatGroupRow> {
@@ -1013,7 +1170,10 @@ fn combine_with_min(
         power = power.mul(&x);
     }
     let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(rows.len());
-    let mut units: Vec<Vec<MainUnitScatter>> = Vec::with_capacity(rows.len());
+    let mut units: Vec<MainUnitScatter> = Vec::new();
+    let started = Instant::now();
+    let mut completed_rows = 0u64;
+    let mut completed_symbols = 0u64;
     for (row, scale) in rows.iter().zip(&powers) {
         let mut row_scatter = Vec::new();
         let mut row_units = Vec::new();
@@ -1154,10 +1314,17 @@ fn combine_with_min(
         }
         out.target = out.target.add(&scale.mul(&row.target));
         scatter.push(row_scatter);
-        units.push(row_units);
+        units.append(&mut row_units);
+        completed_rows += 1;
+        completed_symbols += row_symbols(row) as u64;
+        if completed_rows % 64 == 0 {
+            bat_progress(completed_rows, completed_symbols, started.elapsed());
+        }
     }
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(units, places)?;
     let scatter_at = |place: usize, chunk: &mut [Fp3]| -> Result<()> {
-        for (row_scatter, row_units) in scatter.iter().zip(&units) {
+        for row_scatter in &scatter {
             for term in row_scatter {
                 if place >= term.places {
                     continue;
@@ -1171,15 +1338,12 @@ fn combine_with_min(
                     *slot = slot.add(&term.scale.mul(value));
                 }
             }
-            for unit in row_units {
-                if unit.place != place {
-                    continue;
-                }
-                let slot = chunk
-                    .get_mut(unit.first + unit.row)
-                    .ok_or(Error::InvalidIndex)?;
-                *slot = slot.add(&unit.scaled);
-            }
+        }
+        for unit in buckets.at(place) {
+            let slot = chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
         }
         Ok(())
     };
@@ -1196,6 +1360,295 @@ fn combine_with_min(
     Ok(out)
 }
 
+/// Adds one plain row to the group row with the given power of x. The terms
+/// are the same scatters the materialized combine applies; field addition is
+/// exact and order independent, so applying them row by row yields the same
+/// group row as the batched pass.
+/// The row length in field symbols, used to bound the streaming chunk.
+fn row_symbols(row: &BatRow) -> usize {
+    let mut symbols = row.units.len() + row.runs.len() * 2;
+    for term in &row.terms {
+        symbols += term.values.len();
+    }
+    for run in &row.runs {
+        symbols += run.values.len();
+    }
+    for form in &row.forms {
+        symbols += form.values.len();
+    }
+    symbols
+}
+
+/// Streaming chunks flush at this many row symbols, so the buffer stays
+/// bounded while the place-major scatter keeps the full thread parallelism.
+const STREAM_CHUNK_SYMBOLS: usize = 1 << 25;
+
+/// Collects one row's scatters and applies the carried parts to the group
+/// row immediately. The returned scatters borrow the row values.
+fn collect_row_scatter<'a>(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    row: &'a BatRow,
+    scale: Fp3,
+) -> Result<(Vec<MainScatter<'a>>, Vec<MainUnitScatter>)> {
+    let mut row_scatter: Vec<MainScatter<'a>> = Vec::new();
+    let mut row_units: Vec<MainUnitScatter> = Vec::new();
+    for term in &row.terms {
+        let shape = statement.oracle(term.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == term.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        if term.part == BatPart::Main && !member.kept {
+            if !shape.has(term.part) || term.values.len() != shape.table_len(term.part)? {
+                return Err(Error::ShapeMismatch);
+            }
+            row_scatter.push(main_scatter(
+                &term.values,
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(term.part),
+                scale,
+            )?);
+        } else {
+            carry_table(
+                statement,
+                layout,
+                term.oracle,
+                term.part,
+                &term.values,
+                scale,
+                out,
+            )?;
+        }
+    }
+    for unit in &row.units {
+        let shape = statement.oracle(unit.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == unit.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let len = shape.table_len(unit.part)?;
+        if !shape.has(unit.part) || unit.index >= len as u64 {
+            return Err(Error::InvalidIndex);
+        }
+        if unit.part == BatPart::Main && !member.kept {
+            row_units.push(main_unit_scatter(
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(unit.part),
+                unit.index,
+                scale.mul(&unit.coefficient),
+            )?);
+        } else {
+            carry_entry(
+                statement,
+                layout,
+                unit.oracle,
+                unit.part,
+                unit.index,
+                unit.coefficient,
+                scale,
+                out,
+            )?;
+        }
+    }
+    for run in &row.runs {
+        if run.step == 0 {
+            return Err(Error::ShapeMismatch);
+        }
+        let shape = statement.oracle(run.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == run.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let len = shape.table_len(run.part)?;
+        for (offset, value) in run.values.iter().enumerate() {
+            let index = run
+                .first
+                .checked_add(
+                    run.step
+                        .checked_mul(offset as u64)
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .ok_or(Error::ResourceLimit)?;
+            if !shape.has(run.part) || index >= len as u64 {
+                return Err(Error::InvalidIndex);
+            }
+            if run.part == BatPart::Main && !member.kept {
+                row_units.push(main_unit_scatter(
+                    member.main_first.ok_or(Error::StatementMismatch)?,
+                    shape.row_bits(run.part),
+                    index,
+                    scale.mul(value),
+                )?);
+            } else {
+                carry_entry(
+                    statement,
+                    layout,
+                    run.oracle,
+                    run.part,
+                    index,
+                    *value,
+                    scale,
+                    out,
+                )?;
+            }
+        }
+    }
+    for form in &row.forms {
+        let shape = statement.oracle(form.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == form.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        if !member.kept {
+            if !shape.has(BatPart::Main)
+                || form.values.len() != shape.table_len(BatPart::Main)?
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            row_scatter.push(main_scatter(
+                &form.values,
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(BatPart::Main),
+                scale,
+            )?);
+        } else {
+            carry_table(
+                statement,
+                layout,
+                form.oracle,
+                BatPart::Main,
+                &form.values,
+                scale,
+                out,
+            )?;
+        }
+    }
+    out.target = out.target.add(&scale.mul(&row.target));
+    Ok((row_scatter, row_units))
+}
+
+/// Applies one row's scatters immediately, in row order.
+fn array_row_into(
+    out: &mut BatGroupRow,
+    chunk_len: usize,
+    row_scatter: &[MainScatter<'_>],
+    row_units: Vec<MainUnitScatter>,
+) -> Result<()> {
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(row_units, places)?;
+    for (place, chunk) in out.main.chunks_mut(chunk_len).enumerate() {
+        for term in row_scatter {
+            if place >= term.places {
+                continue;
+            }
+            let lo = place * term.rows_per_place;
+            let hi = lo + term.rows_per_place;
+            let target = chunk
+                .get_mut(term.first..term.first + term.rows_per_place)
+                .ok_or(Error::InvalidIndex)?;
+            for (slot, value) in target.iter_mut().zip(&term.values[lo..hi]) {
+                *slot = slot.add(&term.scale.mul(value));
+            }
+        }
+        for unit in buckets.at(place) {
+            let slot = chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
+        }
+    }
+    Ok(())
+}
+
+fn combine_row_into(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    row: &BatRow,
+    scale: Fp3,
+) -> Result<()> {
+    let chunk_len = 1usize
+        .checked_shl(layout.group_row_bits(BatPart::Main))
+        .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let (row_scatter, row_units) = collect_row_scatter(statement, layout, out, row, scale)?;
+    array_row_into(out, chunk_len, &row_scatter, row_units)
+}
+
+/// Applies a bounded chunk of rows with the place-major parallel scatter the
+/// materialized combine uses, so the streaming path keeps the same thread
+/// parallelism without keeping every row resident.
+fn combine_chunk_into(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    chunk: &[(BatRow, Fp3)],
+) -> Result<()> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let group_bits = layout.group_row_bits(BatPart::Main);
+    let chunk_len = 1usize
+        .checked_shl(group_bits)
+        .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(chunk.len());
+    let mut units: Vec<MainUnitScatter> = Vec::new();
+    for (row, scale) in chunk {
+        let (row_scatter, mut row_units) =
+            collect_row_scatter(statement, layout, out, row, *scale)?;
+        scatter.push(row_scatter);
+        units.append(&mut row_units);
+    }
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(units, places)?;
+    let scatter_at = |place: usize, out_chunk: &mut [Fp3]| -> Result<()> {
+        for row_scatter in &scatter {
+            for term in row_scatter {
+                if place >= term.places {
+                    continue;
+                }
+                let lo = place * term.rows_per_place;
+                let hi = lo + term.rows_per_place;
+                let target = out_chunk
+                    .get_mut(term.first..term.first + term.rows_per_place)
+                    .ok_or(Error::InvalidIndex)?;
+                for (slot, value) in target.iter_mut().zip(&term.values[lo..hi]) {
+                    *slot = slot.add(&term.scale.mul(value));
+                }
+            }
+        }
+        for unit in buckets.at(place) {
+            let slot = out_chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
+        }
+        Ok(())
+    };
+    if out.main.len() >= COMBINE_PARALLEL_MIN && chunk_len <= out.main.len() {
+        out.main
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .try_for_each(|(place, out_chunk)| scatter_at(place, out_chunk))?;
+    } else {
+        for (place, out_chunk) in out.main.chunks_mut(chunk_len).enumerate() {
+            scatter_at(place, out_chunk)?;
+        }
+    }
+    Ok(())
+}
+
 /// Folded-main terms use the parallel block scatter from this group-row
 /// length upward; smaller groups keep the sequential chunk loop.
 const COMBINE_PARALLEL_MIN: usize = 1 << 22;
@@ -1210,6 +1663,7 @@ struct MainScatter<'a> {
 }
 
 /// One folded main-table point coefficient.
+#[derive(Clone, Copy)]
 struct MainUnitScatter {
     first: usize,
     place: usize,
@@ -1257,6 +1711,61 @@ fn main_unit_scatter(
         row: usize::try_from(row).map_err(|_| Error::ResourceLimit)?,
         scaled,
     })
+}
+
+/// The empty unit, used only to size the bucketed buffer first.
+const EMPTY_UNIT: MainUnitScatter = MainUnitScatter {
+    first: 0,
+    place: 0,
+    row: 0,
+    scaled: Fp3::ZERO,
+};
+
+/// Units bucketed by their place. One counting pass over the units and one
+/// over the places turn the per-place scatter into O(units + places +
+/// matches): the per-place scan over every unit made a chunk with block-local
+/// runs quadratic in the place count and held the combine for hours.
+struct BucketedUnits {
+    units: Vec<MainUnitScatter>,
+    starts: Vec<usize>,
+}
+
+impl BucketedUnits {
+    fn build(units: Vec<MainUnitScatter>, places: usize) -> Result<Self> {
+        let mut starts = vec![0usize; places + 1];
+        for unit in &units {
+            if unit.place >= places {
+                return Err(Error::InvalidIndex);
+            }
+            starts[unit.place + 1] += 1;
+        }
+        for place in 0..places {
+            starts[place + 1] += starts[place];
+        }
+        let mut sorted = vec![EMPTY_UNIT; units.len()];
+        let mut cursor = starts.clone();
+        for unit in units {
+            let place = unit.place;
+            let at = cursor[place];
+            cursor[place] += 1;
+            sorted[at] = unit;
+        }
+        Ok(Self { units: sorted, starts })
+    }
+
+    fn at(&self, place: usize) -> &[MainUnitScatter] {
+        &self.units[self.starts[place]..self.starts[place + 1]]
+    }
+}
+
+/// One in-stage combine progress line: the completed row count and symbol
+/// volume at a chunk boundary, so a long combine reports its real pace and
+/// its completed work instead of going silent.
+fn bat_progress(rows: u64, symbols: u64, elapsed: std::time::Duration) {
+    eprintln!(
+        "bat_progress completed_rows={rows} completed_symbols={symbols} elapsed_ms={}",
+        elapsed.as_millis()
+    );
 }
 
 fn kept_slot<'a>(
@@ -2022,6 +2531,90 @@ mod tests {
     }
 
     #[test]
+    fn streaming_combine_matches_materialized_combine() {
+        let (mut st, group) = group_fixture();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        let x = Fp3::from_u64(7);
+        let materialized = combine_with_min(&st, &input.layout, &input.rows, x, 0).unwrap();
+        let mut streamed = BatGroupRow {
+            group,
+            main: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Main).unwrap()
+            ],
+            mask: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Mask).unwrap()
+            ],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        let mut scale = Fp3::ONE;
+        for row in input.rows.iter() {
+            combine_row_into(&st, &input.layout, &mut streamed, row, scale).unwrap();
+            scale = scale.mul(&x);
+        }
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn chunked_combine_matches_materialized_combine() {
+        let (mut st, group) = group_fixture();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        let x = Fp3::from_u64(7);
+        let materialized = combine_with_min(&st, &input.layout, &input.rows, x, 0).unwrap();
+        let mut power = Fp3::ONE;
+        let chunk: Vec<(BatRow, Fp3)> = input
+            .rows
+            .iter()
+            .map(|row| {
+                let scaled = (row.clone(), power);
+                power = power.mul(&x);
+                scaled
+            })
+            .collect();
+        let mut chunked = BatGroupRow {
+            group,
+            main: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Main).unwrap()
+            ],
+            mask: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Mask).unwrap()
+            ],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        combine_chunk_into(&st, &input.layout, &mut chunked, &chunk).unwrap();
+        assert_eq!(materialized, chunked);
+    }
+
+    #[test]
     fn combine_parallel_matches_serial_across_threads() {
         let (mut st, group) = group_fixture();
         let mut first = BatRow::new(BatRowKind::Plain);
@@ -2049,5 +2642,113 @@ mod tests {
             });
             assert_eq!(serial, parallel, "threads {threads}");
         }
+    }
+
+    fn deferred_fixture() -> (BatStatement, u64, BatRow, BatRow, Vec<BatRow>) {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 0, 2)).unwrap();
+        st.sample_deferred(0, 2).unwrap();
+        let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 0, false).unwrap();
+        let mut plain = BatRow::new(BatRowKind::Plain);
+        plain.target = Fp3::from_u64(3);
+        plain.add_term(0, BatPart::Main, one_at(16, 0, 5));
+        let mut generator = BatRow::new(BatRowKind::Generator);
+        generator.target = Fp3::from_u64(4);
+        let mut first = BatRow::new(BatRowKind::Sample);
+        first.target = Fp3::from_u64(11);
+        first.add_term(0, BatPart::Main, one_at(16, 1, 7));
+        let mut second = BatRow::new(BatRowKind::Sample);
+        second.target = Fp3::from_u64(12);
+        second.add_term(0, BatPart::Main, one_at(16, 5, 9));
+        (st, group, plain, generator, vec![first, second])
+    }
+
+    #[test]
+    fn sample_deferred_refuses_a_wrong_count() {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 0, 2)).unwrap();
+        assert!(st.sample_deferred(0, 1).is_err());
+        assert!(st.sample_deferred(0, 2).is_ok());
+        assert!(st.sample_deferred(0, 2).is_err());
+    }
+
+    #[test]
+    fn deferred_samples_combine_in_the_emitted_order() {
+        let (st, group, plain, generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        assert!(input.rows.is_empty());
+        assert_eq!(input.deferred, vec![(0, 2)]);
+        let layout = input.layout.clone();
+        let mut rows = vec![plain.clone(), generator.clone()];
+        rows.extend(samples.iter().cloned());
+        let streamed = session
+            .finish_run_streaming(input, |sink| {
+                sink(plain)?;
+                sink(generator)?;
+                for row in &samples {
+                    sink(row.clone())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let x = session.last_x().unwrap();
+        let expected = combine(session.statement(), &layout, &rows, x).unwrap();
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn deferred_samples_refuse_a_short_stream() {
+        let (st, group, plain, generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(plain)?;
+            sink(generator)?;
+            sink(samples[0].clone())?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_close_the_stream() {
+        let (st, group, plain, _generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(samples[0].clone())?;
+            sink(samples[1].clone())?;
+            sink(plain)?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_refuse_a_foreign_reference() {
+        let (st, group, _plain, _generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let mut foreign = samples[0].clone();
+        foreign.add_term(1, BatPart::Main, one_at(16, 0, 1));
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(foreign)?;
+            sink(samples[1].clone())?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_require_the_streaming_run() {
+        let (st, group, _plain, _generator, _samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        assert!(matches!(
+            session.finish_run(input),
+            Err(Error::InvalidSessionState)
+        ));
     }
 }

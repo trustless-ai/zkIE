@@ -16,7 +16,7 @@ pub mod profile;
 pub mod prove;
 pub mod report;
 pub mod run;
-pub mod s7_context;
+pub mod lm_head_context;
 pub mod lm_head_key;
 pub mod lm_head_stage;
 pub mod verify;
@@ -24,6 +24,12 @@ pub mod verify;
 use provider::production_provider;
 
 pub fn run_cli(args: Vec<String>) -> i32 {
+    let code = run_cli_inner(args);
+    zkie_engine::profile::dump();
+    code
+}
+
+fn run_cli_inner(args: Vec<String>) -> i32 {
     let Some(command) = args.first().map(String::as_str) else {
         print_usage();
         return 0;

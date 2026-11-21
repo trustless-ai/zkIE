@@ -61,6 +61,8 @@ pub struct NormSegmentSpace {
     pub squares: GroupIds,
     pub mean: GroupIds,
     pub variance: GroupIds,
+    pub low: GroupIds,
+    pub high: GroupIds,
     pub round: GroupIds,
     pub mask: GroupIds,
 }
@@ -83,6 +85,10 @@ pub struct NormSegmentProfile {
     pub round_widths: NormRoundWidths,
     pub tail_widths: NormOutputTailWidths,
     pub table_real_len: u64,
+    /// The trusted bound of the rounded mean square (RMS form).
+    pub mean_bound: u64,
+    /// The correlated pre-clamp bound (RMS form).
+    pub pre_bound: u64,
     /// The fixed public coin seed of the trusted x group derivation.
     pub x_seed: Digest,
 }
@@ -313,13 +319,28 @@ pub fn build_core_plan(
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
     let relations: Vec<usize> = if profile.mode.is_rms() {
-        (2..=26).collect()
+        (16..=25).chain(26..=95).collect()
     } else {
         (0..26).collect()
     };
     let round_layout =
         NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?.with_mode(profile.mode);
-    let round_columns = profile.round_widths.columns()?;
+    let rms_widths = if profile.mode.is_rms() {
+        Some(crate::proof::rms_limbs::RmsLimbWidths::derive(
+            profile.input_bound,
+            profile.valid,
+        )?)
+    } else {
+        None
+    };
+    let round_layout = match &rms_widths {
+        Some(widths) => round_layout.with_rms(widths.first_divisor, widths.second_divisor)?,
+        None => round_layout,
+    };
+    let round_columns = u64::try_from(round_layout.total_slots())
+        .ok()
+        .and_then(|slots| slots.checked_next_power_of_two())
+        .ok_or(Error::ResourceLimit)?;
     let x_roots = x_roots(space, profile, x_rows)?;
     let mask = base_mask_plan(space, profile, variables, relations.len())?;
     let mut plan = NormPlan {
@@ -330,6 +351,17 @@ pub fn build_core_plan(
         relations,
         x: group_plan(space, profile, columns, space.x)?,
         x_roots,
+        rms: if profile.mode.is_rms() {
+            Some(crate::proof::hidden_norm_psc::RmsLimbPlan {
+                low: group_plan(space, profile, columns, space.low)?,
+                high: group_plan(space, profile, columns, space.high)?,
+                widths: rms_widths.clone().ok_or(Error::InvalidConfig)?,
+                mean_bound: profile.mean_bound,
+                pre_bound: profile.pre_bound,
+            })
+        } else {
+            None
+        },
         sum: group_plan(space, profile, 1, space.sum)?,
         squares: group_plan(space, profile, 1, space.squares)?,
         mean: group_plan(space, profile, 1, space.mean)?,
@@ -444,11 +476,17 @@ pub fn build_core_witness(
             return Err(Error::ShapeMismatch);
         }
         rows.push(row.clone());
-        core.push(NormCoreRow::from_values_mode(
-            row,
-            profile.valid as usize,
-            plan.mode,
-        )?);
+        let computed = match (&plan.rms, &plan.round) {
+            (Some(rms), Some(round)) => NormCoreRow::from_values_rms(
+                row,
+                profile.valid as usize,
+                round.input_bound,
+                rms.widths,
+                rms.mean_bound,
+            )?,
+            _ => NormCoreRow::from_values_mode(row, profile.valid as usize, plan.mode)?,
+        };
+        core.push(computed);
     }
     let rsqrt = core
         .iter()
@@ -459,6 +497,28 @@ pub fn build_core_witness(
     if x.committed.roots != plan.x_roots {
         return Err(Error::StatementMismatch);
     }
+    let (low, high) = match &plan.rms {
+        Some(rms) => {
+            let limb_values = |pick: fn(&crate::proof::rms_limbs::RmsLimbRow) -> &Vec<i64>|
+             -> Result<Vec<Vec<Fp3>>> {
+                core.iter()
+                    .map(|row| {
+                        let limb = row.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+                        let mut values = vec![0i64; profile.columns as usize];
+                        for (slot, value) in values.iter_mut().zip(pick(limb)) {
+                            *slot = *value;
+                        }
+                        signed_column(&values.iter().map(|value| *value as i128).collect::<Vec<_>>())
+                    })
+                    .collect()
+            };
+            let low = commit_group(&rms.low, &limb_values(|limb| &limb.low)?, group_seed(b"low"))?;
+            let high =
+                commit_group(&rms.high, &limb_values(|limb| &limb.high)?, group_seed(b"high"))?;
+            (Some(low), Some(high))
+        }
+        None => (None, None),
+    };
     let sum = commit_group(&plan.sum, &scalar_values(&core, |row| row.sum)?, group_seed(b"sum"))?;
     let squares = commit_group(
         &plan.squares,
@@ -494,6 +554,8 @@ pub fn build_core_witness(
         rows,
         core,
         x,
+        low,
+        high,
         sum,
         squares,
         mean,
@@ -924,6 +986,8 @@ mod tests {
             squares: GroupIds { oracle: 9200, tree: 60200 },
             mean: GroupIds { oracle: 9300, tree: 60300 },
             variance: GroupIds { oracle: 9400, tree: 60400 },
+            low: GroupIds { oracle: 9700, tree: 60700 },
+            high: GroupIds { oracle: 9720, tree: 60720 },
             round: GroupIds { oracle: 9600, tree: 60600 },
             mask: GroupIds { oracle: 9500, tree: 60500 },
         }
@@ -966,6 +1030,8 @@ mod tests {
                 pre_clamp: 4,
             },
             table_real_len: 7_340_032,
+            mean_bound: 0,
+            pre_bound: 0,
             x_seed: Digest([0x91; 32]),
         }
     }
@@ -1369,4 +1435,210 @@ mod tests {
         let third = x_roots(&space, &profile, &changed).unwrap();
         assert_ne!(first, third);
     }
+    fn rms_profile() -> NormSegmentProfile {
+        NormSegmentProfile {
+            positions: 2,
+            hidden: 4,
+            valid: 4,
+            columns: 16,
+            mode: crate::proof::hidden_norm::NormMode::RmsNorm,
+            shift: 32,
+            clamp: Some((-(1 << 31), (1 << 31) - 1)),
+            clamp_widths: Some(NormClampWidths {
+                low: 5,
+                high: 5,
+                low_strict: 4,
+                low_nonstrict: 4,
+                high_strict: 4,
+                high_nonstrict: 4,
+            }),
+            no_op_clamp: true,
+            input_bound: 1 << 10,
+            sum_offset: 0,
+            mean_offset: 0,
+            round_widths: NormRoundWidths {
+                sum: 7,
+                squares: 7,
+                variance: 7,
+                mean: 7,
+                offset: 3,
+            },
+            tail_widths: NormOutputTailWidths {
+                quotient: 4,
+                remainder: 4,
+                doubled_remainder: 5,
+                tie_slack: 4,
+                shifted: 4,
+                pre_clamp: 4,
+            },
+            table_real_len: 1 << 30,
+            mean_bound: 1 << 40,
+            pre_bound: 1 << 40,
+            x_seed: Digest([0x91; 32]),
+        }
+    }
+
+    #[test]
+    fn the_rms_plan_and_witness_bind_the_limb_groups() {
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let mut plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        assert!(plan.rms.is_some());
+        assert!(plan.relations.contains(&26));
+        assert!(plan.relations.contains(&95));
+        assert!(plan.round.as_ref().unwrap().layout.rms.is_some());
+        let round = plan.round.as_ref().unwrap();
+        let digit_count = round.layout.digit_slots().unwrap().len();
+        assert!(digit_count > 128, "the limb slots join the byte lookup");
+        let key = crate::proof::hidden_norm_psc::round_digit_lookup_key(
+            round,
+            profile.positions,
+            16,
+            0,
+            crate::proof::lookup::BYTE_TABLE_IDENTITY,
+        )
+        .unwrap();
+        assert_eq!(key.sources.len(), digit_count * profile.positions as usize);
+        let rstd = vec![64i64, 64];
+        let rms = plan.rms.as_ref().unwrap();
+        let core0 = NormCoreRow::from_values_rms(
+            &rows[0],
+            profile.valid as usize,
+            profile.input_bound,
+            rms.widths,
+            rms.mean_bound,
+        )
+        .unwrap();
+        let _rsqrt0 = crate::proof::hidden_norm::RsqrtRow::from_variance(
+            core0.variance,
+            profile.table_real_len,
+            rstd[0],
+        )
+        .unwrap();
+        let witness = build_core_witness(&plan, &profile, &space(), &rows, &rstd).unwrap();
+        let low = witness.low.as_ref().expect("the low limb group");
+        let high = witness.high.as_ref().expect("the high limb group");
+        assert_eq!(low.committed.roots.len(), profile.positions as usize);
+        assert_eq!(high.committed.roots.len(), profile.positions as usize);
+        for position in 0..profile.positions as usize {
+            let core = &witness.core[position];
+            let limb = core.rms.as_ref().unwrap();
+            assert_eq!(core.sum, limb.s_ll);
+            assert_eq!(core.squares, limb.s_lh);
+            assert_eq!(core.mean, limb.s_hh as i64);
+            assert_eq!(core.variance, limb.mean_square as i64);
+        }
+        let round = plan.round.as_ref().unwrap();
+        let rsqrt = &witness.rsqrt.as_ref().unwrap()[0];
+        let columns = plan.columns as usize;
+        for relation in &plan.relations {
+            let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+                &witness.core[0],
+                &rows[0],
+                profile.valid as usize,
+                columns,
+                *relation,
+                Some(round),
+                Some(rsqrt),
+            )
+            .unwrap_or_else(|error| panic!("relation {relation}: {error:?}"));
+            let inner = left.iter().zip(&right).fold(
+                zkie_engine::pcs::request::field::Fp3::ZERO,
+                |sum, (l, r)| sum.add(&l.mul(r)),
+            );
+            assert_eq!(
+                inner,
+                zkie_engine::pcs::request::field::Fp3::ZERO,
+                "relation {relation}"
+            );
+        }
+        let _ = plan.rms.as_mut().unwrap();
+    }
+
+    /// The limb relations bind every term: a changed limb digit or mean byte
+    /// breaks its relation, so the zero on the honest witness is not vacuous.
+    #[test]
+    fn the_rms_limb_relations_bind_a_changed_digit() {
+        use zkie_engine::pcs::request::field::Fp3;
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        let round = plan.round.as_ref().unwrap();
+        let columns = plan.columns as usize;
+        let rstd = vec![64i64, 64];
+        let witness = build_core_witness(&plan, &profile, &space(), &rows, &rstd).unwrap();
+        let rsqrt = &witness.rsqrt.as_ref().unwrap()[0];
+        let dot = |core: &NormCoreRow, relation: usize| {
+            let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+                core,
+                &rows[0],
+                profile.valid as usize,
+                columns,
+                relation,
+                Some(round),
+                Some(rsqrt),
+            )
+            .unwrap();
+            left.iter()
+                .zip(&right)
+                .fold(Fp3::ZERO, |sum, (l, r)| sum.add(&l.mul(r)))
+        };
+        let mut changed = witness.core[0].clone();
+        changed.rms.as_mut().unwrap().v_digits[0] += 1;
+        assert!(!dot(&changed, 33).is_zero(), "relation 33 reads the digit");
+        let mut changed = witness.core[0].clone();
+        changed.rms.as_mut().unwrap().mean_digits[4] += 1;
+        assert!(!dot(&changed, 93).is_zero(), "relation 93 reads the mean byte");
+    }
+
+    /// The coarse rsqrt relation must hold on a witness whose raw value is in
+    /// the coarse segment. The small fixture rows never reach that branch
+    /// (raw lands in the fine segment, so the coarse remainder is zero), so
+    /// this pins the coarse digit weights directly.
+    #[test]
+    fn the_coarse_rsqrt_relation_holds_on_a_coarse_witness() {
+        use zkie_engine::pcs::request::field::Fp3;
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        let round = plan.round.as_ref().unwrap();
+        let columns = plan.columns as usize;
+        let raw = crate::registry::RSQRT_COARSE_END + 0x1234;
+        let variance = raw * crate::registry::RSQRT_SHIFT;
+        let rsqrt = crate::proof::hidden_norm::RsqrtRow::from_variance(
+            variance,
+            profile.table_real_len,
+            64,
+        )
+        .unwrap();
+        assert!(rsqrt.coarse);
+        let low = (rsqrt.coarse_r & 0xff) as u64;
+        let high = ((rsqrt.coarse_r >> 8) & 0xffff) as u64;
+        assert_ne!(low, high, "the witness must distinguish the coarse digits");
+        let rms = plan.rms.as_ref().unwrap();
+        let core = NormCoreRow::from_values_rms(
+            &rows[0],
+            profile.valid as usize,
+            profile.input_bound,
+            rms.widths,
+            rms.mean_bound,
+        )
+        .unwrap();
+        let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+            &core,
+            &rows[0],
+            profile.valid as usize,
+            columns,
+            23,
+            Some(round),
+            Some(&rsqrt),
+        )
+        .unwrap();
+        let inner = left
+            .iter()
+            .zip(&right)
+            .fold(Fp3::ZERO, |sum, (l, r)| sum.add(&l.mul(r)));
+        assert_eq!(inner, Fp3::ZERO, "the coarse relation");
+    }
+
 }

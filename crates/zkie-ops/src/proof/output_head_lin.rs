@@ -95,12 +95,22 @@ pub const OUTPUT_HEAD_ASSET_PATH: &str = "gpt2/weights/lm_head_w_i32.bin";
 /// The table has 1024 rows and 65536 entries per row, and every one of its
 /// entries is read by the matrix mapping.
 pub fn output_head_shape() -> Result<LinShape> {
-    LinShape::new(
+    output_head_shape_for(
         OUTPUT_HEAD_HIDDEN as u64,
         OUTPUT_HEAD_K_LO,
         OUTPUT_HEAD_TABLE_ROWS,
         OUTPUT_HEAD_COLUMNS as u64,
     )
+}
+
+/// The output-head matrix shape of an explicit model geometry.
+pub fn output_head_shape_for(
+    hidden: u64,
+    k_lo: u32,
+    table_rows: u64,
+    columns: u64,
+) -> Result<LinShape> {
+    LinShape::new(hidden, k_lo, table_rows, columns)
 }
 
 /// The trusted plan items of one output-head step.
@@ -443,8 +453,13 @@ pub struct OutputHeadOutputPlan {
     pub valid: usize,
     /// The complete padded column domain of the mask.
     pub vocab: usize,
-    /// The constant added to every column at or above `valid`.
+    /// The constant added to every column at or above `valid`. The unmasked
+    /// form has no invalid columns, so the value is zero and unused.
     pub mask_value: i64,
+    /// Whether the graph carries a vocabulary mask. A model whose logits are
+    /// argmaxed directly over the full vocabulary has no mask step and uses
+    /// the unmasked form `valid == vocab`.
+    pub masked: bool,
     /// The separate argmax step of every position, in position order.
     pub argmax_steps: Vec<usize>,
     /// The expected final output, one index per position.
@@ -468,9 +483,20 @@ impl OutputHeadOutputPlan {
             || self.step.hidden as u64 != shape.matrix_rows
             || self.step.columns as u64 != shape.matrix_columns()?
             || self.vocab != self.step.columns
-            || self.valid == 0
-            || self.valid >= self.vocab
-            || self.mask_value >= 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.masked {
+            if self.valid == 0
+                || self.valid >= self.vocab
+                || self.mask_value >= 0
+                || self.relation_version != 2
+            {
+                return Err(Error::InvalidConfig);
+            }
+        } else if self.valid != self.vocab
+            || self.mask_value != 0
+            || self.relation_version != 3
         {
             return Err(Error::InvalidConfig);
         }
@@ -486,8 +512,7 @@ impl OutputHeadOutputPlan {
         {
             return Err(Error::BoundViolation);
         }
-        if self.relation_version != 2
-            || self.range_bits == 0
+        if self.range_bits == 0
             || self.range_bits > 62
             || self.slack_bits == 0
             || self.slack_bits > 62
@@ -495,7 +520,7 @@ impl OutputHeadOutputPlan {
             return Err(Error::InvalidConfig);
         }
         let offset = (1u128 << self.range_bits) - 1;
-        if (self.mask_value as i128) > -((offset as i128) + 1) {
+        if self.masked && (self.mask_value as i128) > -((offset as i128) + 1) {
             return Err(Error::InvalidConfig);
         }
         let bound = 1u128 << self.slack_bits;
@@ -568,7 +593,7 @@ pub fn close_output_relation(
         let mut best = 0usize;
         let mut best_value = i64::MIN;
         for (column, value) in row.iter().enumerate() {
-            let masked = if column >= plan.valid {
+            let masked = if plan.masked && column >= plan.valid {
                 value.checked_add(plan.mask_value).ok_or(Error::BoundViolation)?
             } else {
                 *value
@@ -663,6 +688,7 @@ fn hidden_plan(
                 valid: output.valid,
                 vocab: output.vocab,
                 mask_value: output.mask_value,
+                masked: output.masked,
                 winner: output.expected_argmax.clone(),
                 slack: closure.slack.clone(),
                 slack_oracle_base: closure.slack_oracle_base,
@@ -676,6 +702,7 @@ fn hidden_plan(
                 bits_columns,
                 bits_per_cell: width as u32,
                 boolean_variables,
+                tail_pad: true,
                 mask: closure.mask.clone(),
             };
             if plan.fault(&send).is_some() {
@@ -865,9 +892,134 @@ pub fn build_output_head_output_plan_for(
         valid,
         vocab,
         mask_value,
+        masked: true,
         argmax_steps: plan.argmax_steps.clone(),
         expected_argmax: expected_argmax.to_vec(),
         relation_version: 2,
+        range_bits,
+        slack_bits,
+    };
+    Ok(output)
+}
+
+/// Selects the output-head step of a graph whose logits are argmaxed directly
+/// over the full vocabulary. There is no mask item; the argmax steps consume
+/// the MatMul output itself.
+fn select_output_head_step_unmasked_for(
+    plan: &TracePlan,
+    positions: usize,
+    hidden: usize,
+    columns: usize,
+    asset_path: &str,
+) -> Result<OutputHeadStep> {
+    if positions == 0 || hidden == 0 || columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut candidates = Vec::new();
+    for (index, step) in plan.steps.iter().enumerate() {
+        if step.opcode != OpCode::MatMul || step.inputs.len() != 2 || step.outputs != 1 {
+            continue;
+        }
+        let Some(config) = literal_config(step) else {
+            continue;
+        };
+        if config.len() != 5
+            || config[0] != positions as i64
+            || config[1] != columns as i64
+            || config[2] != hidden as i64
+            || config[3] != 0
+            || config[4] != 0
+        {
+            continue;
+        }
+        let Some((activation_step, activation_output)) = flat_previous(&step.inputs[0]) else {
+            continue;
+        };
+        if flat_asset(&step.inputs[1]) != Some(asset_path) {
+            continue;
+        }
+        candidates.push((index, activation_step, activation_output));
+    }
+    let (step, activation_step, activation_output) = match candidates.as_slice() {
+        [candidate] => *candidate,
+        [] => return Err(Error::StatementMismatch),
+        _ => return Err(Error::InvalidConfig),
+    };
+    if plan.argmax_steps.len() != positions {
+        return Err(Error::StatementMismatch);
+    }
+    let expected_rows: Vec<PlanLayout> = (0..positions)
+        .map(|row| PlanLayout::rows(columns, row, 1))
+        .collect();
+    for layout in &expected_rows {
+        let count = plan
+            .argmax_steps
+            .iter()
+            .filter(|index| {
+                plan.steps.get(**index).is_some_and(|plan_step| {
+                    plan_step.opcode == OpCode::Argmax
+                        && plan_step.inputs.len() == 1
+                        && plan_step.inputs[0]
+                            == PlanSource::Prev {
+                                step,
+                                output: 0,
+                                layout: layout.clone(),
+                            }
+                })
+            })
+            .count();
+        if count != 1 {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    let derived =
+        PreviousObjectPlan::derive_for_activation(plan, activation_step, positions, hidden)?;
+    let previous = match &plan.previous_object {
+        Some(declared) => {
+            declared.validate_for_activation(plan, activation_step, positions, hidden)?;
+            declared.clone()
+        }
+        None => derived,
+    };
+    Ok(OutputHeadStep {
+        step,
+        activation_step,
+        activation_output,
+        masked_step: step,
+        positions,
+        hidden,
+        columns,
+        asset_path: asset_path.to_owned(),
+        previous,
+    })
+}
+
+/// Builds the trusted output relation of an unmasked output head: the argmax
+/// steps consume the MatMul output directly, the valid vocabulary is the full
+/// column domain and no mask constant exists.
+pub fn build_output_head_output_plan_unmasked_for(
+    plan: &TracePlan,
+    positions: usize,
+    hidden: usize,
+    columns: usize,
+    asset_path: &str,
+    range_bits: u32,
+    slack_bits: u32,
+    expected_argmax: &[u32],
+) -> Result<OutputHeadOutputPlan> {
+    let step = select_output_head_step_unmasked_for(plan, positions, hidden, columns, asset_path)?;
+    if expected_argmax.len() != positions {
+        return Err(Error::ShapeMismatch);
+    }
+    let output = OutputHeadOutputPlan {
+        step,
+        valid: columns,
+        vocab: columns,
+        mask_value: 0,
+        masked: false,
+        argmax_steps: plan.argmax_steps.clone(),
+        expected_argmax: expected_argmax.to_vec(),
+        relation_version: 3,
         range_bits,
         slack_bits,
     };
@@ -2037,6 +2189,7 @@ mod tests {
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
+            own_deferred_samples: true,
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
             planner_checked: false,
@@ -2326,11 +2479,10 @@ mod tests {
             .unwrap(),
             slack_oracle_base: SLACK_ORACLE_BASE,
             slack_openings: 1,
-            bits: WShape::new(
+            bits: crate::proof::output_closure::stacked_shape(
                 bits_columns,
-                group_code(),
-                1,
                 TOY_POSITIONS as u32,
+                group_code(),
                 SALT,
                 BITS_TREE_NUMBER,
                 1,
@@ -2340,11 +2492,10 @@ mod tests {
             .unwrap(),
             bits_oracle_base: BITS_ORACLE_BASE,
             bits_openings: 1,
-            map: WShape::new(
+            map: crate::proof::output_closure::stacked_shape(
                 bits_columns,
-                group_code(),
-                1,
                 TOY_POSITIONS as u32,
+                group_code(),
                 SALT,
                 MAP_TREE_NUMBER,
                 1,

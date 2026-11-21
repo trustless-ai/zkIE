@@ -40,7 +40,7 @@ use crate::lm_head_key::{
     build_lm_head_holder_from_asset, fixed_lm_head_key_randomness, limited_key_binding_parameters,
     LmHeadAssetSource, LmHeadKeyRandomness,
 };
-use crate::s7_context::LmHeadAsset;
+use crate::lm_head_context::LmHeadAsset;
 
 /// The proof-dir carrier of the segment: the published public reader and the
 /// canonical session messages. The name and the version are the reserved
@@ -273,8 +273,11 @@ pub fn plan_identifier(
 }
 
 /// The trusted lm_head asset identity of the committed anchor.
-pub fn lm_head_asset(commitment: &ModelCommitment, path: &str) -> Result<LmHeadAsset> {
-    let specs = zkie_models_gpt2::plan::asset_specs();
+pub fn lm_head_asset(
+    commitment: &ModelCommitment,
+    path: &str,
+    specs: &[zkie_ops::proof::model_commitment::ModelAssetSpec],
+) -> Result<LmHeadAsset> {
     let spec = specs
         .iter()
         .find(|spec| spec.path == path)
@@ -315,6 +318,10 @@ pub fn build_segment_table(
     work_dir: &Path,
 ) -> Result<SegmentTableProver> {
     let shape = request_plan.table_shape()?;
+    let gemma3 = asset.path.contains("gemma3");
+    let table_max_bytes = if gemma3 { 8u64 << 30 } else { TABLE_MAX_BYTES };
+    let store_max_bytes = if gemma3 { 16u64 << 30 } else { STORE_MAX_BYTES };
+    let total_bytes = if gemma3 { 4u64 << 30 } else { TOTAL_BYTES };
     let store_dir = work_dir.join("segment-table-store");
     let _ = std::fs::remove_dir_all(&store_dir);
     std::fs::create_dir_all(&store_dir).map_err(|_| Error::Io)?;
@@ -324,8 +331,9 @@ pub fn build_segment_table(
         shape.rows(),
         shape.code.n(),
         configuration,
-        STORE_MAX_BYTES,
+        store_max_bytes,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_store_open");
     let holder = build_lm_head_holder_from_asset(
         asset_root,
         asset,
@@ -334,19 +342,23 @@ pub fn build_segment_table(
         key,
         &mut store,
         PANEL_COLUMNS,
-        TABLE_MAX_BYTES,
+        table_max_bytes,
         CAP_BYTES,
         WINDOW_BYTES,
-        TOTAL_BYTES,
+        total_bytes,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_holder_built");
     let reader = holder.reader().clone();
     let name = holder.table().name.clone();
     let leaves = holder.table().leaves().to_vec();
     let salts = holder.table().salts().to_vec();
     let peak = holder.table().peak_bytes();
     drop(holder);
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_holder_dropped");
     store.cleanup()?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_store_cleaned");
     let table = StreamingTable::rebuild(reader.clone(), name, leaves, salts, peak)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_table_rebuilt");
     let source = LmHeadAssetSource::open_with_asset(
         asset_root,
         asset,
@@ -355,8 +367,9 @@ pub fn build_segment_table(
         key,
         CAP_BYTES,
         WINDOW_BYTES,
-        TOTAL_BYTES,
+        total_bytes,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_source_open");
     let hiding = HidingState::new(reader.root, 1, reader.shape.code.r as u64);
     Ok(SegmentTableProver {
         table,
@@ -374,19 +387,21 @@ pub fn segment_table_key(shape: IndexShape) -> LmHeadKeyRandomness {
 pub struct SegmentParamTables {
     gain_table: StreamingTable,
     gain_source: AssetRowSource<AssetReader>,
-    bias_table: StreamingTable,
-    bias_source: AssetRowSource<AssetReader>,
+    bias_table: Option<StreamingTable>,
+    bias_source: Option<AssetRowSource<AssetReader>>,
 }
 
 fn build_param_table(
     commitment: &ModelCommitment,
     input: &AssetTableInput,
+    specs: &[zkie_ops::proof::model_commitment::ModelAssetSpec],
+    identity: Digest,
 ) -> Result<(StreamingTable, AssetRowSource<AssetReader>)> {
-    let spec: ModelAssetSpec = zkie_models_gpt2::plan::asset_specs()
-        .into_iter()
+    let spec: ModelAssetSpec = specs
+        .iter()
+        .cloned()
         .find(|spec| spec.path == input.params.path)
         .ok_or(Error::InvalidConfig)?;
-    let identity = zkie_models_gpt2::plan::table_model_identity()?;
     let configuration = asset_table_configuration(identity, &spec, &input.params)?;
     let reader = open_asset_reader(commitment, spec.asset_id)?;
     let mut source = asset_row_source(reader, &spec, &input.params, input.randomness.tails.clone())?;
@@ -415,19 +430,41 @@ fn build_param_table(
 }
 
 pub fn build_param_tables(
+    model: &str,
     commitment: &ModelCommitment,
     inputs: &[AssetTableInput],
 ) -> Result<SegmentParamTables> {
+    let (specs, identity, gain_path, bias_path) = match model {
+        "gpt2" => (
+            zkie_models_gpt2::plan::asset_specs(),
+            zkie_models_gpt2::plan::table_model_identity()?,
+            "gpt2/weights/ln_f_w_i32.bin",
+            Some("gpt2/weights/ln_f_b_i32.bin"),
+        ),
+        "gemma3" => (
+            zkie_models_gemma3::plan::asset_specs(),
+            zkie_models_gemma3::plan::table_model_identity()?,
+            "models/gemma3/weights/final_norm_i32.bin",
+            None,
+        ),
+        _ => return Err(Error::UnsupportedPrimitive),
+    };
     let gain = inputs
         .iter()
-        .find(|input| input.params.path.ends_with("ln_f_w_i32.bin"))
+        .find(|input| input.params.path == gain_path)
         .ok_or(Error::InvalidConfig)?;
-    let bias = inputs
-        .iter()
-        .find(|input| input.params.path.ends_with("ln_f_b_i32.bin"))
-        .ok_or(Error::InvalidConfig)?;
-    let (gain_table, gain_source) = build_param_table(commitment, gain)?;
-    let (bias_table, bias_source) = build_param_table(commitment, bias)?;
+    let (gain_table, gain_source) = build_param_table(commitment, gain, &specs, identity)?;
+    let (bias_table, bias_source) = match bias_path {
+        Some(path) => {
+            let bias = inputs
+                .iter()
+                .find(|input| input.params.path == path)
+                .ok_or(Error::InvalidConfig)?;
+            let (table, source) = build_param_table(commitment, bias, &specs, identity)?;
+            (Some(table), Some(source))
+        }
+        None => (None, None),
+    };
     Ok(SegmentParamTables {
         gain_table,
         gain_source,
@@ -440,7 +477,11 @@ impl NormParamTableProver for SegmentParamTables {
     fn source(&mut self, kind: NormParamKind) -> &mut dyn TableRowSource {
         match kind {
             NormParamKind::Gain => &mut self.gain_source,
-            NormParamKind::Bias => &mut self.bias_source,
+            NormParamKind::Bias => self
+                .bias_source
+                .as_mut()
+                .map(|source| source as &mut dyn TableRowSource)
+                .expect("the plan carries no bias row"),
         }
     }
 
@@ -451,7 +492,10 @@ impl NormParamTableProver for SegmentParamTables {
     ) -> Result<Vec<ColumnOpening>> {
         match kind {
             NormParamKind::Gain => self.gain_table.open_columns(&mut self.gain_source, positions),
-            NormParamKind::Bias => self.bias_table.open_columns(&mut self.bias_source, positions),
+            NormParamKind::Bias => match (&mut self.bias_table, &mut self.bias_source) {
+                (Some(table), Some(source)) => table.open_columns(source, positions),
+                _ => Err(Error::UnsupportedPrimitive),
+            },
         }
     }
 }
@@ -465,7 +509,7 @@ pub fn prove_segment_bytes(
     params: &mut SegmentParamTables,
     rstd_table: &dyn LookupTable,
 ) -> Result<Vec<u8>> {
-    let (messages, _witness) = prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+    let (messages, private_witness) = prove_hidden_lin_hidden_with_norm_hd_rstd_table(
         plan,
         table,
         seed,
@@ -473,6 +517,9 @@ pub fn prove_segment_bytes(
         rstd_table,
         Some(params),
     )?;
+    // The segment carrier needs only the messages; release the private
+    // witness before the encoded copy exists so the two never share the peak.
+    drop(private_witness);
     messages.encode()
 }
 
@@ -488,17 +535,39 @@ pub fn verify_segment_bytes(
 }
 
 /// Opens the frozen public rstd table view from the trusted asset file.
-pub fn rstd_table_view(asset_root: &Path) -> Result<RangeTable<PublicFileTable>> {
-    let config = zkie_models_gpt2::norm_profile::rstd_table_config();
-    let source = PublicFileTable::new(
-        asset_root.join("gpt2/weights/rsqrt_table_i32.bin"),
-        config.clone(),
-    )?;
-    RangeTable::open(
-        source,
-        zkie_models_gpt2::norm_profile::RSTD_TABLE_LOG,
-        &config,
-    )
+pub fn rstd_table_view(
+    asset_root: &Path,
+    model: &str,
+) -> Result<Box<dyn LookupTable>> {
+    match model {
+        "gpt2" => {
+            let config = zkie_models_gpt2::norm_profile::rstd_table_config();
+            let source = PublicFileTable::new(
+                asset_root.join("gpt2/weights/rsqrt_table_i32.bin"),
+                config.clone(),
+            )?;
+            Ok(Box::new(RangeTable::open(
+                source,
+                zkie_models_gpt2::norm_profile::RSTD_TABLE_LOG,
+                &config,
+            )?))
+        }
+        "gemma3" => {
+            let config = zkie_models_gemma3::norm_profile::rstd_table_config();
+            let source = zkie_ops::proof::lookup_table::SplitFileTable::new(
+                asset_root.join("models/gpt2/weights/rsqrt_table_i32.bin"),
+                zkie_models_gemma3::norm_profile::RSTD_BASE_LEN as usize,
+                asset_root.join("cases/gemma3/rsqrt_ext_i32.bin"),
+                config,
+            )?;
+            Ok(Box::new(RangeTable::open(
+                source,
+                zkie_models_gemma3::norm_profile::RSTD_TABLE_LOG,
+                &config,
+            )?))
+        }
+        _ => Err(Error::UnsupportedPrimitive),
+    }
 }
 
 /// The work directory of one prove stage, kept next to the proof artifact so

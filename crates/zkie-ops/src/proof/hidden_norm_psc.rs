@@ -35,6 +35,9 @@ use crate::proof::committed_psc::{
     PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormMode, NormShape};
+
+use crate::proof::rms_limbs::RmsLimbWidths;
+
 use crate::proof::hidden_send_session::{
     get_column_opening, put_column_opening, SendSamples, WShape,
 };
@@ -730,6 +733,204 @@ fn map_pair(columns: usize) -> (Vec<Fp3>, Vec<Fp3>) {
     (vec![Fp3::ZERO; 2 * columns], vec![Fp3::ZERO; 2 * columns])
 }
 
+/// The linear term list of one multi-limb RMS relation: `(round slot,
+/// coefficient)` pairs and a constant, with `sum coeff*value + constant = 0`
+/// on the exact row. Relations 30..32 and 73 bind a statistic row and are
+/// handled by their own branches.
+pub fn rms_relation_terms(
+    relation: usize,
+    slots: &RmsRoundSlots,
+) -> Result<(Vec<(usize, i128)>, i128)> {
+    let mut terms: Vec<(usize, i128)> = Vec::new();
+    let mut constant: i128 = 0;
+    let carry_offset = RmsRoundSlots::CARRY_OFFSET as i128;
+    match relation {
+        33..=42 => {
+            let index = relation - 33;
+            terms.push((slots.v_digits + index, 1));
+            if index < 9 {
+                terms.push((slots.v_carries + 2 * index, 256));
+                terms.push((slots.v_carries + 2 * index + 1, 65_536));
+            }
+            if index < 5 {
+                terms.push((slots.s_ll_digits + index, -1));
+            }
+            if index >= 2 && index - 2 < 6 {
+                terms.push((slots.s_lh_digits + index - 2, -2));
+            }
+            if index >= 4 && index - 4 < 6 {
+                terms.push((slots.s_hh_digits + index - 4, -1));
+            }
+            if index > 0 {
+                terms.push((slots.v_carries + 2 * (index - 1), -1));
+                terms.push((slots.v_carries + 2 * (index - 1) + 1, -256));
+            }
+            if index < 9 {
+                // The carry pair reads 256*(carry + OFFSET); the previous
+                // pair subtracts another OFFSET, so 255 offsets cancel, or
+                // all 256 at the first digit.
+                constant = -(255 * carry_offset)
+                    + if index == 0 { -carry_offset } else { 0 }
+                    + if index == 7 { 16 } else { 0 };
+            } else {
+                constant = carry_offset;
+            }
+        }
+        43..=52 => {
+            let index = relation - 43;
+            terms.push((slots.v_plus_digits + index, 1));
+            if index < 9 {
+                terms.push((slots.v_plus_carries + index, 256));
+            }
+            terms.push((slots.v_digits + index, -1));
+            if index > 0 {
+                terms.push((slots.v_plus_carries + index - 1, -1));
+            }
+            if index == 0 {
+                // The value is shifted by half the valid count before the
+                // two-stage division; the shift is a plan value.
+                let valid = slots.first_divisor as i128 * slots.second_divisor as i128;
+                constant = -(valid / 2);
+            }
+        }
+        53..=62 => {
+            // Stage one: divide by the first factor.
+            let index = relation - 53;
+            terms.push((slots.q1_digits + index, slots.first_divisor as i128));
+            terms.push((slots.shift_carries + index, 1));
+            terms.push((slots.v_plus_digits + index, -1));
+            if index + 1 < 10 {
+                terms.push((slots.shift_carries + index + 1, -256));
+            }
+        }
+        63..=72 => {
+            // The stage-one remainder is below the first factor.
+            let index = relation - 63;
+            terms.push((slots.shift_carries + index, 1));
+            terms.push((slots.shift_slack + index, 1));
+            constant = -(slots.first_divisor as i128 - 1);
+        }
+        73..=82 => {
+            // Stage two: divide the shifted quotient by the second factor.
+            let index = relation - 73;
+            terms.push((slots.q_digits + index, slots.second_divisor as i128));
+            terms.push((slots.division_carries + index, 1));
+            terms.push((slots.q1_digits + index, -1));
+            if index + 1 < 10 {
+                terms.push((slots.division_carries + index + 1, -256));
+            }
+        }
+        83..=92 => {
+            // The stage-two remainder is below the second factor.
+            let index = relation - 83;
+            terms.push((slots.division_carries + index, 1));
+            terms.push((slots.division_slack + index, 1));
+            constant = -(slots.second_divisor as i128 - 1);
+        }
+        93 => {
+            // The mean digits reconstruct the rounded mean square over the
+            // two 32-bit halves: each byte carries its positional weight, so
+            // the high half's bytes are shifted by 2^32.
+            for index in 0..8 {
+                terms.push((slots.q_digits + index, 1i128 << (8 * index)));
+            }
+        }
+        94 => {
+            terms.push((slots.q_digits + 8, 1));
+            terms.push((slots.q_digits + 9, 1));
+        }
+        95 => {
+            // q7 + slack = 31 forces the mean below 2^61.
+            terms.push((slots.q_digits + 7, 1));
+            terms.push((slots.mean_top_slack, 1));
+            constant = -31;
+        }
+        _ => return Err(Error::UnsupportedPrimitive),
+    }
+    Ok((terms, constant))
+}
+
+/// The exact witness value of one multi-limb round slot. The carry slots are
+/// offset-encoded, matching the committed message.
+pub(crate) fn rms_slot_value(
+    row: &crate::proof::rms_limbs::RmsLimbRow,
+    slots: &RmsRoundSlots,
+    slot: usize,
+) -> Result<i128> {
+    let offset = RmsRoundSlots::CARRY_OFFSET as i128;
+    let value = if slot >= slots.v_digits && slot < slots.v_digits + 10 {
+        row.v_digits[slot - slots.v_digits] as i128
+    } else if slot >= slots.v_carries && slot < slots.v_carries + 20 {
+        // The committed pair is the 16-bit `carry + OFFSET` split into its
+        // low and high byte, exactly as the round message writes it.
+        let index = (slot - slots.v_carries) / 2;
+        let byte = (slot - slots.v_carries) % 2;
+        let encoded = i128::from(row.v_carries[index]) + offset;
+        if byte == 0 {
+            encoded & 0xff
+        } else {
+            (encoded >> 8) & 0xff
+        }
+    } else if slot >= slots.s_ll_digits && slot < slots.s_ll_digits + 5 {
+        row.s_ll_digits[slot - slots.s_ll_digits] as i128
+    } else if slot >= slots.s_lh_digits && slot < slots.s_lh_digits + 6 {
+        row.s_lh_digits[slot - slots.s_lh_digits] as i128
+    } else if slot >= slots.s_hh_digits && slot < slots.s_hh_digits + 6 {
+        row.s_hh_digits[slot - slots.s_hh_digits] as i128
+    } else if slot >= slots.v_plus_digits && slot < slots.v_plus_digits + 10 {
+        row.v_plus_digits[slot - slots.v_plus_digits] as i128
+    } else if slot >= slots.v_plus_carries && slot < slots.v_plus_carries + 10 {
+        row.v_plus_carries[slot - slots.v_plus_carries] as i128
+    } else if slot >= slots.q1_digits && slot < slots.q1_digits + 10 {
+        row.q1_digits[slot - slots.q1_digits] as i128
+    } else if slot >= slots.shift_carries && slot < slots.shift_carries + 10 {
+        row.shift_carries[slot - slots.shift_carries] as i128
+    } else if slot >= slots.shift_slack && slot < slots.shift_slack + 10 {
+        row.shift_slack[slot - slots.shift_slack] as i128
+    } else if slot >= slots.q_digits && slot < slots.q_digits + 10 {
+        row.mean_digits[slot - slots.q_digits] as i128
+    } else if slot >= slots.division_carries && slot < slots.division_carries + 10 {
+        row.division_carries[slot - slots.division_carries] as i128
+    } else if slot >= slots.division_slack && slot < slots.division_slack + 10 {
+        row.division_slack[slot - slots.division_slack] as i128
+    } else if slot == slots.mean_top_slack {
+        row.mean_top_slack as i128
+    } else {
+        return Err(Error::InvalidIndex);
+    };
+    Ok(value)
+}
+
+/// One evaluated term of an RMS limb relation: its slot, the plan's
+/// coefficient and the exact witness value at that slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RmsRelationTerm {
+    pub slot: usize,
+    pub coefficient: i128,
+    pub value: i128,
+}
+
+/// The single evaluation path of one RMS limb relation: the plan's terms and
+/// the witness values at their slots, with the constant of
+/// `Σ coefficient · slot + constant = 0`. The PSC relation map and the
+/// second-stage plain rows read the same term list.
+pub(crate) fn rms_relation_values(
+    row: &crate::proof::rms_limbs::RmsLimbRow,
+    slots: &RmsRoundSlots,
+    relation: usize,
+) -> Result<(Vec<RmsRelationTerm>, i128)> {
+    let (terms, constant) = rms_relation_terms(relation, slots)?;
+    let mut values = Vec::with_capacity(terms.len());
+    for (slot, coefficient) in terms {
+        values.push(RmsRelationTerm {
+            slot,
+            coefficient,
+            value: rms_slot_value(row, slots, slot)?,
+        });
+    }
+    Ok((values, constant))
+}
+
 pub(crate) fn rel_map(
     row: &NormCoreRow,
     values: &[i64],
@@ -967,9 +1168,9 @@ pub(crate) fn rel_map(
                     left[2] = signed(rsqrt.coarse_q as i128)?;
                     right[2] = signed(-65_536)?;
                     left[3] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
-                    right[3] = signed(-256)?;
+                    right[3] = signed(-1)?;
                     left[4] = Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
-                    right[4] = signed(-1)?;
+                    right[4] = signed(-256)?;
                 }
                 24 => {
                     // index = fine*raw + middle*(FINE+q) + coarse*(END+q)
@@ -997,18 +1198,103 @@ pub(crate) fn rel_map(
                 }
             }
         }
-        26 => {
-            // RMS statistic: sum of the squared valid cells. Both factors
-            // read the committed x row, so the product map is x_i * x_i; the
-            // extra slot carries -sum on the left and one on the right.
-            for (index, value) in values.iter().take(valid).enumerate() {
-                let value = fp3_signed(*value as i128)?;
-                left[index] = value;
-                right[index] = value;
+
+        30..=32 => {
+            let round = round.ok_or(Error::InvalidConfig)?;
+            let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
+            let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            let (start, width, digits, value, offset) = match relation {
+                30 => (rms_slots.s_ll_digits, 5usize, &limb.s_ll_digits, row.sum, 0i128),
+                31 => (
+                    rms_slots.s_lh_digits,
+                    6,
+                    &limb.s_lh_digits,
+                    row.squares,
+                    crate::proof::rms_limbs::CROSS_OFFSET,
+                ),
+                _ => (rms_slots.s_hh_digits, 6, &limb.s_hh_digits, row.mean as i128, 0),
+            };
+            let _ = start;
+            if width >= columns || digits.len() > width {
+                return Err(Error::ShapeMismatch);
             }
-            left[columns] = fp3_signed(-row.sum)?;
+            let mut power: i128 = 1;
+            for index in 0..width {
+                let digit = digits.get(index).copied().unwrap_or(0) as i128;
+                left[index] = fp3_signed(power * digit)?;
+                right[index] = Fp3::ONE;
+                power = power.checked_mul(256).ok_or(Error::ResourceLimit)?;
+            }
+            if offset != 0 {
+                left[width] = fp3_signed(-offset)?;
+                right[width] = Fp3::ONE;
+            }
+            left[columns] = fp3_signed(-value)?;
             right[columns] = Fp3::ONE;
         }
+        33..=95 => {
+            let round = round.ok_or(Error::InvalidConfig)?;
+            let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
+            let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            let (terms, constant) = rms_relation_values(limb, &rms_slots, relation)?;
+            if terms.len() + 1 >= columns {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, term) in terms.iter().enumerate() {
+                let value = term
+                    .coefficient
+                    .checked_mul(term.value)
+                    .ok_or(Error::ResourceLimit)?;
+                left[index] = fp3_signed(value)?;
+                right[index] = Fp3::ONE;
+            }
+            let constant = match relation {
+                93 => constant
+                    .checked_sub(row.variance as i128)
+                    .ok_or(Error::ResourceLimit)?,
+                _ => constant,
+            };
+            left[columns] = fp3_signed(constant)?;
+            right[columns] = Fp3::ONE;
+        }
+        26..=28 => {
+            // The three bounded partial sums of the RMS statistic:
+            // S_ll = sum lo^2, S_lh = sum lo hi, S_hh = sum hi^2. Each
+            // relation has both factors over one limb row; the extra slot
+            // carries the minus of the committed scalar.
+            let rms = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            let (left_limb, right_limb, scalar) = match relation {
+                26 => (&rms.low, &rms.low, row.sum),
+                27 => (&rms.low, &rms.high, row.squares),
+                _ => (&rms.high, &rms.high, row.mean as i128),
+            };
+            for (index, (left_value, right_value)) in
+                left_limb.iter().zip(right_limb.iter()).enumerate().take(valid)
+            {
+                left[index] = fp3_signed(*left_value as i128)?;
+                right[index] = fp3_signed(*right_value as i128)?;
+            }
+            left[columns] = fp3_signed(-scalar)?;
+            right[columns] = Fp3::ONE;
+        }
+        29 => {
+            // The pointwise split x = lo + 2^16 hi over the valid columns.
+            // The padding cells of every group are zero, so the relation on
+            // the valid domain fixes the padded cells at zero as well.
+            let rms = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            if rms.low.len() != valid || rms.high.len() != valid {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, value) in values.iter().take(valid).enumerate() {
+                let high = fp3_signed(rms.high[index] as i128)?
+                    .mul(&Fp3::from_u64(1 << 16));
+                left[index] = fp3_signed(*value as i128)?
+                    .sub(&fp3_signed(rms.low[index] as i128)?)
+                    .sub(&high);
+                right[index] = Fp3::ONE;
+            }
+        }
+
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -1138,9 +1424,14 @@ pub const NORM_BIND_VERSION: u64 = 15;
 /// every relation is fixed by the relation index; the plan may list only
 /// relations whose row binding is implemented. Relation 26 is the RMS sum of
 /// squares; the layer relations 0 and 1 are not part of an RMS plan.
-pub const NORM_BOUND_RELATIONS: [usize; 27] = [
+
+pub const NORM_BOUND_RELATIONS: [usize; 96] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-    25, 26,
+    25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+    47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+    69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+    91, 92, 93, 94, 95,
+
 ];
 
 /// One committed witness group of the integrated norm plan.
@@ -2033,6 +2324,20 @@ pub fn lookup_mask_rows(
     Err(Error::ResourceLimit)
 }
 
+/// The trusted plan of the multi-limb RMS statistic. The two limb groups are
+/// committed column rows bound pointwise to the trusted x group; the widths
+/// are derived from the input bound and the valid count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RmsLimbPlan {
+    pub low: NormGroupPlan,
+    pub high: NormGroupPlan,
+    pub widths: RmsLimbWidths,
+    /// The trusted bound of the rounded mean square.
+    pub mean_bound: u64,
+    /// The correlated bound of the pre-clamp value.
+    pub pre_bound: u64,
+}
+
 /// The trusted plan of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormPlan {
@@ -2049,6 +2354,9 @@ pub struct NormPlan {
     /// The trusted product-form x group. Its roots are plan values.
     pub x: NormGroupPlan,
     pub x_roots: Vec<Digest>,
+    /// The multi-limb RMS limb groups and bounds; present only for the RMS
+    /// form.
+    pub rms: Option<RmsLimbPlan>,
     /// The proof-fixed sum/squares/mean/variance witness groups.
     pub sum: NormGroupPlan,
     pub squares: NormGroupPlan,
@@ -2103,18 +2411,17 @@ impl NormPlan {
             return Err(Error::UnsupportedPrimitive);
         }
         if self.mode.is_rms() {
-            // The RMS form proves the sum of squares and the two rounding
-            // equations; the centering relations of the layer form must not
-            // be listed because their equations are false for this relation.
-            if self.relations.contains(&0)
-                || self.relations.contains(&1)
-                || !self.relations.contains(&2)
-                || !self.relations.contains(&3)
-                || !self.relations.contains(&26)
+
+            // The RMS form proves the multi-limb statistic and the rsqrt
+            // rows; the layer relations 0..15 are not part of its plan.
+            if self.relations.iter().any(|relation| *relation < 16)
+                || !(16..=25).all(|relation| self.relations.contains(&relation))
+                || !(26..=95).all(|relation| self.relations.contains(&relation))
             {
                 return Err(Error::InvalidConfig);
             }
-        } else if self.relations.contains(&26) {
+        } else if self.relations.iter().any(|relation| *relation >= 26) {
+
             return Err(Error::InvalidConfig);
         }
         if self.x.columns != self.columns
@@ -2138,7 +2445,11 @@ impl NormPlan {
         {
             return Err(Error::InvalidConfig);
         }
-        let groups = [&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
+        let mut groups = vec![&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
+        if let Some(rms) = &self.rms {
+            groups.push(&rms.low);
+            groups.push(&rms.high);
+        }
         for left in 0..groups.len() {
             for right in left + 1..groups.len() {
                 if groups[left].oracle_base == groups[right].oracle_base {
@@ -2156,22 +2467,28 @@ impl NormPlan {
             {
                 return Err(Error::InvalidConfig);
             }
-            let columns = round.layout.widths.columns()?;
+            let columns = u64::try_from(round.layout.total_slots())
+                .ok()
+                .and_then(|slots| slots.checked_next_power_of_two())
+                .ok_or(Error::ResourceLimit)?;
             if round.group.columns != columns
                 || round.group.fault(self.shape.positions).is_some()
                 || round.group.shape.answers != 1
             {
                 return Err(Error::InvalidConfig);
             }
-            if norm_no_wrap_mode(
-                round.input_bound,
-                self.shape.valid,
-                &round.layout.widths,
-                round.layout.sum_offset,
-                round.layout.mean_offset,
-                self.mode,
-            )
-            .is_err()
+
+            if !self.mode.is_rms()
+                && norm_no_wrap_mode(
+                    round.input_bound,
+                    self.shape.valid,
+                    &round.layout.widths,
+                    round.layout.sum_offset,
+                    round.layout.mean_offset,
+                    self.mode,
+                )
+                .is_err()
+
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2284,11 +2601,66 @@ impl NormPlan {
                     .as_ref()
                     .is_some_and(|bias| bias.width != self.columns)
             {
+
+
                 return Err(Error::InvalidConfig);
             }
             if self.mode.is_rms() && params.bias.is_some() {
                 return Err(Error::InvalidConfig);
             }
+        }
+        match (&self.rms, self.mode.is_rms()) {
+            (Some(rms), true) => {
+                if rms.low.columns != self.columns
+                    || rms.high.columns != self.columns
+                    || rms.low.fault(self.shape.positions).is_some()
+                    || rms.high.fault(self.shape.positions).is_some()
+                    || rms.mean_bound == 0
+                    || rms.mean_bound >= (1u64 << 62)
+                    || rms.pre_bound == 0
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                rms.widths.validate()?;
+                let round = self.round.as_ref().ok_or(Error::InvalidConfig)?;
+                let expected_widths = crate::proof::rms_limbs::RmsLimbWidths::derive(
+                    round.input_bound,
+                    self.shape.valid,
+                )?;
+                if round.layout.rms.is_none() || rms.widths != expected_widths {
+                    return Err(Error::InvalidConfig);
+                }
+                if let Some(slots) = &round.layout.rms {
+                    if slots.first_divisor != rms.widths.first_divisor
+                        || slots.second_divisor != rms.widths.second_divisor
+                    {
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+                if round.group.columns < round.layout.total_slots() as u64 {
+                    return Err(Error::InvalidConfig);
+                }
+                // The 752 window cover with the correlated pre bound.
+                let reconstruction = ((1u128 << 31) - 1)
+                    .checked_mul(1u128 << 32)
+                    .and_then(|value| value.checked_add((1u128 << 32) - 1))
+                    .ok_or(Error::ResourceLimit)?;
+                if (rms.pre_bound as u128)
+                    .checked_add(reconstruction)
+                    .filter(|value| *value < MODULUS as u128)
+                    .is_none()
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                norm_rms_no_wrap(
+                    round.input_bound,
+                    self.shape.valid,
+                    &rms.widths,
+                    rms.mean_bound,
+                )?;
+            }
+            (None, false) => {}
+            _ => return Err(Error::InvalidConfig),
         }
         if let Some(output) = &self.output {
             if self.params.is_none() {
@@ -2366,14 +2738,8 @@ impl NormPlan {
         let sh_cap = capacity(widths.shifted)?;
         let pre_cap = capacity(widths.pre_clamp)?;
         let pre_half = half_range(widths.pre_clamp)?;
-        let round_bounds = norm_no_wrap_mode(
-            round.input_bound,
-            self.shape.valid,
-            &round.layout.widths,
-            round.layout.sum_offset,
-            round.layout.mean_offset,
-            self.mode,
-        )?;
+
+
         let gain = params
             .gain
             .valid_max
@@ -2385,25 +2751,45 @@ impl NormPlan {
                 .unsigned_abs()
                 .max(bias.valid_min.unsigned_abs()) as u128
         });
-        let centered = (round.input_bound as u128)
-            .checked_mul(2)
-            .ok_or(Error::ResourceLimit)?;
+
+
         // The image is the pointwise product pinned by the product-sumcheck;
-        // the prover has no free choice over it. The per-column bound uses the
-        // trusted input contract and the pinned table magnitudes: the centered
-        // amplitude (twice the input bound), the rstd value bound of the
-        // frozen-table plan when present, and the gain bound. The valid-column
-        // count is not a factor: the claim target is field arithmetic and the
-        // image carries no per-row sum.
-        let rstd_bound = match &self.rstd {
-            Some(rstd) => u128::from(rstd.value_bound),
-            None => round_bounds.rsqrt,
+        // the prover has no free choice over it. The layer form bounds it by
+        // the centered amplitude, the pinned rstd value and the gain bound.
+        // The RMS form uses the correlated pre-clamp bound derived from the
+        // frozen table and checked on the authenticated rows, because the
+        // independent product of the same factors exceeds the field half.
+        let image = if self.mode.is_rms() {
+            let rms = self.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            norm_rms_no_wrap(
+                round.input_bound,
+                self.shape.valid,
+                &rms.widths,
+                rms.mean_bound,
+            )?;
+            rms.pre_bound as u128
+        } else {
+            let round_bounds = norm_no_wrap_mode(
+                round.input_bound,
+                self.shape.valid,
+                &round.layout.widths,
+                round.layout.sum_offset,
+                round.layout.mean_offset,
+                self.mode,
+            )?;
+            let centered = (round.input_bound as u128)
+                .checked_mul(2)
+                .ok_or(Error::ResourceLimit)?;
+            let rstd_bound = match &self.rstd {
+                Some(rstd) => u128::from(rstd.value_bound),
+                None => round_bounds.rsqrt,
+            };
+            centered
+                .checked_mul(rstd_bound)
+                .and_then(|value| value.checked_mul(gain))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::ResourceLimit)?
         };
-        let image = centered
-            .checked_mul(rstd_bound)
-            .and_then(|value| value.checked_mul(gain))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(Error::ResourceLimit)?;
         let shifted = q_half
             .checked_add(1)
             .ok_or(Error::ResourceLimit)?;
@@ -2533,6 +2919,23 @@ impl NormPlan {
         writer.put_u64(self.x_roots.len() as u64);
         for root in &self.x_roots {
             writer.put_digest(root);
+        }
+        match &self.rms {
+            Some(rms) => {
+                writer.put_u64(1);
+                put_norm_group(writer, &rms.low);
+                put_norm_group(writer, &rms.high);
+                writer.put_u64(rms.widths.first_divisor as u64);
+                writer.put_u64(rms.widths.second_divisor as u64);
+                writer.put_u64(rms.widths.s_ll as u64);
+                writer.put_u64(rms.widths.s_lh as u64);
+                writer.put_u64(rms.widths.s_hh as u64);
+                writer.put_u64(rms.widths.v as u64);
+                writer.put_u64(rms.widths.mean as u64);
+                writer.put_u64(rms.mean_bound);
+                writer.put_u64(rms.pre_bound);
+            }
+            None => writer.put_u64(0),
         }
         put_norm_group(writer, &self.sum);
         put_norm_group(writer, &self.squares);
@@ -4315,6 +4718,9 @@ pub struct NormWitness {
     /// The exact integer core of every row.
     pub core: Vec<NormCoreRow>,
     pub x: NormGroupWitness,
+    /// The committed limb rows of the RMS form.
+    pub low: Option<NormGroupWitness>,
+    pub high: Option<NormGroupWitness>,
     pub sum: NormGroupWitness,
     pub squares: NormGroupWitness,
     pub mean: NormGroupWitness,
@@ -4830,6 +5236,9 @@ impl NormOutputTailMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
     pub x: CommittedPscGroup,
+    /// The committed limb rows of the RMS form; absent in the layer form.
+    pub low: Option<CommittedPscGroup>,
+    pub high: Option<CommittedPscGroup>,
     pub sum: CommittedPscGroup,
     pub squares: CommittedPscGroup,
     pub mean: CommittedPscGroup,
@@ -4856,6 +5265,15 @@ impl NormFirstMessages {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(NORM_BIND_VERSION);
         self.x.encode_into(&mut writer)?;
+        for limb in [&self.low, &self.high] {
+            match limb {
+                Some(group) => {
+                    writer.put_u64(1);
+                    group.encode_into(&mut writer)?;
+                }
+                None => writer.put_u64(0),
+            }
+        }
         self.sum.encode_into(&mut writer)?;
         self.squares.encode_into(&mut writer)?;
         self.mean.encode_into(&mut writer)?;
@@ -4900,6 +5318,28 @@ impl NormFirstMessages {
         }
         let positions = plan.shape.positions;
         let x = CommittedPscGroup::decode(&mut reader, &plan.x.shape, positions)?;
+        let mut limb_group = |plan: &NormPlan, kind: u8| -> Result<Option<CommittedPscGroup>> {
+            match reader.get_u64()? {
+                0 => {
+                    if plan.rms.is_some() {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    Ok(None)
+                }
+                1 => {
+                    let rms = plan.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+                    let group = if kind == 0 { &rms.low } else { &rms.high };
+                    Ok(Some(CommittedPscGroup::decode(
+                        &mut reader,
+                        &group.shape,
+                        positions,
+                    )?))
+                }
+                _ => Err(Error::InvalidEncoding),
+            }
+        };
+        let low = limb_group(plan, 0)?;
+        let high = limb_group(plan, 1)?;
         let sum = CommittedPscGroup::decode(&mut reader, &plan.sum.shape, positions)?;
         let squares = CommittedPscGroup::decode(&mut reader, &plan.squares.shape, positions)?;
         let mean = CommittedPscGroup::decode(&mut reader, &plan.mean.shape, positions)?;
@@ -4974,6 +5414,8 @@ impl NormFirstMessages {
         reader.finish()?;
         let message = Self {
             x,
+            low,
+            high,
             sum,
             squares,
             mean,
@@ -4994,13 +5436,21 @@ impl NormFirstMessages {
     /// witness group roots are proof values and are not compared with the plan.
     pub fn check_trusted(&self, plan: &NormPlan) -> Result<()> {
         plan.validate()?;
-        let groups = [
-            (&self.x, &plan.x, true),
+        let mut groups = vec![(&self.x, &plan.x, true)];
+        match (&plan.rms, &self.low, &self.high) {
+            (Some(rms), Some(low), Some(high)) => {
+                groups.push((low, &rms.low, false));
+                groups.push((high, &rms.high, false));
+            }
+            (None, None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        groups.extend([
             (&self.sum, &plan.sum, false),
             (&self.squares, &plan.squares, false),
             (&self.mean, &plan.mean, false),
             (&self.variance, &plan.variance, false),
-        ];
+        ]);
         for (message, group_plan, trusted) in groups {
             if message.message.group.group != group_plan.group {
                 return Err(Error::StatementMismatch);
@@ -5200,6 +5650,77 @@ fn digit_capacity(width: usize) -> Result<u128> {
         .ok_or(Error::ResourceLimit)
 }
 
+/// The digit and carry slots of the multi-limb RMS rows inside the rounding
+/// message. Every digit is one byte cell; every carry is one two-byte signed
+/// cell (offset by `2^15`), so the byte lookup covers every cell. The slots
+/// are absolute positions in the rounding message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RmsRoundSlots {
+    pub first_divisor: u32,
+    pub second_divisor: u32,
+    pub s_ll_digits: usize,
+    pub s_lh_digits: usize,
+    pub s_hh_digits: usize,
+    pub v_digits: usize,
+    pub v_carries: usize,
+    pub v_plus_digits: usize,
+    pub v_plus_carries: usize,
+    pub q1_digits: usize,
+    pub shift_carries: usize,
+    pub shift_slack: usize,
+    pub q_digits: usize,
+    pub division_carries: usize,
+    pub division_slack: usize,
+    pub mean_top_slack: usize,
+    pub total: usize,
+}
+
+impl RmsRoundSlots {
+    pub const CARRY_OFFSET: u64 = 1 << 15;
+
+    pub fn new(base: usize, first_divisor: u32, second_divisor: u32) -> Self {
+        let mut next = base;
+        let mut take = |count: usize| {
+            let at = next;
+            next += count;
+            at
+        };
+        let s_ll_digits = take(5);
+        let s_lh_digits = take(6);
+        let s_hh_digits = take(6);
+        let v_digits = take(10);
+        let v_carries = take(20);
+        let v_plus_digits = take(10);
+        let v_plus_carries = take(10);
+        let q1_digits = take(10);
+        let shift_carries = take(10);
+        let shift_slack = take(10);
+        let q_digits = take(10);
+        let division_carries = take(10);
+        let division_slack = take(10);
+        let mean_top_slack = take(1);
+        Self {
+            first_divisor,
+            second_divisor,
+            s_ll_digits,
+            s_lh_digits,
+            s_hh_digits,
+            v_digits,
+            v_carries,
+            v_plus_digits,
+            v_plus_carries,
+            q1_digits,
+            shift_carries,
+            shift_slack,
+            q_digits,
+            division_carries,
+            division_slack,
+            mean_top_slack,
+            total: next,
+        }
+    }
+}
+
 /// The slot positions of the rounding witness message.
 ///
 /// The six fixed slots hold the mean and variance remainders, offsets and
@@ -5257,6 +5778,8 @@ pub struct NormRoundLayout {
     /// and every lookup constructor consume the same field.
     pub mode: NormMode,
     pub slots: NormRoundSlots,
+    /// The multi-limb RMS slots, present only for the RMS form.
+    pub rms: Option<RmsRoundSlots>,
 }
 
 impl NormRoundLayout {
@@ -5428,7 +5951,30 @@ impl NormRoundLayout {
                 rstd,
                 total: next,
             },
+            rms: None,
         })
+    }
+
+    /// Attaches the multi-limb RMS slots after the shared slots.
+    pub fn with_rms(mut self, first_divisor: u32, second_divisor: u32) -> Result<Self> {
+        let base = self.slots.total;
+        if first_divisor == 0
+            || second_divisor == 0
+            || first_divisor > 255
+            || second_divisor > 255
+        {
+            return Err(Error::InvalidConfig);
+        }
+        self.rms = Some(RmsRoundSlots::new(base, first_divisor, second_divisor));
+        Ok(self)
+    }
+
+    /// The total slot count including the multi-limb slots.
+    pub fn total_slots(&self) -> usize {
+        match self.rms {
+            Some(slots) => slots.total,
+            None => self.slots.total,
+        }
     }
 
     /// The committed digit slots the byte lookup covers, in plan order: the
@@ -5457,6 +6003,25 @@ impl NormRoundLayout {
             (self.slots.index_digits, RSQRT_INDEX_WIDTH),
             (self.slots.index_slack, RSQRT_INDEX_SLACK_WIDTH),
         ];
+        let mut ranges = ranges.to_vec();
+        if let Some(rms) = self.rms {
+            ranges.extend([
+                (rms.s_ll_digits, 5),
+                (rms.s_lh_digits, 6),
+                (rms.s_hh_digits, 6),
+                (rms.v_digits, 10),
+                (rms.v_carries, 20),
+                (rms.v_plus_digits, 10),
+                (rms.v_plus_carries, 10),
+                (rms.q1_digits, 10),
+                (rms.shift_carries, 10),
+                (rms.shift_slack, 10),
+                (rms.q_digits, 10),
+                (rms.division_carries, 10),
+                (rms.division_slack, 10),
+                (rms.mean_top_slack, 1),
+            ]);
+        }
         let mut slots = Vec::new();
         for (start, width) in ranges {
             for index in 0..width {
@@ -5584,6 +6149,72 @@ impl NormRoundLayout {
             &rsqrt.index_slack_digits,
         )?;
         values[self.rstd_slot()] = fp3_signed(rsqrt.rstd as i128)?;
+
+        if let Some(slots) = self.rms {
+            if columns < slots.total as u64 {
+                return Err(Error::ShapeMismatch);
+            }
+            let rms = core.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+            write_digits(
+                &mut values[slots.s_ll_digits..slots.s_ll_digits + 5],
+                &rms.s_ll_digits,
+            )?;
+            write_digits(
+                &mut values[slots.s_lh_digits..slots.s_lh_digits + 6],
+                &rms.s_lh_digits,
+            )?;
+            write_digits(
+                &mut values[slots.s_hh_digits..slots.s_hh_digits + 6],
+                &rms.s_hh_digits,
+            )?;
+            write_digits(
+                &mut values[slots.v_digits..slots.v_digits + 10],
+                &rms.v_digits,
+            )?;
+            for (index, carry) in rms.v_carries.iter().enumerate() {
+                let encoded = i64::from(*carry)
+                    .checked_add(RmsRoundSlots::CARRY_OFFSET as i64)
+                    .ok_or(Error::BoundViolation)?;
+                let encoded = u16::try_from(encoded).map_err(|_| Error::BoundViolation)?;
+                values[slots.v_carries + 2 * index] = Fp3::from_u64((encoded & 0xff) as u64);
+                values[slots.v_carries + 2 * index + 1] =
+                    Fp3::from_u64((encoded >> 8) as u64);
+            }
+            write_digits(
+                &mut values[slots.v_plus_digits..slots.v_plus_digits + 10],
+                &rms.v_plus_digits,
+            )?;
+            write_digits(
+                &mut values[slots.v_plus_carries..slots.v_plus_carries + 10],
+                &rms.v_plus_carries,
+            )?;
+            write_digits(
+                &mut values[slots.q1_digits..slots.q1_digits + 10],
+                &rms.q1_digits,
+            )?;
+            write_digits(
+                &mut values[slots.shift_carries..slots.shift_carries + 10],
+                &rms.shift_carries,
+            )?;
+            write_digits(
+                &mut values[slots.shift_slack..slots.shift_slack + 10],
+                &rms.shift_slack,
+            )?;
+            write_digits(
+                &mut values[slots.q_digits..slots.q_digits + 10],
+                &rms.mean_digits,
+            )?;
+            write_digits(
+                &mut values[slots.division_carries..slots.division_carries + 10],
+                &rms.division_carries,
+            )?;
+            write_digits(
+                &mut values[slots.division_slack..slots.division_slack + 10],
+                &rms.division_slack,
+            )?;
+            values[slots.mean_top_slack] = Fp3::from_u64(u64::from(rms.mean_top_slack));
+        }
+
         Ok(values)
     }
 }
@@ -5613,6 +6244,73 @@ fn write_digits(slot: &mut [Fp3], digits: &[u8]) -> Result<()> {
     }
     for (target, digit) in slot.iter_mut().zip(digits) {
         *target = Fp3::from_u64(*digit as u64);
+    }
+    Ok(())
+}
+
+/// The plan-level no-wrap bounds of the multi-limb RMS form. Every relation
+/// term stays below the field half range, the two-half mean reconstruction
+/// stays below it under `mean_bound`, and the rsqrt relations are rederived
+/// with the same mean bound instead of the old single-element variance
+/// capacity.
+pub fn norm_rms_no_wrap(
+    input_bound: u64,
+    valid: u32,
+    widths: &crate::proof::rms_limbs::RmsLimbWidths,
+    mean_bound: u64,
+) -> Result<()> {
+    use crate::proof::rms_limbs::{CROSS_OFFSET, LIMB_BASE, LOW_BOUND};
+    if input_bound == 0 || valid == 0 || mean_bound == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    widths.validate()?;
+    let x = input_bound as u128;
+    let d = valid as u128;
+    let low = LOW_BOUND as u128;
+    let high = (x + low - 1) / LIMB_BASE as u128;
+    let s_ll = d
+        .checked_mul(low.checked_mul(low).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let s_lh = d
+        .checked_mul(low.checked_mul(high).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let s_hh = d
+        .checked_mul(high.checked_mul(high).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let half = (MODULUS as u128) / 2;
+    for (value, width) in [(s_ll, widths.s_ll), (s_hh, widths.s_hh)] {
+        if value >= half || value >= 1u128 << (8 * width as u32) {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    if s_lh
+        .checked_add(CROSS_OFFSET as u128)
+        .filter(|value| *value < half && *value < (1u128 << (8 * widths.s_lh as u32)))
+        .is_none()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    // The mean reconstruction: m + lo + 2^32 hi, with m below mean_bound,
+    // lo below 2^32 and hi below 2^29 by the q7 slack relation.
+    let mean_reconstruction = (mean_bound as u128)
+        .checked_add((1u128 << 32) - 1)
+        .and_then(|value| {
+            value.checked_add(((1u128 << 32) - 1) * ((1u128 << 29) - 1))
+        })
+        .ok_or(Error::ResourceLimit)?;
+    if mean_reconstruction >= half {
+        return Err(Error::InvalidConfig);
+    }
+    // The rsqrt relations: raw = round(m / 2^18), index and raw digits keep
+    // their small capacities; the widest term is m + 2^17 + 2^18 raw.
+    let raw = ((mean_bound as u128) + (1u128 << 17)) / (1u128 << 18) + 1;
+    let rsqrt = (mean_bound as u128)
+        .checked_add(1u128 << 17)
+        .and_then(|value| value.checked_add((1u128 << 18) * raw))
+        .and_then(|value| value.checked_add(1u128 << 19))
+        .ok_or(Error::ResourceLimit)?;
+    if rsqrt >= half {
+        return Err(Error::InvalidConfig);
     }
     Ok(())
 }
@@ -6623,10 +7321,7 @@ mod tests {
             .enumerate()
             .map(|(position, list)| {
                 committed
-                    .trees
-                    .get(position)
-                    .unwrap()
-                    .open(list)
+                    .open_position(&plan.shape, &tails[position], position, list)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -6798,6 +7493,7 @@ mod tests {
             relations: vec![0, 1, 2, 3],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
+            rms: None,
             sum: integrated_group(&psc.groups.sum),
             squares: integrated_group(&psc.groups.squares),
             mean: integrated_group(&psc.groups.mean),
@@ -6811,6 +7507,8 @@ mod tests {
         };
         let message = NormFirstMessages {
             x: first.x.clone(),
+            low: None,
+            high: None,
             sum: first.sum.clone(),
             squares: first.squares.clone(),
             mean: first.mean.clone(),

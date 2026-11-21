@@ -184,7 +184,6 @@ impl LimitedTableIdentity {
         }
         if self.model.is_empty()
             || self.case_id.is_empty()
-            || self.asset_id == 0
             || self.anchor_id == Digest::ZERO
             || self.model_id == Digest::ZERO
             || self.asset_table_identity == Digest::ZERO
@@ -890,14 +889,25 @@ pub fn select(
             })
         }
         "gemma3" => {
-            if case.limited_table_identity.is_some() {
-                return Err(Error::InvalidConfig);
-            }
             if case.raw_input_length.is_some() || case.patch_tokens.is_some() {
                 return Err(Error::InvalidConfig);
             }
             let sequence = case.sequence_length.ok_or(Error::InvalidConfig)?;
             if sequence == 0 || sequence > TOKEN_MAX_SEQUENCE || sequence != input_len {
+                return Err(Error::StatementMismatch);
+            }
+            let anchor_id = digest_from_hex(&case.anchor_id)?;
+            let model_id = digest_from_hex(&case.model_id)?;
+            let identity = case
+                .limited_table_identity
+                .clone()
+                .ok_or(Error::InvalidConfig)?;
+            if identity.model != document.model
+                || identity.model_version != document.model_version
+                || identity.case_id != case.case_id
+                || identity.anchor_id != anchor_id
+                || identity.model_id != model_id
+            {
                 return Err(Error::StatementMismatch);
             }
             let output = select_output(case, OutputKind::Argmax, Some(sequence))?;
@@ -908,10 +918,10 @@ pub fn select(
                 sequence_length: Some(sequence),
                 raw_input_length: None,
                 patch_tokens: None,
-                anchor_id: digest_from_hex(&case.anchor_id)?,
-                model_id: digest_from_hex(&case.model_id)?,
+                anchor_id,
+                model_id,
                 output,
-                limited_table_identity: None,
+                limited_table_identity: Some(identity),
                 activation_commitment: None,
             })
         }

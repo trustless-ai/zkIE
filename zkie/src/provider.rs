@@ -28,7 +28,8 @@ use zkie_ops::pipeline::{
 };
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor_with_tables, verify_model_anchor_with_tables_on_identity,
-    verify_shared_trace, ModelCommitmentPublic, SharedTrace,
+    verify_shared_trace, verify_shared_trace_output, verify_shared_trace_outputs,
+    ModelAssetSpec, ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::asset_key::{
     prove_asset_key, verify_asset_key, AssetKeyColumns, ASSET_KEY_BUNDLE,
@@ -41,8 +42,10 @@ use zkie_ops::proof::consumer_proof::ConsumerProofFile;
 use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
 use zkie_ops::proof::consumer_session::verify_consumer_request;
 use crate::norm_parent::{
-    build_norm_plan, build_norm_segment, build_segment_plan, check_authenticated_bounds,
-    final_norm_rows, read_anchored_params, read_rstd_values, segment_session_seed, segment_x_seed,
+    build_norm_plan, build_norm_plan_gemma3, build_norm_segment, build_norm_witness_gemma3,
+    build_segment_plan, build_segment_plan_for, check_authenticated_bounds, final_norm_rows,
+    final_norm_rows_for, read_anchored_params, read_anchored_params_gemma3, read_rstd_values,
+    read_rstd_values_gemma3, segment_session_seed, segment_x_seed, GEMMA3_SEGMENT_HEAD,
 };
 use crate::norm_segment_provider::{
     build_param_tables, build_segment_table, configuration_for, lm_head_asset, plan_identifier,
@@ -443,10 +446,178 @@ fn norm_param_seed(params: &AssetTableParams) -> zkie_core::types::Digest {
     zkie_core::artifact::digest_bytes(&bytes)
 }
 
+fn gemma3_key_columns() -> Result<(
+    AssetTableParams,
+    ModelAssetSpec,
+    AssetKeyColumns,
+)> {
+    let path = zkie_models_gemma3::plan::FIRST_PROJECTION;
+    let params = zkie_models_gemma3::plan::projection_table_params(path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let spec = zkie_models_gemma3::plan::asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let derived = zkie_models_gemma3::plan::derive_table_plan(
+        &zkie_models_gemma3::plan::TABLE_PLAN_CANDIDATE,
+    )?;
+    let columns = AssetKeyColumns {
+        key_columns: derived.one_time_columns,
+        instance_columns: derived.total_columns,
+        k_lo: zkie_models_gemma3::plan::TABLE_PLAN_CANDIDATE.k_lo,
+        lin_check: derived.lin_check,
+    };
+    Ok((params, spec, columns))
+}
+
+fn model_key_columns(
+    model: &str,
+) -> Result<(AssetTableParams, ModelAssetSpec, AssetKeyColumns)> {
+    match model {
+        "gpt2" => gpt2_key_columns(),
+        "gemma3" => gemma3_key_columns(),
+        _ => Err(Error::UnsupportedPrimitive),
+    }
+}
+
+fn model_table_identity(model: &str) -> Result<Digest> {
+    match model {
+        "gpt2" => zkie_models_gpt2::plan::table_model_identity(),
+        "gemma3" => zkie_models_gemma3::plan::table_model_identity(),
+        _ => Err(Error::UnsupportedPrimitive),
+    }
+}
+
+fn model_shared_plan(model: &str) -> Result<ConsumerSharedPlan> {
+    match model {
+        "gpt2" => {
+            let derived = zkie_models_gpt2::plan::derive_table_plan(
+                &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+            )?;
+            Ok(ConsumerSharedPlan {
+                m_once: derived.table_shape.distances.m_once,
+                m_later: derived.table_shape.distances.m_later,
+                one_time_columns: derived.one_time_columns,
+                later_columns: derived.later_batch_columns,
+                declared_batches: 1,
+                table_tail: derived.table_shape.code.r,
+            })
+        }
+        "gemma3" => {
+            let derived = zkie_models_gemma3::plan::derive_table_plan(
+                &zkie_models_gemma3::plan::TABLE_PLAN_CANDIDATE,
+            )?;
+            Ok(ConsumerSharedPlan {
+                m_once: derived.table_shape.distances.m_once,
+                m_later: derived.table_shape.distances.m_later,
+                one_time_columns: derived.one_time_columns,
+                later_columns: derived.later_batch_columns,
+                declared_batches: 1,
+                table_tail: derived.table_shape.code.r,
+            })
+        }
+        _ => Err(Error::UnsupportedPrimitive),
+    }
+}
+
+fn verify_model_key_bundle(
+    model: &str,
+    commit_root: &Path,
+    commit_manifest: &ArtifactManifest,
+    table_metas: &[AssetTableMeta],
+    metrics: &mut zkie_engine::context::Metrics,
+) -> Result<()> {
+    if model != "gpt2" && model != "gemma3" {
+        return Ok(());
+    }
+    let (params, spec, columns) = model_key_columns(model)?;
+    let identity = model_table_identity(model)?;
+    let key_bytes = checked_artifact_file(commit_root, commit_manifest, ASSET_KEY_BUNDLE)?;
+    let key_meta = table_metas
+        .iter()
+        .find(|meta| meta.path == params.path)
+        .ok_or(Error::IncompleteArtifact)?;
+    let started = Instant::now();
+    let range = zkie_ops::proof::table_range::production_table_range()?;
+    verify_asset_key(key_meta, &params, identity, &spec, columns, &range, &key_bytes)?;
+    metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+    metrics.record("key_bytes", key_bytes.len() as u64);
+    Ok(())
+}
+
+fn verify_model_consumer(
+    model: &str,
+    public: &ModelCommitmentPublic,
+    trace: &SharedTrace,
+    tokens: &[u32],
+    proof_dir: &Path,
+    proof_manifest: &ArtifactManifest,
+    table_metas: &[AssetTableMeta],
+    public_root: &Path,
+) -> Result<()> {
+    if model != "gpt2" && model != "gemma3" {
+        return Ok(());
+    }
+    let sidecar_entry = proof_manifest
+        .find_file(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE)
+        .ok_or(Error::IncompleteArtifact)?;
+    let sidecar_bytes =
+        fs::read(proof_dir.join(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE))
+            .map_err(|_| Error::IncompleteArtifact)?;
+    if sidecar_bytes.len() as u64 != sidecar_entry.byte_length
+        || digest_bytes(&sidecar_bytes) != sidecar_entry.content_digest
+    {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    let consumer = ConsumerProofFile::decode(&sidecar_bytes)?;
+    let (plan, outputs, params, spec) = match model {
+        "gpt2" => {
+            let plan = zkie_models_gpt2::plan::trace_plan_public(tokens.len())?;
+            let outputs = verify_shared_trace_outputs(
+                public,
+                trace,
+                tokens,
+                &plan,
+                Some(public_root),
+            )?;
+            let (params, spec, _columns) = gpt2_key_columns()?;
+            (plan, outputs, params, spec)
+        }
+        "gemma3" => {
+            let plan = zkie_models_gemma3::plan::trace_plan_public(tokens.len())?;
+            let outputs = verify_shared_trace_outputs(
+                public,
+                trace,
+                tokens,
+                &plan,
+                Some(public_root),
+            )?;
+            let (params, spec, _columns) = gemma3_key_columns()?;
+            (plan, outputs, params, spec)
+        }
+        _ => return Ok(()),
+    };
+    let meta = table_metas
+        .iter()
+        .find(|meta| meta.path == params.path)
+        .ok_or(Error::IncompleteArtifact)?;
+    verify_consumer_request(
+        &plan,
+        &outputs,
+        model_table_identity(model)?,
+        meta,
+        &params,
+        &spec,
+        model_shared_plan(model)?,
+        &consumer,
+    )
+    .map(|_| ())
+}
+
 fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
     match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
-        "gemma3" => Ok(Vec::new()),
+        "gemma3" => zkie_models_gemma3::plan::asset_table_params(),
         "timesfm" => zkie_models_timesfm::plan::asset_table_params(),
         _ => Err(Error::UnsupportedPrimitive),
     }
@@ -458,12 +629,11 @@ fn build_commitment(
 ) -> Result<zkie_ops::proof::model_commitment::ModelCommitment> {
     match config.model.as_str() {
         "gpt2" => gpt2::build_commitment(Path::new(&config.asset_root), &config.tokens, tables),
-        "gemma3" => {
-            if !tables.is_empty() {
-                return Err(Error::InvalidConfig);
-            }
-            gemma3::build_commitment(Path::new(&config.case_root), &config.tokens)
-        }
+        "gemma3" => gemma3::build_commitment(
+            Path::new(&config.case_root),
+            &config.tokens,
+            tables,
+        ),
         "timesfm" => timesfm::build_commitment(
             Path::new(&config.case_root),
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
@@ -487,12 +657,13 @@ fn execute_shared(
             Some(progress),
         )
         .map(|(trace, file)| (trace, Some(file))),
-        "gemma3" => gemma3::execute_shared_with_progress_public(
+        "gemma3" => gemma3::execute_shared_with_progress_public_consumer(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
             Some(progress),
         )
-        .map(|trace| (trace, None)),
+        .map(|(trace, file)| (trace, Some(file))),
         "timesfm" => timesfm::execute_shared_with_progress_public_consumer(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
@@ -519,25 +690,32 @@ fn prove_norm_segment(
     if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS {
         return Ok(None);
     }
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_enter");
     let model = commitment.anchor.record.model_commitment;
     let public = ModelCommitmentPublic::from_commitment(commitment);
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
-    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
+    let matmul = crate::lm_head_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
     let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
     let configuration = configuration_for(&request_plan, identifier)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_configuration");
     let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
     let profile = zkie_models_gpt2::norm_profile::segment_profile(
         plan_positions,
         segment_x_seed(model, positions),
     )?;
     let (norm_index, x_rows, hd_rows) = final_norm_rows(trace)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_final_rows");
     if matmul.activation_step != norm_index {
         return Err(Error::StatementMismatch);
     }
     let asset_root = Path::new(&config.asset_root);
     let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_params");
     let rstd = read_rstd_values(asset_root, &profile, &x_rows)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_rstd");
     let (norm_plan, witness) = build_norm_segment(
         &profile,
         configuration,
@@ -547,20 +725,23 @@ fn prove_norm_segment(
         &bias,
         &rstd,
     )?;
-    let rstd_table = rstd_table_view(asset_root)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_witness");
+    let rstd_table = rstd_table_view(asset_root, "gpt2")?;
     check_authenticated_bounds(
         &norm_plan,
         &profile,
         &x_rows,
         &gain,
         &bias,
-        &rstd_table,
+        rstd_table.as_ref(),
     )?;
     let key = segment_table_key(request_plan.table_shape()?);
-    let asset = lm_head_asset(commitment, &matmul.weight_path)?;
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let asset = lm_head_asset(commitment, &matmul.weight_path, &specs)?;
     let work_dir = segment_work_dir(output_dir)?;
     std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
     let started = Instant::now();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_table");
     let mut table = build_segment_table(
         asset_root,
         &asset,
@@ -570,6 +751,7 @@ fn prove_norm_segment(
         &work_dir,
     )?;
     let reader = table.reader().clone();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_table");
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
         .iter()
@@ -610,15 +792,157 @@ fn prove_norm_segment(
         &hd_rows,
         session_seed,
     )?;
-    let mut params = build_param_tables(commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_plan");
+    let mut params = build_param_tables("gpt2", commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_param_tables");
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_prove");
     let messages = prove_segment_bytes(
         &plan,
         &mut table,
         session_seed,
         &witness,
         &mut params,
-        &rstd_table,
+        rstd_table.as_ref(),
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_prove");
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_prove");
+    let _ = std::fs::remove_dir_all(&work_dir);
+    ctx.metrics
+        .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);
+    ctx.metrics.record("norm_segment_bytes", messages.len() as u64);
+    let carrier = NormSegmentCarrier {
+        version: NORM_SEGMENT_CARRIER_VERSION,
+        reader,
+        messages,
+    };
+    Ok(Some((carrier.encode()?, identity)))
+}
+
+/// Proves the gemma3 final RMS norm segment: the gain-only multi-limb norm,
+/// the combined rstd table, the unmasked 2^18 output head and the materialized
+/// activation binding.
+fn prove_norm_segment_gemma3(
+    config: &ProviderConfig,
+    commitment: &zkie_ops::proof::model_commitment::ModelCommitment,
+    tables: &[AssetTableInput],
+    trace: &SharedTrace,
+    output_dir: &Path,
+    ctx: &mut PipelineContext<'_>,
+) -> Result<Option<(Vec<u8>, SegmentTableIdentity)>> {
+    let positions = config.tokens.len();
+    if positions != GEMMA3_SEGMENT_HEAD.positions {
+        return Ok(None);
+    }
+    let model = commitment.anchor.record.model_commitment;
+    let public = ModelCommitmentPublic::from_commitment(commitment);
+    let trace_plan = zkie_models_gemma3::plan::trace_plan_public(positions)?;
+    let matmul = crate::lm_head_context::find_lm_head_matmul_for(
+        &trace_plan,
+        GEMMA3_SEGMENT_HEAD.asset_path,
+    )?;
+    let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
+    let request_plan = zkie_models_gemma3::lm_head_plan::lm_head_plan()?;
+    let configuration = configuration_for(&request_plan, identifier)?;
+    let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+    let profile = zkie_models_gemma3::norm_profile::segment_profile(
+        plan_positions,
+        segment_x_seed(model, positions),
+    )?;
+    let (norm_index, x_rows, hd_rows) =
+        final_norm_rows_for(trace, zkie_ops::op::OpCode::ProfileRmsNorm as u16)?;
+    if matmul.activation_step != norm_index {
+        return Err(Error::StatementMismatch);
+    }
+    let asset_root = Path::new(&config.asset_root);
+    let gain = read_anchored_params_gemma3(asset_root, &public.assets)?;
+    let rstd = read_rstd_values_gemma3(asset_root, &profile, &x_rows)?;
+    let norm_plan =
+        build_norm_plan_gemma3(&profile, configuration, &commitment.tables, &x_rows)?;
+    let witness = build_norm_witness_gemma3(
+        &norm_plan,
+        &profile,
+        configuration,
+        &x_rows,
+        &gain,
+        &rstd,
+    )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_before_witness");
+    let rstd_table = rstd_table_view(asset_root, "gemma3")?;
+    check_authenticated_bounds(
+        &norm_plan,
+        &profile,
+        &x_rows,
+        &gain,
+        &[],
+        rstd_table.as_ref(),
+    )?;
+    let key = segment_table_key(request_plan.table_shape()?);
+    let specs = zkie_models_gemma3::plan::asset_specs();
+    let asset = lm_head_asset(commitment, &matmul.weight_path, &specs)?;
+    let work_dir = segment_work_dir(output_dir)?;
+    std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
+    let started = Instant::now();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_table");
+    let mut table = build_segment_table(
+        asset_root,
+        &asset,
+        &request_plan,
+        configuration,
+        &key,
+        &work_dir,
+    )?;
+    let reader = table.reader().clone();
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_table");
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == matmul.weight_path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let identity = SegmentTableIdentity {
+        asset_id: spec.asset_id,
+        asset_table_identity: zkie_ops::proof::model_commitment::asset_table_identity(spec),
+        code_log_n: reader.shape.code.log_n,
+        code_ell: reader.shape.code.ell,
+        code_r: reader.shape.code.r,
+        table_v: reader.shape.v,
+        answers: reader.shape.answers,
+        salt_bytes: reader.shape.salt_bytes as u64,
+        distance_radius: reader.shape.distances.radius,
+        distance_later_radius: reader.shape.distances.later_radius,
+        distance_m_once: reader.shape.distances.m_once,
+        distance_m_later: reader.shape.distances.m_later,
+        matrix_rows_log: request_plan.lin.matrix_rows_log,
+        k_lo: request_plan.lin.k_lo,
+        k_col: request_plan.lin.k_col,
+        table_root: reader.root,
+        table_record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        table_configuration: configuration,
+    };
+    identity.validate()?;
+    let binding = segment_identity_binding(&identity);
+    let session_seed = segment_session_seed(model, positions, binding);
+    let plan = build_segment_plan_for(
+        &GEMMA3_SEGMENT_HEAD,
+        &trace_plan,
+        &config.expected_argmax,
+        &reader,
+        reader.shape,
+        configuration,
+        &norm_plan,
+        &profile,
+        &hd_rows,
+        session_seed,
+    )?;
+    let mut params = build_param_tables("gemma3", commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_before_prove");
+    let messages = prove_segment_bytes(
+        &plan,
+        &mut table,
+        session_seed,
+        &witness,
+        &mut params,
+        rstd_table.as_ref(),
+    )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_prove");
     let _ = std::fs::remove_dir_all(&work_dir);
     ctx.metrics
         .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);
@@ -694,7 +1018,9 @@ fn verify_norm_segment(
         return Err(Error::StatementMismatch);
     }
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
-    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
+    let matmul = crate::lm_head_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
         .iter()
@@ -749,10 +1075,138 @@ fn verify_norm_segment(
         &hd_rows,
         session_seed,
     )?;
-    let rstd = rstd_table_view(asset_root)?;
-    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, &rstd)?;
+    let rstd = rstd_table_view(asset_root, "gpt2")?;
+    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, rstd.as_ref())?;
     let started = Instant::now();
-    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, &rstd)?;
+    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, rstd.as_ref())?;
+    ctx.metrics
+        .record("norm_segment_verify_ms", started.elapsed().as_millis() as u64);
+    if outcome.activation.root != plan.send.activation_root {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Verifies the gemma3 final RMS norm carrier when the proof publishes one.
+fn verify_norm_segment_gemma3(
+    trusted: &crate::policy::TrustedRequest,
+    public: &ModelCommitmentPublic,
+    statement: &StatementData,
+    trace: &SharedTrace,
+    proof_dir: &Path,
+    proof_manifest: &ArtifactManifest,
+    asset_root: &Path,
+    table_metas: &[AssetTableMeta],
+    ctx: &mut PipelineContext<'_>,
+) -> Result<()> {
+    let applies = statement.tokens.len() == GEMMA3_SEGMENT_HEAD.positions;
+    let entry = match proof_manifest.find_file(NORM_SEGMENT_CARRIER_FILE) {
+        Some(entry) => entry,
+        None => {
+            if applies {
+                return Err(Error::IncompleteArtifact);
+            }
+            return Ok(());
+        }
+    };
+    if !applies {
+        return Err(Error::StatementMismatch);
+    }
+    let bytes = fs::read(proof_dir.join(NORM_SEGMENT_CARRIER_FILE))
+        .map_err(|_| Error::IncompleteArtifact)?;
+    if bytes.len() as u64 != entry.byte_length
+        || digest_bytes(&bytes) != entry.content_digest
+    {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    let carrier = NormSegmentCarrier::decode(&bytes)?;
+    let identity = statement
+        .segment_identity
+        .as_ref()
+        .ok_or(Error::IncompleteArtifact)?;
+    identity.validate()?;
+    let positions = statement.tokens.len();
+    if positions != GEMMA3_SEGMENT_HEAD.positions
+        || statement.model != trusted.model
+        || statement.case_id != trusted.case_id
+        || statement.model_commitment != public.anchor.model_commitment
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let reader = &carrier.reader;
+    if reader.fault().is_some()
+        || reader.root != identity.table_root
+        || reader.configuration != identity.table_configuration
+        || reader.shape != identity.shape()?
+        || digest_bytes(&reader.record.encode()) != identity.table_record_digest
+        || identity.matrix_rows()? != reader.shape.rows()
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let trace_plan = zkie_models_gemma3::plan::trace_plan_public(positions)?;
+    let matmul = crate::lm_head_context::find_lm_head_matmul_for(
+        &trace_plan,
+        GEMMA3_SEGMENT_HEAD.asset_path,
+    )?;
+    let specs = zkie_models_gemma3::plan::asset_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == matmul.weight_path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let asset_meta = public
+        .assets
+        .iter()
+        .find(|asset| asset.path == spec.path)
+        .ok_or(Error::AssetMismatch)?;
+    if identity.asset_id != asset_meta.asset_id
+        || identity.asset_table_identity
+            != zkie_ops::proof::model_commitment::asset_table_identity(spec)
+        || asset_meta.leaf_record.table_identity != identity.asset_table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let identifier = plan_identifier(public, &trace_plan, matmul.index)?;
+    let request_plan = zkie_models_gemma3::lm_head_plan::lm_head_plan()?;
+    let configuration = configuration_for(&request_plan, identifier)?;
+    if configuration != reader.configuration
+        || identity.table_configuration != configuration
+        || identity.shape()? != request_plan.table_shape()?
+        || identity.matrix_rows_log != request_plan.lin.matrix_rows_log
+        || identity.k_lo != request_plan.lin.k_lo
+        || identity.k_col != request_plan.lin.k_col
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let model = statement.model_commitment;
+    let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+    let profile = zkie_models_gemma3::norm_profile::segment_profile(
+        plan_positions,
+        segment_x_seed(model, positions),
+    )?;
+    let (norm_index, x_rows, hd_rows) =
+        final_norm_rows_for(trace, zkie_ops::op::OpCode::ProfileRmsNorm as u16)?;
+    if matmul.activation_step != norm_index {
+        return Err(Error::StatementMismatch);
+    }
+    let norm_plan = build_norm_plan_gemma3(&profile, configuration, table_metas, &x_rows)?;
+    let gain = read_anchored_params_gemma3(asset_root, &public.assets)?;
+    let session_seed = segment_session_seed(model, positions, segment_identity_binding(identity));
+    let plan = build_segment_plan_for(
+        &GEMMA3_SEGMENT_HEAD,
+        &trace_plan,
+        &statement.expected_argmax,
+        reader,
+        reader.shape,
+        configuration,
+        &norm_plan,
+        &profile,
+        &hd_rows,
+        session_seed,
+    )?;
+    let rstd = rstd_table_view(asset_root, "gemma3")?;
+    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &[], rstd.as_ref())?;
+    let started = Instant::now();
+    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, rstd.as_ref())?;
     ctx.metrics
         .record("norm_segment_verify_ms", started.elapsed().as_millis() as u64);
     if outcome.activation.root != plan.send.activation_root {
@@ -916,9 +1370,9 @@ impl PipelineProvider for ProductionProvider {
         // re-verifies the same proof; the proof is never regenerated per
         // request and re-verification does not spend the durable column budget.
         let mut key_bundle: Option<Vec<u8>> = None;
-        if config.model == "gpt2" {
-            let (params, spec, columns) = gpt2_key_columns()?;
-            let identity = zkie_models_gpt2::plan::table_model_identity()?;
+        if config.model == "gpt2" || config.model == "gemma3" {
+            let (params, spec, columns) = model_key_columns(&config.model)?;
+            let identity = model_table_identity(&config.model)?;
             let meta = commitment
                 .tables
                 .iter()
@@ -1061,9 +1515,9 @@ impl PipelineProvider for ProductionProvider {
             "private/asset-table-randomness.bin",
             &randomness_bytes,
         )?;
-        if config.model == "gpt2" {
-            let (params, spec, columns) = gpt2_key_columns()?;
-            let identity = zkie_models_gpt2::plan::table_model_identity()?;
+        if config.model == "gpt2" || config.model == "gemma3" {
+            let (params, spec, columns) = model_key_columns(&config.model)?;
+            let identity = model_table_identity(&config.model)?;
             let meta = commitment
                 .tables
                 .iter()
@@ -1109,6 +1563,18 @@ impl PipelineProvider for ProductionProvider {
         } else if config.model == "timesfm" {
             match prove_timesfm_norm_segment(&config, &commitment, &tables, &trace, ctx)? {
                 Some(bytes) => (Some(bytes), None),
+                None => (None, None),
+            }
+        } else if config.model == "gemma3" {
+            match prove_norm_segment_gemma3(
+                &config,
+                &commitment,
+                &tables,
+                &trace,
+                &request.output_dir,
+                ctx,
+            )? {
+                Some((bytes, identity)) => (Some(bytes), Some(identity)),
                 None => (None, None),
             }
         } else {
@@ -1278,7 +1744,6 @@ impl PipelineProvider for ProductionProvider {
                 if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
                 }
-                let plan = zkie_models_gpt2::plan::trace_plan_public(statement.tokens.len())?;
                 if zkie_models_gpt2::plan::model_commitment(&statement.tokens)? != model_id {
                     return Err(Error::StatementMismatch);
                 }
@@ -1294,88 +1759,22 @@ impl PipelineProvider for ProductionProvider {
                     &table_metas,
                     &table_params,
                 )?;
-                // The table's one-time qualification is re-verified per
-                // request from the commit's public key bundle into an
-                // in-memory accepted key; every accepted field is compared
-                // with this commit's table, record, range and plan before the
-                // request consumes the table. The key bytes and time are
-                // recorded separately.
-                let (key_params, key_spec, key_columns) = gpt2_key_columns()?;
-                let identity = zkie_models_gpt2::plan::table_model_identity()?;
-                let key_bytes =
-                    checked_artifact_file(commit_root, &commit_manifest, ASSET_KEY_BUNDLE)?;
-                let key_meta = table_metas
-                    .iter()
-                    .find(|meta| meta.path == key_params.path)
-                    .ok_or(Error::IncompleteArtifact)?;
-                let started = Instant::now();
-                let key_range = zkie_ops::proof::table_range::production_table_range()?;
-                verify_asset_key(
-                    key_meta,
-                    &key_params,
-                    identity,
-                    &key_spec,
-                    key_columns,
-                    &key_range,
-                    &key_bytes,
+                verify_model_key_bundle(
+                    "gpt2",
+                    commit_root,
+                    &commit_manifest,
+                    &table_metas,
+                    &mut *ctx.metrics,
                 )?;
-                ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
-                ctx.metrics.record("key_bytes", key_bytes.len() as u64);
-                // The request's own stages' auxiliary file is part of the same
-                // proof artifact: its manifest entry must exist and its bytes
-                // must match before it is decoded.
-                let sidecar_entry = proof_manifest
-                    .find_file(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE)
-                    .ok_or(Error::IncompleteArtifact)?;
-                let sidecar_bytes = fs::read(
-                    proof_dir.join(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE),
-                )
-                .map_err(|_| Error::IncompleteArtifact)?;
-                if sidecar_bytes.len() as u64 != sidecar_entry.byte_length
-                    || digest_bytes(&sidecar_bytes) != sidecar_entry.content_digest
-                {
-                    return Err(Error::ArtifactIntegrityMismatch);
-                }
-                let consumer = ConsumerProofFile::decode(&sidecar_bytes)?;
-                let outputs = zkie_ops::proof::model_commitment::verify_shared_trace_outputs(
+                verify_model_consumer(
+                    "gpt2",
                     &public,
                     &trace,
                     &statement.tokens,
-                    &plan,
-                    Some(public_root),
-                )?;
-                let path = "gpt2/weights/L0_k_w_i32.bin";
-                let consumer_params =
-                    zkie_models_gpt2::plan::projection_table_params(path)
-                        .ok_or(Error::UnsupportedPrimitive)?;
-                let derived = zkie_models_gpt2::plan::derive_table_plan(
-                    &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
-                )?;
-                let shared = ConsumerSharedPlan {
-                    m_once: derived.table_shape.distances.m_once,
-                    m_later: derived.table_shape.distances.m_later,
-                    one_time_columns: derived.one_time_columns,
-                    later_columns: derived.later_batch_columns,
-                    declared_batches: 1,
-                    table_tail: derived.table_shape.code.r,
-                };
-                let spec = zkie_models_gpt2::plan::asset_specs()
-                    .into_iter()
-                    .find(|spec| spec.path == path)
-                    .ok_or(Error::UnsupportedPrimitive)?;
-                let meta = table_metas
-                    .iter()
-                    .find(|meta| meta.path == path)
-                    .ok_or(Error::IncompleteArtifact)?;
-                verify_consumer_request(
-                    &plan,
-                    &outputs,
-                    zkie_models_gpt2::plan::table_model_identity()?,
-                    meta,
-                    &consumer_params,
-                    &spec,
-                    shared,
-                    &consumer,
+                    proof_dir,
+                    &proof_manifest,
+                    &table_metas,
+                    public_root,
                 )?;
                 verify_norm_segment(
                     &trusted,
@@ -1407,23 +1806,50 @@ impl PipelineProvider for ProductionProvider {
                 if trusted.model_version != zkie_models_gemma3::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
                 }
-                let plan = zkie_models_gemma3::plan::trace_plan_public(statement.tokens.len())?;
                 if zkie_models_gemma3::plan::model_commitment(&statement.tokens)? != model_id {
                     return Err(Error::StatementMismatch);
                 }
                 let parameters = zkie_models_gemma3::plan::parameters_digest()?;
                 let specs = zkie_models_gemma3::plan::asset_specs();
-                verify_model_anchor_with_tables(
+                verify_model_anchor_with_tables_on_identity(
                     &public,
                     trusted.anchor_id,
                     model_id,
+                    zkie_models_gemma3::plan::table_model_identity()?,
                     parameters,
                     &specs,
                     &table_metas,
                     &table_params,
                 )?;
-                let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, Some(public_root))?;
+                verify_model_key_bundle(
+                    "gemma3",
+                    commit_root,
+                    &commit_manifest,
+                    &table_metas,
+                    &mut *ctx.metrics,
+                )?;
+                verify_model_consumer(
+                    "gemma3",
+                    &public,
+                    &trace,
+                    &statement.tokens,
+                    proof_dir,
+                    &proof_manifest,
+                    &table_metas,
+                    public_root,
+                )?;
+                verify_norm_segment_gemma3(
+                    &trusted,
+                    &public,
+                    &statement,
+                    &trace,
+                    proof_dir,
+                    &proof_manifest,
+                    public_root,
+                    &table_metas,
+                    ctx,
+                )?;
+                let argmax = trace.argmax.clone();
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,

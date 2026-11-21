@@ -42,7 +42,10 @@ pub const INPUT_BOUND: u64 = 1 << 33;
 /// Trusted bound of the rounded mean square. The measured maximum of the
 /// registered case is 97,721,861,469,415,282 (2^56.44); the bound keeps a wide
 /// margin and makes the two-half reconstruction of the mean stay below the
-/// field half range.
+/// field half range. This is a measured-with-margin value rather than the
+/// exact worst case, because the exact worst case (input bound squared,
+/// 2^66) would not fit the i64 row representation; the value and the plan
+/// encoding are unchanged.
 pub const MEAN_BOUND: u64 = 1 << 61;
 /// The largest absolute gain entry of the registered final norm asset.
 pub const GAIN_MAX: i64 = 19_726_336;

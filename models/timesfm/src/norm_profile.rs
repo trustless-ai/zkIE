@@ -221,7 +221,7 @@ mod tests {
         assert!(INPUT_OBSERVED.unsigned_abs() <= INPUT_BOUND);
         assert!(CENTERED_OBSERVED.unsigned_abs() <= 2 * INPUT_BOUND);
         assert!((PRE_CLAMP_OBSERVED as u64) < PRE_BOUND);
-        assert!(CENTERED_OBSERVED.unsigned_abs() <= MEAN_BOUND as i64);
+        assert!(CENTERED_OBSERVED.unsigned_abs() <= (MEAN_BOUND as i64).try_into().unwrap());
         assert!(RSTD_OBSERVED.unsigned_abs() as u64 <= RSTD_VALUE_BOUND);
         assert!(GAIN_MAX >= 80_546);
         assert!(RSTD_INDEX_MIN < RSTD_INDEX_MAX);

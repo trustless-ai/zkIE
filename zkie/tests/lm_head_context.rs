@@ -72,8 +72,78 @@ fn first_anchor_hex(text: &str) -> Option<String> {
     text.get(start..end).map(str::to_owned)
 }
 
-fn read_statement(path: &Path) -> StatementData {
-    bincode::deserialize(&fs::read(path).expect("statement bytes")).expect("statement")
+struct LegacyCursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> LegacyCursor<'a> {
+    fn take(&mut self, count: usize) -> &'a [u8] {
+        let end = self.at.checked_add(count).expect("legacy prefix");
+        let slice = self.bytes.get(self.at..end).expect("legacy prefix length");
+        self.at = end;
+        slice
+    }
+
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take(8).try_into().expect("legacy u64"))
+    }
+
+    fn string(&mut self) -> String {
+        let len = usize::try_from(self.u64()).expect("legacy string length");
+        String::from_utf8(self.take(len).to_vec()).expect("legacy string")
+    }
+
+    fn u32s(&mut self) -> Vec<u32> {
+        let len = usize::try_from(self.u64()).expect("legacy vector length");
+        (0..len)
+            .map(|_| u32::from_le_bytes(self.take(4).try_into().expect("legacy u32")))
+            .collect()
+    }
+
+    fn i32s(&mut self) -> Vec<i32> {
+        let len = usize::try_from(self.u64()).expect("legacy vector length");
+        (0..len)
+            .map(|_| i32::from_le_bytes(self.take(4).try_into().expect("legacy i32")))
+            .collect()
+    }
+}
+
+/// The archived statements predate the current statement layout. The current
+/// reader rejects them outright; the test recovers the prefix fields the
+/// loader needs and rebuilds the statement in the current format in a temp
+/// file, so the archive stays untouched.
+fn current_statement_from_legacy(path: &Path) -> StatementData {
+    let bytes = fs::read(path).expect("statement bytes");
+    assert!(
+        bincode::deserialize::<StatementData>(&bytes).is_err(),
+        "the archived statement must be rejected by the current reader"
+    );
+    let mut cursor = LegacyCursor {
+        bytes: &bytes,
+        at: 0,
+    };
+    let case_id = cursor.string();
+    let model = cursor.string();
+    let digest: [u8; 32] = cursor.take(32).try_into().expect("legacy digest");
+    let tokens = cursor.u32s();
+    let expected_argmax = cursor.u32s();
+    let expected_output = cursor.i32s();
+    StatementData {
+        case_id,
+        model,
+        model_commitment: Digest(digest),
+        tokens,
+        expected_argmax,
+        expected_output,
+        segment_identity: None,
+        norm_only: false,
+    }
+}
+
+fn write_current_statement(name: &str, statement: &StatementData) -> PathBuf {
+    let bytes = bincode::serialize(statement).expect("current statement");
+    temp_file(name, &bytes)
 }
 
 fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
@@ -100,7 +170,8 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
     let Some((case, policy, public, statement)) = registered_artifacts() else {
         return;
     };
-    let statement_data = read_statement(&statement);
+    let statement_data = current_statement_from_legacy(&statement);
+    let statement_path = write_current_statement("current-statement.bin", &statement_data);
     let table_metas: Vec<zkie_ops::proof::asset_table::AssetTableMeta> =
         bincode::deserialize(&fs::read(public.join("asset-tables.bin")).expect("asset tables"))
             .expect("asset tables");
@@ -115,7 +186,7 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
             &case,
             &policy,
             &public,
-            &statement,
+            &statement_path,
             statement_data.model_commitment,
         )
         .is_err());
@@ -125,7 +196,7 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
         &case,
         &policy,
         &public,
-        &statement,
+        &statement_path,
         statement_data.model_commitment,
     )
     .expect("trusted context");
@@ -175,7 +246,8 @@ fn legacy_artifacts_are_rejected_by_the_version_gate() {
     let Some((case, policy, public, statement)) = legacy_artifacts() else {
         return;
     };
-    let statement_data = read_statement(&statement);
+    let statement_data = current_statement_from_legacy(&statement);
+    let statement_path = write_current_statement("legacy-gate-statement.bin", &statement_data);
     let policy_text = fs::read_to_string(&policy).expect("policy text");
     let old_policy = policy_text.replace("model_version = 2", "model_version = 1");
     let old_policy = temp_file("policy-v1.toml", old_policy.as_bytes());
@@ -183,7 +255,7 @@ fn legacy_artifacts_are_rejected_by_the_version_gate() {
         &case,
         &old_policy,
         &public,
-        &statement,
+        &statement_path,
         statement_data.model_commitment,
     )
     .expect_err("an artifact of another model version must be rejected");
@@ -195,17 +267,18 @@ fn wrong_identities_and_shapes_are_rejected() {
     let Some((case, policy, public, statement)) = registered_artifacts() else {
         return;
     };
-    let statement_data = read_statement(&statement);
+    let statement_data = current_statement_from_legacy(&statement);
+    let statement_path = write_current_statement("negatives-statement.bin", &statement_data);
     let model_id = statement_data.model_commitment;
 
-    assert!(load_gpt2_lm_head_context(&case, &policy, &public, &statement, Digest::ZERO).is_err());
+    assert!(load_gpt2_lm_head_context(&case, &policy, &public, &statement_path, Digest::ZERO).is_err());
 
     let policy_text = fs::read_to_string(&policy).expect("policy text");
     let anchor = first_anchor_hex(&policy_text).expect("policy anchor");
     let wrong_policy = policy_text.replace(&anchor, &"00".repeat(32));
     let wrong_policy = temp_file("policy.toml", wrong_policy.as_bytes());
     assert!(
-        load_gpt2_lm_head_context(&case, &wrong_policy, &public, &statement, model_id).is_err()
+        load_gpt2_lm_head_context(&case, &wrong_policy, &public, &statement_path, model_id).is_err()
     );
 
     let mut wrong_statement = statement_data.clone();
@@ -239,7 +312,7 @@ fn wrong_identities_and_shapes_are_rejected() {
         bincode::serialize(&wrong_public).expect("public"),
     )
     .expect("write public");
-    assert!(load_gpt2_lm_head_context(&case, &policy, &anchor_dir, &statement, model_id).is_err());
+    assert!(load_gpt2_lm_head_context(&case, &policy, &anchor_dir, &statement_path, model_id).is_err());
 
     let mut wrong_asset: ModelCommitmentPublic =
         bincode::deserialize(&commitment_bytes).expect("public bundle");
@@ -260,7 +333,7 @@ fn wrong_identities_and_shapes_are_rejected() {
         &case,
         &policy,
         &wrong_asset_dir.join("public"),
-        &statement,
+        &statement_path,
         model_id
     )
     .is_err());

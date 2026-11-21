@@ -18043,67 +18043,72 @@ fn norm_members_core(
         return Ok(members);
     };
     let positions = plan.send.positions();
-    let mut groups = vec![
-        (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
-    ];
-    if let (Some(low), Some(rms)) = (&norm_first.low, &norm_plan.rms) {
-        groups.push((low, &rms.low, norm_witness.and_then(|w| w.low.as_ref())));
+    let group_plans = norm_member_group_plans(norm_plan);
+    let mut messages: Vec<&CommittedPscGroup> = vec![&norm_first.x];
+    let mut witnesses: Vec<Option<&NormGroupWitness>> = vec![norm_witness.map(|w| &w.x)];
+    if norm_plan.rms.is_some() {
+        messages.push(norm_first.low.as_ref().ok_or(Error::ShapeMismatch)?);
+        messages.push(norm_first.high.as_ref().ok_or(Error::ShapeMismatch)?);
+        witnesses.push(norm_witness.and_then(|w| w.low.as_ref()));
+        witnesses.push(norm_witness.and_then(|w| w.high.as_ref()));
     }
-    if let (Some(high), Some(rms)) = (&norm_first.high, &norm_plan.rms) {
-        groups.push((high, &rms.high, norm_witness.and_then(|w| w.high.as_ref())));
-    }
-    groups.extend([
-        (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
-        (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
-        (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
-        (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
+    messages.extend([
+        &norm_first.sum,
+        &norm_first.squares,
+        &norm_first.mean,
+        &norm_first.variance,
     ]);
-    if let (Some(round_message), Some(round_plan)) =
-        (&norm_first.round, &norm_plan.round)
-    {
-        groups.push((
-            round_message,
-            &round_plan.group,
-            norm_witness.and_then(|witness| witness.round.as_ref()),
-        ));
+    witnesses.extend([
+        norm_witness.map(|w| &w.sum),
+        norm_witness.map(|w| &w.squares),
+        norm_witness.map(|w| &w.mean),
+        norm_witness.map(|w| &w.variance),
+    ]);
+    if norm_plan.round.is_some() {
+        messages.push(norm_first.round.as_ref().ok_or(Error::ShapeMismatch)?);
+        witnesses.push(norm_witness.and_then(|w| w.round.as_ref()));
     }
-    if let (Some(output_message), Some(output_plan)) =
-        (&norm_first.output, &norm_plan.output)
-    {
-        let output_witness = norm_witness.and_then(|witness| witness.output.as_ref());
-        groups.push((
+    if norm_plan.output.is_some() {
+        let output_message = norm_first.output.as_ref().ok_or(Error::ShapeMismatch)?;
+        messages.extend([
             &output_message.broadcast,
-            &output_plan.broadcast,
-            output_witness.map(|witness| &witness.broadcast),
-        ));
-        groups.push((
             &output_message.product,
-            &output_plan.product,
-            output_witness.map(|witness| &witness.product),
-        ));
-        groups.push((
             &output_message.image,
-            &output_plan.image,
-            output_witness.map(|witness| &witness.image),
-        ));
-        groups.push((
             &output_message.out,
-            &output_plan.out,
-            output_witness.map(|witness| &witness.out),
-        ));
-    }
-    if let (Some(tail_message), Some(output_plan)) = (&norm_first.tail, &norm_plan.output) {
-        if let Some(tail_plan) = &output_plan.tail {
-            let tail_witness = norm_witness
-                .and_then(|witness| witness.output.as_ref())
-                .and_then(|witness| witness.tail.as_ref());
-            groups.push((
-                &tail_message.group,
-                &tail_plan.group,
-                tail_witness.map(|witness| &witness.committed),
-            ));
+        ]);
+        let output_witness = norm_witness.and_then(|w| w.output.as_ref());
+        witnesses.extend([
+            output_witness.map(|w| &w.broadcast),
+            output_witness.map(|w| &w.product),
+            output_witness.map(|w| &w.image),
+            output_witness.map(|w| &w.out),
+        ]);
+        if norm_plan
+            .output
+            .as_ref()
+            .and_then(|output| output.tail.as_ref())
+            .is_some()
+        {
+            let tail_message = norm_first.tail.as_ref().ok_or(Error::ShapeMismatch)?;
+            messages.push(&tail_message.group);
+            witnesses.push(
+                norm_witness
+                    .and_then(|w| w.output.as_ref())
+                    .and_then(|w| w.tail.as_ref())
+                    .map(|w| &w.committed),
+            );
         }
     }
+    if group_plans.len() != messages.len() || group_plans.len() != witnesses.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let groups: Vec<(&CommittedPscGroup, &NormGroupPlan, Option<&NormGroupWitness>)> =
+        group_plans
+            .into_iter()
+            .zip(messages)
+            .zip(witnesses)
+            .map(|((group_plan, message), witness)| (message, group_plan, witness))
+            .collect();
     for (message, group_plan, group_witness) in groups {
         if message.message.group.group != group_plan.group
             || message.message.roots.len() != positions as usize
@@ -18471,7 +18476,7 @@ pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
         source_oracle += 1;
     };
     let positions = usize::try_from(norm.shape.positions).map_err(|_| Error::ResourceLimit)?;
-    for group in norm_group_plans(norm) {
+    for group in norm_member_group_plans(norm) {
         for _ in 0..positions {
             push(group.shape.main_rows, 0, &mut members);
         }
@@ -18506,18 +18511,6 @@ pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
         total_mask_rows = total_mask_rows
             .checked_add(commit.mask_rows)
             .ok_or(Error::ResourceLimit)?;
-    }
-    if let Some(output) = &norm.output {
-        for group in [&output.broadcast, &output.product, &output.image, &output.out] {
-            for _ in 0..positions {
-                push(group.shape.main_rows, 0, &mut members);
-            }
-        }
-        if let Some(tail) = &output.tail {
-            for _ in 0..positions {
-                push(tail.group.shape.main_rows, 0, &mut members);
-            }
-        }
     }
     if members.is_empty() {
         return Err(Error::InvalidConfig);
@@ -20208,6 +20201,33 @@ fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
     ]);
     if let Some(round) = &plan.round {
         groups.push(&round.group);
+    }
+    groups
+}
+
+/// The plan-side norm member group sequence: the base scalar groups, the
+/// optional limb groups of the RMS form, the optional rounding group, the
+/// optional output groups and the optional tail group. Both the plan-time
+/// member list (fold shape) and the runtime member list derive from this
+/// one sequence, so a group can only be added or dropped in one place.
+fn norm_member_group_plans(norm: &NormPlan) -> Vec<&NormGroupPlan> {
+    let mut groups = vec![&norm.x];
+    if let Some(rms) = &norm.rms {
+        groups.push(&rms.low);
+        groups.push(&rms.high);
+    }
+    groups.extend([&norm.sum, &norm.squares, &norm.mean, &norm.variance]);
+    if let Some(round) = &norm.round {
+        groups.push(&round.group);
+    }
+    if let Some(output) = &norm.output {
+        groups.push(&output.broadcast);
+        groups.push(&output.product);
+        groups.push(&output.image);
+        groups.push(&output.out);
+        if let Some(tail) = &output.tail {
+            groups.push(&tail.group);
+        }
     }
     groups
 }
@@ -41906,6 +41926,108 @@ mod merged_tests {
             .pointwise_hiding = hiding + 1;
         assert!(wrong_counts.validate().is_err());
     }
+    fn with_rms(plan: &crate::proof::hidden_norm_psc::NormPlan) -> crate::proof::hidden_norm_psc::NormPlan {
+        let mut plan = plan.clone();
+        plan.mode = crate::proof::hidden_norm::NormMode::RmsNorm;
+        plan.rms = Some(crate::proof::hidden_norm_psc::RmsLimbPlan {
+            low: norm_group(COLUMNS, 90, 9500, 60600),
+            high: norm_group(COLUMNS, 91, 9600, 60700),
+            widths: crate::proof::rms_limbs::RmsLimbWidths::derive(1 << 10, 4).unwrap(),
+            mean_bound: 1 << 40,
+            pre_bound: 1 << 40,
+        });
+        plan
+    }
+
+    fn with_round(plan: &crate::proof::hidden_norm_psc::NormPlan) -> crate::proof::hidden_norm_psc::NormPlan {
+        let mut plan = plan.clone();
+        let widths = crate::proof::hidden_norm_psc::NormRoundWidths {
+            sum: 7,
+            squares: 7,
+            variance: 7,
+            mean: 7,
+            offset: 3,
+        };
+        plan.round = Some(crate::proof::hidden_norm_psc::NormRoundPlan {
+            group: norm_group(COLUMNS, 92, 10200, 61300),
+            layout: crate::proof::hidden_norm_psc::NormRoundLayout::new(widths, 4, 0, 0).unwrap(),
+            input_bound: 1 << 10,
+            table_real_len: 1 << 30,
+        });
+        plan
+    }
+
+    fn with_output(plan: &crate::proof::hidden_norm_psc::NormPlan) -> crate::proof::hidden_norm_psc::NormPlan {
+        let mut plan = plan.clone();
+        let tail_widths = crate::proof::hidden_norm_psc::NormOutputTailWidths {
+            quotient: 4,
+            remainder: 4,
+            doubled_remainder: 5,
+            tie_slack: 4,
+            shifted: 4,
+            pre_clamp: 4,
+        };
+        plan.output = Some(crate::proof::hidden_norm_psc::NormOutputPlan {
+            broadcast: norm_group(COLUMNS, 93, 9700, 60800),
+            product: norm_group(COLUMNS, 94, 9800, 60900),
+            image: norm_group(COLUMNS, 95, 9900, 61000),
+            out: norm_group(COLUMNS, 96, 10000, 61100),
+            shift: 32,
+            clamp: None,
+            no_op_clamp: true,
+            tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
+                group: norm_group(COLUMNS, 97, 10100, 61200),
+                widths: tail_widths,
+                clamp: None,
+            }),
+        });
+        plan
+    }
+
+    /// The plan-time member list (which derives the fold shape) and the
+    /// runtime member list both walk the one group sequence. The expected
+    /// sequence is pinned literally for the no-limb and the limb shapes,
+    /// including which groups are optional and their order; a dropped or
+    /// reordered group fails here instead of surfacing as a statement
+    /// mismatch deep in a proof.
+    #[test]
+    fn the_norm_member_group_sequence_is_pinned() {
+        let base = norm_plan();
+        let ids = |plan: &crate::proof::hidden_norm_psc::NormPlan| -> Vec<u64> {
+            norm_member_group_plans(plan)
+                .iter()
+                .map(|group| group.group)
+                .collect()
+        };
+        assert_eq!(ids(&base), vec![80, 81, 82, 83, 84]);
+        assert_eq!(
+            ids(&with_rms(&base)),
+            vec![80, 90, 91, 81, 82, 83, 84]
+        );
+        assert_eq!(
+            ids(&with_round(&base)),
+            vec![80, 81, 82, 83, 84, 92]
+        );
+        let full = with_output(&with_round(&with_rms(&base)));
+        assert_eq!(
+            ids(&full),
+            vec![80, 90, 91, 81, 82, 83, 84, 92, 93, 94, 95, 96, 97]
+        );
+        let mut without_tail = full.clone();
+        if let Some(output) = without_tail.output.as_mut() {
+            output.tail = None;
+        }
+        assert_eq!(
+            ids(&without_tail),
+            vec![80, 90, 91, 81, 82, 83, 84, 92, 93, 94, 95, 96]
+        );
+        let mut without_output = with_rms(&with_round(&base));
+        without_output.output = None;
+        assert_eq!(
+            ids(&without_output),
+            vec![80, 90, 91, 81, 82, 83, 84, 92]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -43348,4 +43470,5 @@ mod production_key_geometry_tests {
         assert_eq!(plan.shared.stages.len(), 3);
         assert_eq!(plan.own.stages.len(), 3);
     }
+
 }

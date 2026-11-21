@@ -24563,15 +24563,12 @@ fn norm_plain_rows(
                 let round_member = round_member.ok_or(Error::StatementMismatch)?;
                 let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
                 let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
-                let (start, width, value_group, offset) = match word.relation {
-                    30 => (rms_slots.s_ll_digits, 5usize, &norm.sum, 0i128),
-                    31 => (
-                        rms_slots.s_lh_digits,
-                        6,
-                        &norm.squares,
-                        crate::proof::rms_limbs::CROSS_OFFSET,
-                    ),
-                    _ => (rms_slots.s_hh_digits, 6, &norm.mean, 0),
+                let (start, width, offset) =
+                    crate::proof::hidden_norm_psc::rms_partial_sum_slots(word.relation, &rms_slots)?;
+                let value_group = match word.relation {
+                    30 => &norm.sum,
+                    31 => &norm.squares,
+                    _ => &norm.mean,
                 };
                 let value_member = bat_of
                     .get(

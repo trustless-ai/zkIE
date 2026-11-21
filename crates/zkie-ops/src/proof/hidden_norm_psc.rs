@@ -850,6 +850,26 @@ pub fn rms_relation_terms(
     Ok((terms, constant))
 }
 
+/// The slot range, digit width and sign offset of one limb partial-sum
+/// reconstruction relation (30..=32). The relation value builder and the
+/// prover plain-row builder both call this, so the two sides read one term
+/// list and cannot diverge.
+pub(crate) fn rms_partial_sum_slots(
+    relation: usize,
+    slots: &RmsRoundSlots,
+) -> Result<(usize, usize, i128)> {
+    match relation {
+        30 => Ok((slots.s_ll_digits, slots.widths.s_ll, 0)),
+        31 => Ok((
+            slots.s_lh_digits,
+            slots.widths.s_lh,
+            crate::proof::rms_limbs::CROSS_OFFSET,
+        )),
+        32 => Ok((slots.s_hh_digits, slots.widths.s_hh, 0)),
+        _ => Err(Error::UnsupportedPrimitive),
+    }
+}
+
 /// The exact witness value of one multi-limb round slot. The carry slots are
 /// offset-encoded, matching the committed message.
 pub(crate) fn rms_slot_value(
@@ -1203,28 +1223,11 @@ pub(crate) fn rel_map(
             let round = round.ok_or(Error::InvalidConfig)?;
             let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
             let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
-            let (start, width, digits, value, offset) = match relation {
-                30 => (
-                    rms_slots.s_ll_digits,
-                    rms_slots.widths.s_ll,
-                    &limb.s_ll_digits,
-                    row.sum,
-                    0i128,
-                ),
-                31 => (
-                    rms_slots.s_lh_digits,
-                    rms_slots.widths.s_lh,
-                    &limb.s_lh_digits,
-                    row.squares,
-                    crate::proof::rms_limbs::CROSS_OFFSET,
-                ),
-                _ => (
-                    rms_slots.s_hh_digits,
-                    rms_slots.widths.s_hh,
-                    &limb.s_hh_digits,
-                    row.mean as i128,
-                    0,
-                ),
+            let (start, width, offset) = rms_partial_sum_slots(relation, &rms_slots)?;
+            let (digits, value) = match relation {
+                30 => (&limb.s_ll_digits, row.sum),
+                31 => (&limb.s_lh_digits, row.squares),
+                _ => (&limb.s_hh_digits, row.mean as i128),
             };
             let _ = start;
             if width >= columns || digits.len() > width {
@@ -8478,6 +8481,47 @@ mod tests {
         assert_eq!(slots.division_slack, 1118);
         assert_eq!(slots.mean_top_slack, 1128);
         assert_eq!(slots.total, 1129);
+    }
+
+    /// The limb partial-sum relations (30..=32) read one term list: the
+    /// relation values and the prover plain rows both take the slot range,
+    /// width and offset from the shared helper. The test pins the resulting
+    /// (slot, 256^index) sequences for the published tuple and for the wider
+    /// tuple, so a reintroduced second source is caught.
+    #[test]
+    fn the_limb_partial_sum_terms_are_one_list() {
+        use crate::proof::rms_limbs::{RmsLimbWidths, CROSS_OFFSET};
+        let cases = [
+            (
+                RmsLimbWidths::derive(1 << 33, 640).unwrap(),
+                [(1000usize, 5usize, 0i128), (1005, 6, CROSS_OFFSET), (1011, 6, 0)],
+            ),
+            (
+                RmsLimbWidths::derive(1 << 17, 1280).unwrap(),
+                [(1000, 6, 0), (1006, 6, CROSS_OFFSET), (1012, 6, 0)],
+            ),
+        ];
+        for (widths, expected) in cases {
+            let slots =
+                RmsRoundSlots::new(1000, widths.first_divisor, widths.second_divisor, widths);
+            for (relation, (start, width, offset)) in (30..=32).zip(expected) {
+                let got = rms_partial_sum_slots(relation, &slots).unwrap();
+                assert_eq!(got, (start, width, offset));
+                // The digit coefficient of term i is 256^i, the same power
+                // the plain rows lay down; the last digit sits inside the
+                // allocated block.
+                let terms: Vec<(usize, i128)> = (0..width)
+                    .map(|index| (start + index, 256i128.pow(index as u32)))
+                    .collect();
+                assert_eq!(terms.len(), width);
+                assert_eq!(terms.first().copied(), Some((start, 1)));
+                assert_eq!(
+                    terms.last().copied(),
+                    Some((start + width - 1, 256i128.pow(width as u32 - 1)))
+                );
+                assert!(start + width <= slots.total);
+            }
+        }
     }
 
 }

@@ -72,6 +72,7 @@ pub struct NormSegmentProfile {
     pub hidden: u32,
     pub valid: u32,
     pub columns: u64,
+    pub mode: crate::proof::hidden_norm::NormMode,
     pub shift: u32,
     pub clamp: Option<(i64, i64)>,
     pub clamp_widths: Option<NormClampWidths>,
@@ -311,9 +312,13 @@ pub fn build_core_plan(
     let shape = NormShape::new(profile.positions, profile.hidden, profile.valid)?;
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
-    let relations: Vec<usize> = (0..26).collect();
+    let relations: Vec<usize> = if profile.mode.is_rms() {
+        (2..=26).collect()
+    } else {
+        (0..26).collect()
+    };
     let round_layout =
-        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
+        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?.with_mode(profile.mode);
     let round_columns = profile.round_widths.columns()?;
     let x_roots = x_roots(space, profile, x_rows)?;
     let mask = base_mask_plan(space, profile, variables, relations.len())?;
@@ -321,6 +326,7 @@ pub fn build_core_plan(
         shape,
         columns,
         variables,
+        mode: profile.mode,
         relations,
         x: group_plan(space, profile, columns, space.x)?,
         x_roots,
@@ -438,7 +444,11 @@ pub fn build_core_witness(
             return Err(Error::ShapeMismatch);
         }
         rows.push(row.clone());
-        core.push(NormCoreRow::from_values(row, profile.valid as usize)?);
+        core.push(NormCoreRow::from_values_mode(
+            row,
+            profile.valid as usize,
+            plan.mode,
+        )?);
     }
     let rsqrt = core
         .iter()
@@ -530,14 +540,14 @@ pub fn out_group_roots(
 pub fn attach_params_witness(
     witness: &mut NormWitness,
     gain: &[i64],
-    bias: &[i64],
+    bias: Option<&[i64]>,
 ) -> Result<()> {
-    if gain.len() != bias.len() || gain.is_empty() {
+    if gain.is_empty() || bias.is_some_and(|bias| gain.len() != bias.len()) {
         return Err(Error::ShapeMismatch);
     }
     witness.params = Some(NormParamWitness {
         gain: gain.to_vec(),
-        bias: bias.to_vec(),
+        bias: bias.map(<[i64]>::to_vec),
         gain_claim: None,
         bias_claim: None,
     });
@@ -559,13 +569,13 @@ pub fn attach_output_witness(
     plan: &NormPlan,
     profile: &NormSegmentProfile,
     gain: &[i64],
-    bias: &[i64],
+    bias: Option<&[i64]>,
     rstd_values: &[i64],
 ) -> Result<()> {
     let output = plan.output.as_ref().ok_or(Error::InvalidConfig)?;
     let tail_plan = output.tail.as_ref().ok_or(Error::InvalidConfig)?;
     if gain.len() != profile.columns as usize
-        || bias.len() != profile.columns as usize
+        || bias.is_some_and(|bias| bias.len() != profile.columns as usize)
         || rstd_values.len() != witness.rows.len()
     {
         return Err(Error::ShapeMismatch);
@@ -588,6 +598,7 @@ pub fn attach_output_witness(
             profile.valid as usize,
             output.shift,
             output.clamp,
+            plan.mode,
         )?);
     }
     let tail = NormOutputTailWitness {
@@ -924,6 +935,7 @@ mod tests {
             hidden: 1024,
             valid: 768,
             columns: 1024,
+            mode: crate::proof::hidden_norm::NormMode::LayerNorm,
             shift: 32,
             clamp: Some((-(1 << 31), (1 << 31) - 1)),
             clamp_widths: Some(NormClampWidths {
@@ -1117,7 +1129,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -1160,7 +1172,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -1173,8 +1185,8 @@ mod tests {
             build_core_witness(&plan, &profile, &space, &x_rows, &rstd).unwrap();
         let gain = vec![1i64; profile.columns as usize];
         let bias = vec![0i64; profile.columns as usize];
-        attach_params_witness(&mut witness, &gain, &bias).unwrap();
-        attach_output_witness(&mut witness, &plan, &profile, &gain, &bias, &rstd).unwrap();
+        attach_params_witness(&mut witness, &gain, Some(&bias)).unwrap();
+        attach_output_witness(&mut witness, &plan, &profile, &gain, Some(&bias), &rstd).unwrap();
         attach_lookup(&mut plan, &space, &lookup_space()).unwrap();
         attach_lookup_witness(&mut witness, &plan).unwrap();
         attach_rstd_witness(&mut witness, &plan).unwrap();
@@ -1210,7 +1222,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -1241,7 +1253,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -1275,7 +1287,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -1322,7 +1334,7 @@ mod tests {
             gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
             bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
             gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
-            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            bias: Some(param_identity(NormParamKind::Bias, bias_reader, profile.columns)),
             column_draws: 2,
             seed_budget: 1,
         };

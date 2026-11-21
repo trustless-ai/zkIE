@@ -28,8 +28,7 @@ use zkie_ops::pipeline::{
 };
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor_with_tables, verify_model_anchor_with_tables_on_identity,
-    verify_shared_trace, verify_shared_trace_output,
-    ModelCommitmentPublic, SharedTrace,
+    verify_shared_trace, ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::asset_key::{
     prove_asset_key, verify_asset_key, AssetKeyColumns, ASSET_KEY_BUNDLE,
@@ -93,6 +92,9 @@ pub struct StatementData {
     /// the consumer table; this one rides the statement and its digest is
     /// absorbed into the segment session derivation.
     pub segment_identity: Option<SegmentTableIdentity>,
+    /// The timesfm norm-only segment declaration. It is bound into the
+    /// segment session seed; gpt2 keeps false.
+    pub norm_only: bool,
 }
 
 fn read_i32(path: &Path) -> Result<Vec<i32>> {
@@ -384,16 +386,42 @@ fn gpt2_key_columns() -> Result<(
     Ok((params, spec, columns))
 }
 
+/// The registered first projection table of TimesFM: its trusted parameters,
+/// its asset specification and the derived key-stage columns.
+fn timesfm_key_columns() -> Result<(
+    AssetTableParams,
+    zkie_ops::proof::model_commitment::ModelAssetSpec,
+    AssetKeyColumns,
+)> {
+    let path = zkie_models_timesfm::plan::FIRST_PROJECTION;
+    let params = zkie_models_timesfm::plan::projection_table_params(path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let spec = zkie_models_timesfm::plan::asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let derived = zkie_models_timesfm::plan::derive_table_plan(
+        &zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE,
+    )?;
+    let columns = AssetKeyColumns {
+        key_columns: derived.one_time_columns,
+        instance_columns: derived.total_columns,
+        k_lo: zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE.k_lo,
+        lin_check: derived.lin_check,
+    };
+    Ok((params, spec, columns))
+}
 
-/// Samples the commit's table material. The two final-norm parameter tables
-/// use a plan-fixed public seed, so their roots are a reproducible function of
-/// the trusted asset and the public derivation; the projection table keeps
-/// fresh material.
+/// Samples the commit table material. The final-norm parameter tables use a
+/// plan-fixed public seed, so their roots are a reproducible function of the
+/// trusted asset and the public derivation; the projection table keeps fresh
+/// material.
 fn sample_production_tables(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {
     let mut tables = Vec::with_capacity(params.len());
     for params in params {
         let randomness = if params.path.ends_with("ln_f_w_i32.bin")
             || params.path.ends_with("ln_f_b_i32.bin")
+            || params.path.ends_with("L0_lnw_i32.bin")
         {
             sample_asset_table_randomness_public(params, norm_param_seed(params))?
         } else {
@@ -419,7 +447,7 @@ fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
     match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
         "gemma3" => Ok(Vec::new()),
-        "timesfm" => Ok(Vec::new()),
+        "timesfm" => zkie_models_timesfm::plan::asset_table_params(),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -436,15 +464,11 @@ fn build_commitment(
             }
             gemma3::build_commitment(Path::new(&config.case_root), &config.tokens)
         }
-        "timesfm" => {
-            if !tables.is_empty() {
-                return Err(Error::InvalidConfig);
-            }
-            timesfm::build_commitment(
-                Path::new(&config.case_root),
-                &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
-            )
-        }
+        "timesfm" => timesfm::build_commitment(
+            Path::new(&config.case_root),
+            &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
+        ),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -469,12 +493,13 @@ fn execute_shared(
             Some(progress),
         )
         .map(|trace| (trace, None)),
-        "timesfm" => timesfm::execute_shared_with_progress_public(
+        "timesfm" => timesfm::execute_shared_with_progress_public_consumer(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
             Some(progress),
         )
-        .map(|trace| (trace, None)),
+        .map(|(trace, file)| (trace, Some(file))),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -736,6 +761,144 @@ fn verify_norm_segment(
     Ok(())
 }
 
+
+/// Proves the timesfm L0 norm-only segment and returns its carrier bytes.
+fn prove_timesfm_norm_segment(
+    config: &ProviderConfig,
+    commitment: &zkie_ops::proof::model_commitment::ModelCommitment,
+    tables: &[AssetTableInput],
+    trace: &SharedTrace,
+    ctx: &mut PipelineContext<'_>,
+) -> Result<Option<Vec<u8>>> {
+    use crate::timesfm_norm_parent;
+    use crate::timesfm_norm_segment_provider as segment;
+
+    // The segment positions are the patch tokens, not the raw input points:
+    // the timesfm statement carries the 512 raw points.
+    let positions = config.seq_tokens;
+    if positions != timesfm_norm_parent::SEGMENT_POSITIONS {
+        return Ok(None);
+    }
+    let model = commitment.anchor.record.model_commitment;
+    let profile = zkie_models_timesfm::norm_profile::segment_profile(
+        u32::try_from(positions).map_err(|_| Error::ResourceLimit)?,
+        timesfm_norm_parent::segment_x_seed(model, positions),
+    )?;
+    let (_, x_rows, hd_rows) = timesfm_norm_parent::first_rms_norm_rows(trace)?;
+    let public = ModelCommitmentPublic::from_commitment(commitment);
+    let asset_root = Path::new(&config.asset_root);
+    let gain = timesfm_norm_parent::read_gain(asset_root, &public.assets)?;
+    let rstd = timesfm_norm_parent::read_rstd_values(asset_root, &profile, &x_rows)?;
+    let configuration = segment::configuration(model);
+    let plan = timesfm_norm_parent::build_norm_only_plan(
+        &profile,
+        configuration,
+        &commitment.tables,
+        &x_rows,
+        &hd_rows,
+    )?;
+    let norm_plan = plan.norm.clone().ok_or(Error::IncompleteArtifact)?;
+    let witness = timesfm_norm_parent::build_norm_witness(
+        &norm_plan,
+        &profile,
+        configuration,
+        &x_rows,
+        &gain,
+        &rstd,
+    )?;
+    let table = segment::rstd_table_view(asset_root)?;
+    timesfm_norm_parent::check_authenticated_bounds(
+        &norm_plan,
+        &profile,
+        &x_rows,
+        &gain,
+        &table,
+    )?;
+    let mut params = segment::build_param_tables(commitment, tables)?;
+    let seed = timesfm_norm_parent::segment_session_seed(model, positions, true);
+    let started = Instant::now();
+    let carrier = segment::prove_bytes(&plan, seed, witness, &mut params, &table)?;
+    ctx.metrics
+        .record("timesfm_norm_prove_ms", started.elapsed().as_millis() as u64);
+    let bytes = carrier.encode()?;
+    ctx.metrics
+        .record("timesfm_norm_bytes", bytes.len() as u64);
+    Ok(Some(bytes))
+}
+
+/// Verifies the timesfm norm-only carrier when the statement declares it.
+fn verify_timesfm_norm_segment(
+    trusted: &crate::policy::TrustedRequest,
+    public: &ModelCommitmentPublic,
+    statement: &StatementData,
+    trace: &SharedTrace,
+    proof_dir: &Path,
+    proof_manifest: &ArtifactManifest,
+    asset_root: &Path,
+    table_metas: &[AssetTableMeta],
+    ctx: &mut PipelineContext<'_>,
+) -> Result<()> {
+    use crate::timesfm_norm_parent;
+    use crate::timesfm_norm_segment_provider as segment;
+
+    if statement.model != "timesfm" {
+        return Ok(());
+    }
+    // The declaration must follow the trusted case, not the artifact: the
+    // statement is prover-supplied, so turning the declaration off and
+    // dropping the carrier must not switch the segment verification off for
+    // a case the policy defines as a norm-only segment.
+    let positions = trusted.patch_tokens.ok_or(Error::InvalidConfig)?;
+    let required = positions == timesfm_norm_parent::SEGMENT_POSITIONS;
+    if statement.norm_only != required {
+        return Err(Error::StatementMismatch);
+    }
+    let entry = proof_manifest.find_file(segment::TIMESFM_NORM_CARRIER_FILE);
+    if !required {
+        return if entry.is_some() {
+            Err(Error::StatementMismatch)
+        } else {
+            Ok(())
+        };
+    }
+    let entry = entry.ok_or(Error::IncompleteArtifact)?;
+    let bytes = fs::read(proof_dir.join(segment::TIMESFM_NORM_CARRIER_FILE))
+        .map_err(|_| Error::IncompleteArtifact)?;
+    if bytes.len() as u64 != entry.byte_length || digest_bytes(&bytes) != entry.content_digest {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    let carrier = segment::TimesfmNormCarrier::decode(&bytes)?;
+    let model = statement.model_commitment;
+    let profile = zkie_models_timesfm::norm_profile::segment_profile(
+        u32::try_from(positions).map_err(|_| Error::ResourceLimit)?,
+        timesfm_norm_parent::segment_x_seed(model, positions),
+    )?;
+    let (_, x_rows, hd_rows) = timesfm_norm_parent::first_rms_norm_rows(trace)?;
+    let configuration = segment::configuration(model);
+    let plan = timesfm_norm_parent::build_norm_only_plan(
+        &profile,
+        configuration,
+        table_metas,
+        &x_rows,
+        &hd_rows,
+    )?;
+    let norm_plan = plan.norm.clone().ok_or(Error::IncompleteArtifact)?;
+    let gain = timesfm_norm_parent::read_gain(asset_root, &public.assets)?;
+    let table = segment::rstd_table_view(asset_root)?;
+    timesfm_norm_parent::check_authenticated_bounds(
+        &norm_plan,
+        &profile,
+        &x_rows,
+        &gain,
+        &table,
+    )?;
+    let started = Instant::now();
+    segment::verify_bytes(&plan, &carrier, &table)?;
+    ctx.metrics
+        .record("timesfm_norm_verify_ms", started.elapsed().as_millis() as u64);
+    Ok(())
+}
+
 pub struct ProductionProvider;
 
 impl PipelineProvider for ProductionProvider {
@@ -766,10 +929,33 @@ impl PipelineProvider for ProductionProvider {
                 .find(|table| table.params.path == params.path)
                 .ok_or(Error::IncompleteArtifact)?;
             let started = Instant::now();
-            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns)?;
+            let range = zkie_ops::proof::table_range::production_table_range()?;
+            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns, &range)?;
             ctx.metrics.record("key_prove_ms", started.elapsed().as_millis() as u64);
             let started = Instant::now();
-            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
+            key_bundle = Some(bytes);
+        }
+        if config.model == "timesfm" {
+            let (params, spec, columns) = timesfm_key_columns()?;
+            let identity = zkie_models_timesfm::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let input = tables
+                .iter()
+                .find(|table| table.params.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let started = Instant::now();
+            let range = zkie_models_timesfm::plan::production_table_range()?;
+            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns, &range)?;
+            ctx.metrics.record("key_prove_ms", started.elapsed().as_millis() as u64);
+            let started = Instant::now();
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
             key_bundle = Some(bytes);
@@ -886,7 +1072,24 @@ impl PipelineProvider for ProductionProvider {
             let bytes =
                 checked_artifact_file(&request.commit_dir, &commit_manifest, ASSET_KEY_BUNDLE)?;
             let started = Instant::now();
-            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            let range = zkie_ops::proof::table_range::production_table_range()?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
+        }
+        if config.model == "timesfm" {
+            let (params, spec, columns) = timesfm_key_columns()?;
+            let identity = zkie_models_timesfm::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let bytes =
+                checked_artifact_file(&request.commit_dir, &commit_manifest, ASSET_KEY_BUNDLE)?;
+            let started = Instant::now();
+            let range = zkie_models_timesfm::plan::production_table_range()?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
         }
@@ -903,6 +1106,11 @@ impl PipelineProvider for ProductionProvider {
                 Some((bytes, identity)) => (Some(bytes), Some(identity)),
                 None => (None, None),
             }
+        } else if config.model == "timesfm" {
+            match prove_timesfm_norm_segment(&config, &commitment, &tables, &trace, ctx)? {
+                Some(bytes) => (Some(bytes), None),
+                None => (None, None),
+            }
         } else {
             (None, None)
         };
@@ -914,6 +1122,8 @@ impl PipelineProvider for ProductionProvider {
             expected_argmax: config.expected_argmax.clone(),
             expected_output: config.expected_output.clone(),
             segment_identity,
+            norm_only: config.model == "timesfm"
+                && config.seq_tokens == crate::timesfm_norm_parent::SEGMENT_POSITIONS,
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
         let consumer_bytes = consumer
@@ -956,14 +1166,15 @@ impl PipelineProvider for ProductionProvider {
             ctx.metrics.record("consumer_proof_bytes", bytes.len() as u64);
         }
         if let Some(bytes) = &norm_carrier {
+            let name = if config.model == "timesfm" {
+                crate::timesfm_norm_segment_provider::TIMESFM_NORM_CARRIER_FILE
+            } else {
+                NORM_SEGMENT_CARRIER_FILE
+            };
             let digest = digest_bytes(bytes);
-            files.push((NORM_SEGMENT_CARRIER_FILE, bytes.as_slice()));
-            digests.push((NORM_SEGMENT_CARRIER_FILE, digest));
-            manifest_files.push(ArtifactFile::new(
-                NORM_SEGMENT_CARRIER_FILE,
-                bytes.len() as u64,
-                digest,
-            ));
+            files.push((name, bytes.as_slice()));
+            digests.push((name, digest));
+            manifest_files.push(ArtifactFile::new(name, bytes.len() as u64, digest));
         }
         let manifest = proof_manifest(model, manifest_files);
         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
@@ -1098,12 +1309,14 @@ impl PipelineProvider for ProductionProvider {
                     .find(|meta| meta.path == key_params.path)
                     .ok_or(Error::IncompleteArtifact)?;
                 let started = Instant::now();
+                let key_range = zkie_ops::proof::table_range::production_table_range()?;
                 verify_asset_key(
                     key_meta,
                     &key_params,
                     identity,
                     &key_spec,
                     key_columns,
+                    &key_range,
                     &key_bytes,
                 )?;
                 ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
@@ -1238,21 +1451,104 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_timesfm::plan::parameters_digest()?;
                 let specs = zkie_models_timesfm::plan::asset_specs();
-                verify_model_anchor_with_tables(
+                let identity = zkie_models_timesfm::plan::table_model_identity()?;
+                verify_model_anchor_with_tables_on_identity(
                     &public,
                     trusted.anchor_id,
                     model_id,
+                    identity,
                     parameters,
                     &specs,
                     &table_metas,
                     &table_params,
                 )?;
-                let output = verify_shared_trace_output(
+                let (key_params, key_spec, key_columns) = timesfm_key_columns()?;
+                let key_bytes =
+                    checked_artifact_file(commit_root, &commit_manifest, ASSET_KEY_BUNDLE)?;
+                let key_meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == key_params.path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let started = Instant::now();
+                let key_range = zkie_models_timesfm::plan::production_table_range()?;
+                verify_asset_key(
+                    key_meta,
+                    &key_params,
+                    identity,
+                    &key_spec,
+                    key_columns,
+                    &key_range,
+                    &key_bytes,
+                )?;
+                ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+                ctx.metrics.record("key_bytes", key_bytes.len() as u64);
+                let sidecar_entry = proof_manifest
+                    .find_file(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let sidecar_bytes = fs::read(
+                    proof_dir.join(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE),
+                )
+                .map_err(|_| Error::IncompleteArtifact)?;
+                if sidecar_bytes.len() as u64 != sidecar_entry.byte_length
+                    || digest_bytes(&sidecar_bytes) != sidecar_entry.content_digest
+                {
+                    return Err(Error::ArtifactIntegrityMismatch);
+                }
+                let consumer = ConsumerProofFile::decode(&sidecar_bytes)?;
+                let outputs = zkie_ops::proof::model_commitment::verify_shared_trace_outputs(
                     &public,
                     &trace,
                     &statement.tokens,
                     &plan,
                     Some(public_root),
+                )?;
+                let last = outputs.last().ok_or(Error::StatementMismatch)?;
+                let output: Vec<i64> = last.iter().flatten().copied().collect();
+                if output != trace.output {
+                    return Err(Error::StatementMismatch);
+                }
+                let path = key_params.path.as_str();
+                let consumer_params = zkie_models_timesfm::plan::projection_table_params(path)
+                    .ok_or(Error::UnsupportedPrimitive)?;
+                let derived = zkie_models_timesfm::plan::derive_table_plan(
+                    &zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE,
+                )?;
+                let shared = ConsumerSharedPlan {
+                    m_once: derived.table_shape.distances.m_once,
+                    m_later: derived.table_shape.distances.m_later,
+                    one_time_columns: derived.one_time_columns,
+                    later_columns: derived.later_batch_columns,
+                    declared_batches: 1,
+                    table_tail: derived.table_shape.code.r,
+                };
+                let spec = zkie_models_timesfm::plan::asset_specs()
+                    .into_iter()
+                    .find(|spec| spec.path == path)
+                    .ok_or(Error::UnsupportedPrimitive)?;
+                let meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                verify_consumer_request(
+                    &plan,
+                    &outputs,
+                    identity,
+                    meta,
+                    &consumer_params,
+                    &spec,
+                    shared,
+                    &consumer,
+                )?;
+                verify_timesfm_norm_segment(
+                    &trusted,
+                    &public,
+                    &statement,
+                    &trace,
+                    proof_dir,
+                    &proof_manifest,
+                    public_root,
+                    &table_metas,
+                    ctx,
                 )?;
                 if output.len() != zkie_models_timesfm::plan::output_elements(patches)? {
                     return Err(Error::ShapeMismatch);
@@ -1353,6 +1649,7 @@ mod tests {
             expected_argmax: Vec::new(),
             expected_output: Vec::new(),
             segment_identity: None,
+            norm_only: false,
         }
     }
 

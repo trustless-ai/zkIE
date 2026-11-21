@@ -122,11 +122,19 @@ fn write_policy(
             out.push('\n');
         }
     }
-    if model == "gpt2" {
+    let identity_meta = if model == "gpt2" {
         if let Some(kept) = kept_output_head {
             out.push_str(&kept);
+            None
         } else {
-        let meta = metas.first().expect("the gpt2 commit publishes one table");
+            metas.first()
+        }
+    } else if !metas.is_empty() {
+        metas.first()
+    } else {
+        None
+    };
+    if let Some(meta) = identity_meta {
         out.push_str(&format!(
             "\n[case.limited_table_identity]\nversion = 1\nmodel = \"{model}\"\nmodel_version = {model_version}\ncase_id = \"{case_id}\"\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\nasset_id = {}\nasset_table_identity = \"{}\"\ntable_root = \"{}\"\ntable_record_digest = \"{}\"\ntable_configuration = \"{}\"\ncode_log_n = {}\ncode_ell = {}\ncode_r = {}\ntable_v = {}\nanswers = {}\nsalt_bytes = {}\ndistance_radius = {}\ndistance_later_radius = {}\ndistance_m_once = {}\ndistance_m_later = {}\nmatrix_rows_log = {}\nk_lo = 0\nk_col = {}\nprotocol_identity = \"{}\"\n",
             meta.asset_id,
@@ -148,7 +156,6 @@ fn write_policy(
             meta.shape.v,
             digest_to_hex(&zkie_core::types::Digest([0x5A; 32])),
         ));
-        }
     }
     out
 }

@@ -34,7 +34,7 @@ use crate::proof::committed_psc::{
     get_psc_transcript, get_tree_plan, put_psc_transcript, put_tree_plan, CommittedPscGroup,
     PositionPscChallenges, PscTranscriptTags,
 };
-use crate::proof::hidden_norm::{NormCoreRow, NormShape};
+use crate::proof::hidden_norm::{NormCoreRow, NormMode, NormShape};
 use crate::proof::hidden_send_session::{
     get_column_opening, put_column_opening, SendSamples, WShape,
 };
@@ -997,6 +997,18 @@ pub(crate) fn rel_map(
                 }
             }
         }
+        26 => {
+            // RMS statistic: sum of the squared valid cells. Both factors
+            // read the committed x row, so the product map is x_i * x_i; the
+            // extra slot carries -sum on the left and one on the right.
+            for (index, value) in values.iter().take(valid).enumerate() {
+                let value = fp3_signed(*value as i128)?;
+                left[index] = value;
+                right[index] = value;
+            }
+            left[columns] = fp3_signed(-row.sum)?;
+            right[columns] = Fp3::ONE;
+        }
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -1120,14 +1132,15 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 14;
+pub const NORM_BIND_VERSION: u64 = 15;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
-/// relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 26] = [
+/// relations whose row binding is implemented. Relation 26 is the RMS sum of
+/// squares; the layer relations 0 and 1 are not part of an RMS plan.
+pub const NORM_BOUND_RELATIONS: [usize; 27] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-    25,
+    25, 26,
 ];
 
 /// One committed witness group of the integrated norm plan.
@@ -1422,8 +1435,8 @@ impl NormRstdPlan {
                 .checked_add(position as u64)
                 .ok_or(Error::ResourceLimit)?;
             for (column, slot) in [
-                (0u8, round.layout.slots.index_value),
-                (1u8, round.layout.slots.rstd),
+                (0u8, round.layout.index_value_slot()),
+                (1u8, round.layout.rstd_slot()),
             ] {
                 let row = slot % round_rows;
                 let place = slot / round_rows;
@@ -2026,6 +2039,9 @@ pub struct NormPlan {
     pub shape: NormShape,
     pub columns: u64,
     pub variables: usize,
+    /// The fixed normalization relation: the layer form centers by the mean,
+    /// the RMS form squares the raw valid cells.
+    pub mode: NormMode,
     /// The relation indices of the product-sumcheck instances, in transcript
     /// order. The plan fixes the domain; only the relations whose row binding
     /// is implemented may be listed.
@@ -2086,6 +2102,21 @@ impl NormPlan {
         {
             return Err(Error::UnsupportedPrimitive);
         }
+        if self.mode.is_rms() {
+            // The RMS form proves the sum of squares and the two rounding
+            // equations; the centering relations of the layer form must not
+            // be listed because their equations are false for this relation.
+            if self.relations.contains(&0)
+                || self.relations.contains(&1)
+                || !self.relations.contains(&2)
+                || !self.relations.contains(&3)
+                || !self.relations.contains(&26)
+            {
+                return Err(Error::InvalidConfig);
+            }
+        } else if self.relations.contains(&26) {
+            return Err(Error::InvalidConfig);
+        }
         if self.x.columns != self.columns
             || self.sum.columns != 1
             || self.squares.columns != 1
@@ -2116,6 +2147,9 @@ impl NormPlan {
             }
         }
         if let Some(round) = &self.round {
+            if round.layout.mode != self.mode {
+                return Err(Error::InvalidConfig);
+            }
             if round.input_bound == 0
                 || round.table_real_len == 0
                 || round.table_real_len > (1u64 << 32)
@@ -2129,12 +2163,13 @@ impl NormPlan {
             {
                 return Err(Error::InvalidConfig);
             }
-            if norm_no_wrap(
+            if norm_no_wrap_mode(
                 round.input_bound,
                 self.shape.valid,
                 &round.layout.widths,
                 round.layout.sum_offset,
                 round.layout.mean_offset,
+                self.mode,
             )
             .is_err()
             {
@@ -2243,7 +2278,15 @@ impl NormPlan {
         }
         if let Some(params) = &self.params {
             params.validate()?;
-            if params.gain.width != self.columns || params.bias.width != self.columns {
+            if params.gain.width != self.columns
+                || params
+                    .bias
+                    .as_ref()
+                    .is_some_and(|bias| bias.width != self.columns)
+            {
+                return Err(Error::InvalidConfig);
+            }
+            if self.mode.is_rms() && params.bias.is_some() {
                 return Err(Error::InvalidConfig);
             }
         }
@@ -2323,12 +2366,13 @@ impl NormPlan {
         let sh_cap = capacity(widths.shifted)?;
         let pre_cap = capacity(widths.pre_clamp)?;
         let pre_half = half_range(widths.pre_clamp)?;
-        let round_bounds = norm_no_wrap(
+        let round_bounds = norm_no_wrap_mode(
             round.input_bound,
             self.shape.valid,
             &round.layout.widths,
             round.layout.sum_offset,
             round.layout.mean_offset,
+            self.mode,
         )?;
         let gain = params
             .gain
@@ -2336,12 +2380,11 @@ impl NormPlan {
             .unsigned_abs()
             .max(params.gain.valid_min.unsigned_abs())
             as u128;
-        let bias = params
-            .bias
-            .valid_max
-            .unsigned_abs()
-            .max(params.bias.valid_min.unsigned_abs())
-            as u128;
+        let bias = params.bias.as_ref().map_or(0u128, |bias| {
+            bias.valid_max
+                .unsigned_abs()
+                .max(bias.valid_min.unsigned_abs()) as u128
+        });
         let centered = (round.input_bound as u128)
             .checked_mul(2)
             .ok_or(Error::ResourceLimit)?;
@@ -2481,6 +2524,7 @@ impl NormPlan {
         writer.put_u64(self.shape.valid as u64);
         writer.put_u64(self.columns);
         writer.put_u64(self.variables as u64);
+        writer.put_u64(self.mode.encode());
         writer.put_u64(self.relations.len() as u64);
         for relation in &self.relations {
             writer.put_u64(*relation as u64);
@@ -4238,7 +4282,7 @@ impl NormOutputMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamWitness {
     pub gain: Vec<i64>,
-    pub bias: Vec<i64>,
+    pub bias: Option<Vec<i64>>,
     pub gain_claim: Option<NormParamClaimWitness>,
     pub bias_claim: Option<NormParamClaimWitness>,
 }
@@ -4696,16 +4740,19 @@ impl NormParamMessage {
         let gain = NormParamClaimMessage::decode(gain_claim, &plan.gain, reader.get_bytes()?)?;
         let bias = match reader.get_u64()? {
             0 => {
-                if plan.bias.reader != plan.gain.reader {
-                    return Err(Error::ShapeMismatch);
+                match &plan.bias {
+                    None => {}
+                    Some(bias) if bias.reader == plan.gain.reader => {}
+                    Some(_) => return Err(Error::ShapeMismatch),
                 }
                 None
             }
             1 => {
+                let bias_identity = plan.bias.as_ref().ok_or(Error::ShapeMismatch)?;
                 let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
                 Some(NormParamClaimMessage::decode(
                     bias_claim,
-                    &plan.bias,
+                    bias_identity,
                     reader.get_bytes()?,
                 )?)
             }
@@ -4718,13 +4765,14 @@ impl NormParamMessage {
     pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
         let gain_claim = plan.gain_claim.as_ref().ok_or(Error::ShapeMismatch)?;
         self.gain.check(gain_claim, &plan.gain)?;
-        match (&self.bias, plan.bias.reader == plan.gain.reader) {
-            (None, true) => {}
-            (Some(bias), false) => {
+        match (&self.bias, &plan.bias) {
+            (None, None) => {}
+            (None, Some(bias)) if bias.reader == plan.gain.reader => {}
+            (Some(bias_message), Some(bias)) => {
                 let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
-                bias.check(bias_claim, &plan.bias)?;
+                bias_message.check(bias_claim, bias)?;
             }
-            _ => return Err(Error::ShapeMismatch),
+            (None, Some(_)) | (Some(_), None) => return Err(Error::ShapeMismatch),
         }
         Ok(())
     }
@@ -5205,11 +5253,30 @@ pub struct NormRoundLayout {
     pub widths: NormRoundWidths,
     pub sum_offset: u64,
     pub mean_offset: u64,
+    /// The normalization mode this layout was built for. The witness writer
+    /// and every lookup constructor consume the same field.
+    pub mode: NormMode,
     pub slots: NormRoundSlots,
 }
 
 impl NormRoundLayout {
     pub const FIXED_SLOTS: usize = 6;
+
+    /// Binds the layout to a normalization mode. Existing LayerNorm callers
+    /// keep the default; RMS callers must set this before any witness or
+    /// lookup construction.
+    pub fn with_mode(mut self, mode: NormMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn index_value_slot(&self) -> usize {
+        self.slots.index_value
+    }
+
+    pub fn rstd_slot(&self) -> usize {
+        self.slots.rstd
+    }
 
     pub fn new(
         widths: NormRoundWidths,
@@ -5327,6 +5394,7 @@ impl NormRoundLayout {
             widths,
             sum_offset,
             mean_offset,
+            mode: NormMode::LayerNorm,
             slots: NormRoundSlots {
                 mean_remainder,
                 mean_offset: mean_offset_slot,
@@ -5504,7 +5572,7 @@ impl NormRoundLayout {
         values[self.slots.coarse_r] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
         values[self.slots.coarse_r + 1] =
             Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
-        values[self.slots.index_value] = fp3_signed(rsqrt.index as i128)?;
+        values[self.index_value_slot()] = fp3_signed(rsqrt.index as i128)?;
         write_digits(
             &mut values[self.slots.index_digits
                 ..self.slots.index_digits + RSQRT_INDEX_WIDTH],
@@ -5515,7 +5583,7 @@ impl NormRoundLayout {
                 ..self.slots.index_slack + RSQRT_INDEX_SLACK_WIDTH],
             &rsqrt.index_slack_digits,
         )?;
-        values[self.slots.rstd] = fp3_signed(rsqrt.rstd as i128)?;
+        values[self.rstd_slot()] = fp3_signed(rsqrt.rstd as i128)?;
         Ok(values)
     }
 }
@@ -5571,6 +5639,27 @@ pub fn norm_no_wrap(
     sum_offset: u64,
     mean_offset: u64,
 ) -> Result<NormNoWrap> {
+    norm_no_wrap_mode(
+        input_bound,
+        valid,
+        widths,
+        sum_offset,
+        mean_offset,
+        NormMode::LayerNorm,
+    )
+}
+
+/// The relation bounds of one position for the selected normalization. The
+/// layer form sums the raw cells and squares the centered cells; the RMS form
+/// sums the squared cells and uses the same sum for the squares relation.
+pub fn norm_no_wrap_mode(
+    input_bound: u64,
+    valid: u32,
+    widths: &NormRoundWidths,
+    sum_offset: u64,
+    mean_offset: u64,
+    mode: NormMode,
+) -> Result<NormNoWrap> {
     if valid == 0 || widths.fault(valid).is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -5590,15 +5679,26 @@ pub fn norm_no_wrap(
         .checked_add(mean_offset as u128)
         .ok_or(Error::ResourceLimit)?;
     let bu = digit_bound(widths.offset)?;
-    let relation_sum = d
-        .checked_mul(x)
-        .and_then(|value| value.checked_add(bv))
-        .ok_or(Error::ResourceLimit)?;
+    let square = x.checked_mul(x).ok_or(Error::ResourceLimit)?;
+    let relation_sum = if mode.is_rms() {
+        d.checked_mul(square)
+            .and_then(|value| value.checked_add(bv))
+            .ok_or(Error::ResourceLimit)?
+    } else {
+        d.checked_mul(x)
+            .and_then(|value| value.checked_add(bv))
+            .ok_or(Error::ResourceLimit)?
+    };
     let sum_x_q = x.checked_add(bq).ok_or(Error::ResourceLimit)?;
-    let relation_squares = d
-        .checked_mul(sum_x_q.checked_mul(sum_x_q).ok_or(Error::ResourceLimit)?)
-        .and_then(|value| value.checked_add(bs))
-        .ok_or(Error::ResourceLimit)?;
+    let relation_squares = if mode.is_rms() {
+        d.checked_mul(square)
+            .and_then(|value| value.checked_add(bs))
+            .ok_or(Error::ResourceLimit)?
+    } else {
+        d.checked_mul(sum_x_q.checked_mul(sum_x_q).ok_or(Error::ResourceLimit)?)
+            .and_then(|value| value.checked_add(bs))
+            .ok_or(Error::ResourceLimit)?
+    };
     let relation_mean = bv
         .checked_add(bq.checked_mul(d).ok_or(Error::ResourceLimit)?)
         .and_then(|value| value.checked_add(d))
@@ -6694,6 +6794,7 @@ mod tests {
             shape: psc.shape,
             columns: psc.columns,
             variables: psc.variables,
+            mode: NormMode::LayerNorm,
             relations: vec![0, 1, 2, 3],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
@@ -6773,7 +6874,7 @@ mod tests {
         let digest = plan.digest();
         plan.params = Some(NormParamTablesPlan {
             gain: identity(NormParamKind::Gain, 0),
-            bias: identity(NormParamKind::Bias, 1),
+            bias: Some(identity(NormParamKind::Bias, 1)),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -6787,11 +6888,11 @@ mod tests {
         assert!(changed.validate().is_err());
 
         let mut changed = plan.clone();
-        changed.params.as_mut().unwrap().bias.kind = NormParamKind::Gain;
+        changed.params.as_mut().unwrap().bias.as_mut().unwrap().kind = NormParamKind::Gain;
         assert!(changed.validate().is_err());
 
         let mut changed = plan;
-        changed.params.as_mut().unwrap().bias.row = 0;
+        changed.params.as_mut().unwrap().bias.as_mut().unwrap().row = 0;
         assert!(changed.validate().is_err());
     }
 
@@ -6842,6 +6943,28 @@ mod tests {
     }
 
     #[test]
+    fn round_layout_mode_mismatch_is_rejected() {
+        let (mut plan, _, _) = integrated_fixture();
+        plan.validate().unwrap();
+        let layout = NormRoundLayout::new(
+            NormRoundWidths { sum: 2, squares: 2, variance: 2, mean: 2, offset: 1 },
+            plan.shape.valid,
+            0,
+            0,
+        )
+        .unwrap()
+        .with_mode(crate::proof::hidden_norm::NormMode::LayerNorm);
+        plan.mode = crate::proof::hidden_norm::NormMode::RmsNorm;
+        plan.round = Some(NormRoundPlan {
+            group: plan.x.clone(),
+            layout,
+            input_bound: 1,
+            table_real_len: 1,
+        });
+        assert!(plan.validate().is_err(), "a round layout with another mode must be rejected");
+    }
+
+    #[test]
     fn output_tail_plan_binds_the_groups_and_the_runtime_parameters() {
         use crate::proof::norm_param_table::{
             NormParamKind, NormParamTableIdentity, NormParamTablesPlan,
@@ -6889,7 +7012,7 @@ mod tests {
         };
         plan.params = Some(NormParamTablesPlan {
             gain: identity(NormParamKind::Gain, reader(0x32, 0x31)),
-            bias: identity(NormParamKind::Bias, reader(0x37, 0x38)),
+            bias: Some(identity(NormParamKind::Bias, reader(0x37, 0x38))),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -7232,10 +7355,11 @@ mod tests {
                 &padded,
                 100,
                 &weight,
-                &bias,
+                Some(&bias),
                 2,
                 3,
                 None,
+                NormMode::LayerNorm,
             )
             .unwrap();
             for relation in 0..NORM_OUTPUT_TAIL_RELATIONS {
@@ -7258,8 +7382,18 @@ mod tests {
         assert_eq!(output_tail_variables(columns).unwrap(), 7);
         let row = {
             let core = NormCoreRow::from_values(&[1, 2], 2).unwrap();
-            NormOutputRow::from_core(&core, &[1, 2, 0, 0], 100, &weight, &bias, 2, 3, None)
-                .unwrap()
+            NormOutputRow::from_core(
+                &core,
+                &[1, 2, 0, 0],
+                100,
+                &weight,
+                Some(&bias),
+                2,
+                3,
+                None,
+                NormMode::LayerNorm,
+            )
+            .unwrap()
         };
         assert!(output_rel_map(&tail_plan, &row, columns, 3, NORM_OUTPUT_TAIL_RELATIONS).is_err());
     }
@@ -7315,7 +7449,7 @@ mod tests {
         let bias = identity(NormParamKind::Bias, reader(0x37, 0x38));
         plan.params = Some(NormParamTablesPlan {
             gain: gain.clone(),
-            bias: bias.clone(),
+            bias: Some(bias.clone()),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: Some(claim_gu(NormParamKind::Gain, gain.reader.shape)),
@@ -7363,8 +7497,9 @@ mod tests {
         .is_err());
 
         let mut packed = plan.clone();
-        packed.params.as_mut().unwrap().bias.reader = packed.params.as_ref().unwrap().gain.reader.clone();
-        packed.params.as_mut().unwrap().bias.row = 1;
+        packed.params.as_mut().unwrap().bias.as_mut().unwrap().reader =
+            packed.params.as_ref().unwrap().gain.reader.clone();
+        packed.params.as_mut().unwrap().bias.as_mut().unwrap().row = 0;
         assert!(packed.validate().is_err());
 
         let mut missing = params;

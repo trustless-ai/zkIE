@@ -18045,11 +18045,19 @@ fn norm_members_core(
     let positions = plan.send.positions();
     let mut groups = vec![
         (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
+    ];
+    if let (Some(low), Some(rms)) = (&norm_first.low, &norm_plan.rms) {
+        groups.push((low, &rms.low, norm_witness.and_then(|w| w.low.as_ref())));
+    }
+    if let (Some(high), Some(rms)) = (&norm_first.high, &norm_plan.rms) {
+        groups.push((high, &rms.high, norm_witness.and_then(|w| w.high.as_ref())));
+    }
+    groups.extend([
         (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
         (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
         (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
         (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
-    ];
+    ]);
     if let (Some(round_message), Some(round_plan)) =
         (&norm_first.round, &norm_plan.round)
     {

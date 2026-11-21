@@ -398,6 +398,7 @@ pub fn build_norm_only_plan(
         mask_code,
         shared_mask_tree: mask_tree(0),
         own_mask_tree: mask_tree(1),
+        own_deferred_samples: false,
         // The fresh-mask oracle ids stay below the norm group oracle bases
         // (9000+) and above every member's BAT registration id. The norm-only
         // member set registers more than ninety BAT oracles, so the earlier

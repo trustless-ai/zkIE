@@ -29,6 +29,14 @@ pub const INPUT_BOUND: u64 = 1 << 17;
 pub const SUM_OFFSET: u64 = 1 << 28;
 /// Fixed offset of the mean digit block; larger than the measured `|mean|` max.
 pub const MEAN_OFFSET: u64 = 1 << 18;
+/// Trusted bound of the rounded mean square for the RMS form; the same
+/// 2-power-with-margin form as the mean offset.
+pub const MEAN_BOUND: u64 = 1 << 18;
+/// The correlated pre-clamp bound for the RMS form: twice the input bound,
+/// the gain maximum and the trusted rstd table maximum, plus one. The rstd
+/// term uses the table maximum because this profile has no per-index read
+/// (the measured x-square quotient exceeds the table view).
+pub const PRE_BOUND: u64 = 2 * INPUT_BOUND * (GAIN_MAX as u64) * RSTD_VALUE_BOUND + 1;
 /// Trusted maximum of the gain entries used by the registered case.
 pub const GAIN_MAX: i64 = 1 << 17;
 /// Observed largest absolute input cell, for the record.
@@ -149,6 +157,8 @@ pub fn segment_profile(
         round_widths: round_widths(),
         tail_widths: tail_widths(),
         table_real_len: RSTD_TABLE_REAL_LEN,
+        mean_bound: MEAN_BOUND,
+        pre_bound: PRE_BOUND,
         x_seed,
     })
 }
@@ -210,6 +220,8 @@ mod tests {
     fn the_observed_bounds_fit_the_declared_bounds() {
         assert!(INPUT_OBSERVED.unsigned_abs() <= INPUT_BOUND);
         assert!(CENTERED_OBSERVED.unsigned_abs() <= 2 * INPUT_BOUND);
+        assert!((PRE_CLAMP_OBSERVED as u64) < PRE_BOUND);
+        assert!(CENTERED_OBSERVED.unsigned_abs() <= MEAN_BOUND as i64);
         assert!(RSTD_OBSERVED.unsigned_abs() as u64 <= RSTD_VALUE_BOUND);
         assert!(GAIN_MAX >= 80_546);
         assert!(RSTD_INDEX_MIN < RSTD_INDEX_MAX);

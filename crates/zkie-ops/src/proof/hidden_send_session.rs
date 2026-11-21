@@ -19451,7 +19451,7 @@ fn member_sample_rows(
 plan: &HiddenLinPlan,
 member: &ProximityMember,
 first: &HiddenSendMessages,
-shared: &HiddenSharedMessages,
+shared: Option<&HiddenSharedMessages>,
 ) -> Result<Vec<GuRelationRow>> {
 let shape = plan.send.w.oracle_shape();
     if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
@@ -19804,13 +19804,19 @@ let shape = plan.send.w.oracle_shape();
         }
     }
     if member.source_oracle == plan.proximity.omega.oracle {
-        let mut list = Vec::with_capacity(shared.omega_answers.len());
-        for (answer, target) in shared.omega_answers.iter().enumerate() {
+        let mut list = Vec::with_capacity(
+            shared.map(|shared| shared.omega_answers.len()).unwrap_or(0),
+        );
+        for (answer, target) in shared
+            .map(|shared| shared.omega_answers.iter())
+            .unwrap_or([].iter())
+            .enumerate()
+        {
             list.push(oracle_sample_row(
                 plan.proximity.omega.oracle,
                 plan.proximity.omega.group,
                 &plan.proximity.omega.u,
-                &shared.omega_seeds,
+                &shared.map(|shared| shared.omega_seeds.as_slice()).unwrap_or(&[]),
                 answer as u32,
                 *target,
             )?);
@@ -20055,7 +20061,7 @@ fn member_samples_into(
             return Ok(());
         }
     }
-    for row in member_sample_rows(plan, member, first, shared)? {
+    for row in member_sample_rows(plan, member, first, Some(shared))? {
         emit(adapt_sample_row(&row, member)?)?;
     }
     Ok(())
@@ -20065,7 +20071,7 @@ fn own_sample_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
     first: &HiddenSendMessages,
-    shared: &HiddenSharedMessages,
+    shared: Option<&HiddenSharedMessages>,
 ) -> Result<Vec<Vec<GuRelationRow>>> {
     members
         .iter()
@@ -24778,7 +24784,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_term(
@@ -24797,7 +24803,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
-                rows.push(right);
+                emit(right)?;
             }
             4 | 5 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -26356,10 +26362,6 @@ fn output_tail_padding_rows(
                 );
                 power = power.mul(&Fp3::from_u64(256));
             }
-
-            let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
-
             if let (Some(claim), Some(bias_member)) = (bias_claim, bias_member) {
                 let mut unit = vec![Fp3::ZERO; bits];
                 for bit in 0..bits {
@@ -26367,15 +26369,15 @@ fn output_tail_padding_rows(
                         unit[bit] = Fp3::ONE;
                     }
                 }
-
-                let bias_coefficients =
-                    norm_param_eval_coefficients(&claim.gu, norm.columns, &unit)?;
-                let negated: Vec<Fp3> = bias_coefficients
-                    .iter()
-                    .map(|value| Fp3::ZERO.sub(value))
-                    .collect();
-                row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
-
+                let index = gu_vector_bat_index(&claim.gu, column as u64)?;
+                let eq = crate::proof::output_closure::eq_vector(&unit)?;
+                let coefficient = eq.get(column).copied().ok_or(Error::ShapeMismatch)?;
+                row.add_unit(
+                    bias_member.bat_oracle,
+                    BatPart::Main,
+                    u64::try_from(index).map_err(|_| Error::ResourceLimit)?,
+                    Fp3::ZERO.sub(&coefficient),
+                );
             }
             row.target = target;
             rows.push(row);
@@ -26384,7 +26386,6 @@ fn output_tail_padding_rows(
     Ok(rows)
 }
 
-/// Ownership of the request-chain rows the own stage rebinds and appends.
 /// The prover hands its rows over so the rebind reuses the same allocation;
 /// a verifier that still reads its rows keeps a borrowed copy.
 enum ChainRows<'a> {
@@ -26445,9 +26446,33 @@ fn own_plain_rows_each(
         let binding = norm.ok_or(Error::InvalidConfig)?;
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         let mut rows = Vec::new();
-        rows.extend(norm_plain_rows(plan, members, first, binding)?);
-        if let Some(output) = &binding.output {
-            rows.extend(output_plain_rows(plan, members, first, output)?);
+        {
+            let mut collect = |row: BatRow| -> Result<()> {
+                rows.push(row);
+                Ok(())
+            };
+            norm_plain_rows(plan, members, first, binding, &mut collect)?;
+            if let Some(output) = &binding.output {
+                output_plain_rows(plan, members, first, output, &mut collect)?;
+            }
+            if let Some(lookup) = &binding.lookup {
+                lookup_plain_rows(
+                    plan,
+                    norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
+                    members,
+                    lookup,
+                    &mut collect,
+                )?;
+            }
+            if let Some(rstd) = &binding.rstd {
+                lookup_plain_rows(
+                    plan,
+                    norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
+                    members,
+                    rstd,
+                    &mut collect,
+                )?;
+            }
         }
         if let Some(tail) = &binding.tail {
             rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
@@ -26456,23 +26481,10 @@ fn own_plain_rows_each(
             rows.extend(output_tail_bias_rows(plan, members, point)?);
             rows.extend(output_tail_padding_rows(plan, members)?);
         }
-        if let Some(lookup) = &binding.lookup {
-            rows.extend(lookup_plain_rows(
-                plan,
-                norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
-                members,
-                lookup,
-            )?);
+        for row in rows {
+            emit(row)?;
         }
-        if let Some(rstd) = &binding.rstd {
-            rows.extend(lookup_plain_rows(
-                plan,
-                norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
-                members,
-                rstd,
-            )?);
-        }
-        return Ok(rows);
+        return Ok(());
     }
     let w_rows = usize::try_from(plan.send.w.main_rows).map_err(|_| Error::ResourceLimit)?;
     let w_ell = usize::try_from(plan.send.w.code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -27470,6 +27482,7 @@ fn prove_second(
                 shared_witness,
                 first,
                 plan,
+                norm: None,
             },
             &mut plain_stream,
             plan.proximity.own_fresh,
@@ -27480,7 +27493,7 @@ fn prove_second(
         )?
     } else {
         let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
-        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+        let sample_rows = own_sample_rows(plan, &members, first, Some(shared))?;
         drop(_profile_sample_rows);
         let proximity = proximity_prove_streaming(
             chain,
@@ -27491,6 +27504,7 @@ fn prove_second(
                 shared_witness,
                 first,
                 plan,
+                norm: None,
             },
             &sample_rows,
             &mut plain_stream,
@@ -27953,7 +27967,7 @@ fn verify_second(
             iopp.as_ref(),
         )?
     } else {
-        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+        let sample_rows = own_sample_rows(plan, &members, first, Some(shared))?;
         let proximity = proximity_verify_streaming(
             chain,
             fold,
@@ -28821,7 +28835,7 @@ pub fn prove_norm_only_second(
         None,
         Some(&norm_binding),
         None,
-        &[],
+        ChainRows::Borrowed(&[]),
     )?;
     let fold = member_fold_shape(
         plan.proximity.code,
@@ -28940,7 +28954,7 @@ pub fn verify_norm_only_second(
         None,
         Some(&norm_binding),
         None,
-        &[],
+        ChainRows::Borrowed(&[]),
     )?;
     let fold = member_fold_shape(
         plan.proximity.code,

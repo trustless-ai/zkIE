@@ -916,6 +916,7 @@ fn prove_norm_segment_gemma3(
         table_root: reader.root,
         table_record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
         table_configuration: configuration,
+        source_identity: segment_table_source_identity(),
     };
     identity.validate()?;
     let binding = segment_identity_binding(&identity);

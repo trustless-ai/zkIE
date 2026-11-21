@@ -748,24 +748,24 @@ pub fn rms_relation_terms(
         33..=42 => {
             let index = relation - 33;
             terms.push((slots.v_digits + index, 1));
-            if index < 9 {
+            if index + 1 < slots.widths.v {
                 terms.push((slots.v_carries + 2 * index, 256));
                 terms.push((slots.v_carries + 2 * index + 1, 65_536));
             }
-            if index < 5 {
+            if index < slots.widths.s_ll {
                 terms.push((slots.s_ll_digits + index, -1));
             }
-            if index >= 2 && index - 2 < 6 {
+            if index >= 2 && index - 2 < slots.widths.s_lh {
                 terms.push((slots.s_lh_digits + index - 2, -2));
             }
-            if index >= 4 && index - 4 < 6 {
+            if index >= 4 && index - 4 < slots.widths.s_hh {
                 terms.push((slots.s_hh_digits + index - 4, -1));
             }
             if index > 0 {
                 terms.push((slots.v_carries + 2 * (index - 1), -1));
                 terms.push((slots.v_carries + 2 * (index - 1) + 1, -256));
             }
-            if index < 9 {
+            if index + 1 < slots.widths.v {
                 // The carry pair reads 256*(carry + OFFSET); the previous
                 // pair subtracts another OFFSET, so 255 offsets cancel, or
                 // all 256 at the first digit.
@@ -779,7 +779,7 @@ pub fn rms_relation_terms(
         43..=52 => {
             let index = relation - 43;
             terms.push((slots.v_plus_digits + index, 1));
-            if index < 9 {
+            if index + 1 < slots.widths.v {
                 terms.push((slots.v_plus_carries + index, 256));
             }
             terms.push((slots.v_digits + index, -1));
@@ -799,7 +799,7 @@ pub fn rms_relation_terms(
             terms.push((slots.q1_digits + index, slots.first_divisor as i128));
             terms.push((slots.shift_carries + index, 1));
             terms.push((slots.v_plus_digits + index, -1));
-            if index + 1 < 10 {
+            if index + 1 < slots.widths.mean {
                 terms.push((slots.shift_carries + index + 1, -256));
             }
         }
@@ -816,7 +816,7 @@ pub fn rms_relation_terms(
             terms.push((slots.q_digits + index, slots.second_divisor as i128));
             terms.push((slots.division_carries + index, 1));
             terms.push((slots.q1_digits + index, -1));
-            if index + 1 < 10 {
+            if index + 1 < slots.widths.mean {
                 terms.push((slots.division_carries + index + 1, -256));
             }
         }
@@ -871,27 +871,27 @@ pub(crate) fn rms_slot_value(
         } else {
             (encoded >> 8) & 0xff
         }
-    } else if slot >= slots.s_ll_digits && slot < slots.s_ll_digits + 5 {
+    } else if slot >= slots.s_ll_digits && slot < slots.s_ll_digits + slots.widths.s_ll {
         row.s_ll_digits[slot - slots.s_ll_digits] as i128
-    } else if slot >= slots.s_lh_digits && slot < slots.s_lh_digits + 6 {
+    } else if slot >= slots.s_lh_digits && slot < slots.s_lh_digits + slots.widths.s_lh {
         row.s_lh_digits[slot - slots.s_lh_digits] as i128
-    } else if slot >= slots.s_hh_digits && slot < slots.s_hh_digits + 6 {
+    } else if slot >= slots.s_hh_digits && slot < slots.s_hh_digits + slots.widths.s_hh {
         row.s_hh_digits[slot - slots.s_hh_digits] as i128
-    } else if slot >= slots.v_plus_digits && slot < slots.v_plus_digits + 10 {
+    } else if slot >= slots.v_plus_digits && slot < slots.v_plus_digits + slots.widths.v {
         row.v_plus_digits[slot - slots.v_plus_digits] as i128
-    } else if slot >= slots.v_plus_carries && slot < slots.v_plus_carries + 10 {
+    } else if slot >= slots.v_plus_carries && slot < slots.v_plus_carries + slots.widths.v {
         row.v_plus_carries[slot - slots.v_plus_carries] as i128
-    } else if slot >= slots.q1_digits && slot < slots.q1_digits + 10 {
+    } else if slot >= slots.q1_digits && slot < slots.q1_digits + slots.widths.mean {
         row.q1_digits[slot - slots.q1_digits] as i128
-    } else if slot >= slots.shift_carries && slot < slots.shift_carries + 10 {
+    } else if slot >= slots.shift_carries && slot < slots.shift_carries + slots.widths.mean {
         row.shift_carries[slot - slots.shift_carries] as i128
-    } else if slot >= slots.shift_slack && slot < slots.shift_slack + 10 {
+    } else if slot >= slots.shift_slack && slot < slots.shift_slack + slots.widths.mean {
         row.shift_slack[slot - slots.shift_slack] as i128
-    } else if slot >= slots.q_digits && slot < slots.q_digits + 10 {
+    } else if slot >= slots.q_digits && slot < slots.q_digits + slots.widths.mean {
         row.mean_digits[slot - slots.q_digits] as i128
-    } else if slot >= slots.division_carries && slot < slots.division_carries + 10 {
+    } else if slot >= slots.division_carries && slot < slots.division_carries + slots.widths.mean {
         row.division_carries[slot - slots.division_carries] as i128
-    } else if slot >= slots.division_slack && slot < slots.division_slack + 10 {
+    } else if slot >= slots.division_slack && slot < slots.division_slack + slots.widths.mean {
         row.division_slack[slot - slots.division_slack] as i128
     } else if slot == slots.mean_top_slack {
         row.mean_top_slack as i128
@@ -5658,6 +5658,10 @@ fn digit_capacity(width: usize) -> Result<u128> {
 pub struct RmsRoundSlots {
     pub first_divisor: u32,
     pub second_divisor: u32,
+    /// The derived limb widths the slot blocks are sized from. The slot
+    /// structure and the value writer read these, so the layout and the row
+    /// digits have one source.
+    pub widths: RmsLimbWidths,
     pub s_ll_digits: usize,
     pub s_lh_digits: usize,
     pub s_hh_digits: usize,
@@ -5678,30 +5682,36 @@ pub struct RmsRoundSlots {
 impl RmsRoundSlots {
     pub const CARRY_OFFSET: u64 = 1 << 15;
 
-    pub fn new(base: usize, first_divisor: u32, second_divisor: u32) -> Self {
+    pub fn new(
+        base: usize,
+        first_divisor: u32,
+        second_divisor: u32,
+        widths: RmsLimbWidths,
+    ) -> Self {
         let mut next = base;
         let mut take = |count: usize| {
             let at = next;
             next += count;
             at
         };
-        let s_ll_digits = take(5);
-        let s_lh_digits = take(6);
-        let s_hh_digits = take(6);
-        let v_digits = take(10);
-        let v_carries = take(20);
-        let v_plus_digits = take(10);
-        let v_plus_carries = take(10);
-        let q1_digits = take(10);
-        let shift_carries = take(10);
-        let shift_slack = take(10);
-        let q_digits = take(10);
-        let division_carries = take(10);
-        let division_slack = take(10);
+        let s_ll_digits = take(widths.s_ll);
+        let s_lh_digits = take(widths.s_lh);
+        let s_hh_digits = take(widths.s_hh);
+        let v_digits = take(widths.v);
+        let v_carries = take(2 * widths.v);
+        let v_plus_digits = take(widths.v);
+        let v_plus_carries = take(widths.v);
+        let q1_digits = take(widths.mean);
+        let shift_carries = take(widths.mean);
+        let shift_slack = take(widths.mean);
+        let q_digits = take(widths.mean);
+        let division_carries = take(widths.mean);
+        let division_slack = take(widths.mean);
         let mean_top_slack = take(1);
         Self {
             first_divisor,
             second_divisor,
+            widths,
             s_ll_digits,
             s_lh_digits,
             s_hh_digits,
@@ -5956,7 +5966,12 @@ impl NormRoundLayout {
     }
 
     /// Attaches the multi-limb RMS slots after the shared slots.
-    pub fn with_rms(mut self, first_divisor: u32, second_divisor: u32) -> Result<Self> {
+    pub fn with_rms(
+        mut self,
+        first_divisor: u32,
+        second_divisor: u32,
+        widths: RmsLimbWidths,
+    ) -> Result<Self> {
         let base = self.slots.total;
         if first_divisor == 0
             || second_divisor == 0
@@ -5965,7 +5980,12 @@ impl NormRoundLayout {
         {
             return Err(Error::InvalidConfig);
         }
-        self.rms = Some(RmsRoundSlots::new(base, first_divisor, second_divisor));
+        self.rms = Some(RmsRoundSlots::new(
+            base,
+            first_divisor,
+            second_divisor,
+            widths,
+        ));
         Ok(self)
     }
 
@@ -6006,19 +6026,19 @@ impl NormRoundLayout {
         let mut ranges = ranges.to_vec();
         if let Some(rms) = self.rms {
             ranges.extend([
-                (rms.s_ll_digits, 5),
-                (rms.s_lh_digits, 6),
-                (rms.s_hh_digits, 6),
-                (rms.v_digits, 10),
-                (rms.v_carries, 20),
-                (rms.v_plus_digits, 10),
-                (rms.v_plus_carries, 10),
-                (rms.q1_digits, 10),
-                (rms.shift_carries, 10),
-                (rms.shift_slack, 10),
-                (rms.q_digits, 10),
-                (rms.division_carries, 10),
-                (rms.division_slack, 10),
+                (rms.s_ll_digits, rms.widths.s_ll),
+                (rms.s_lh_digits, rms.widths.s_lh),
+                (rms.s_hh_digits, rms.widths.s_hh),
+                (rms.v_digits, rms.widths.v),
+                (rms.v_carries, 2 * rms.widths.v),
+                (rms.v_plus_digits, rms.widths.v),
+                (rms.v_plus_carries, rms.widths.v),
+                (rms.q1_digits, rms.widths.mean),
+                (rms.shift_carries, rms.widths.mean),
+                (rms.shift_slack, rms.widths.mean),
+                (rms.q_digits, rms.widths.mean),
+                (rms.division_carries, rms.widths.mean),
+                (rms.division_slack, rms.widths.mean),
                 (rms.mean_top_slack, 1),
             ]);
         }
@@ -6156,19 +6176,19 @@ impl NormRoundLayout {
             }
             let rms = core.rms.as_ref().ok_or(Error::ShapeMismatch)?;
             write_digits(
-                &mut values[slots.s_ll_digits..slots.s_ll_digits + 5],
+                &mut values[slots.s_ll_digits..slots.s_ll_digits + slots.widths.s_ll],
                 &rms.s_ll_digits,
             )?;
             write_digits(
-                &mut values[slots.s_lh_digits..slots.s_lh_digits + 6],
+                &mut values[slots.s_lh_digits..slots.s_lh_digits + slots.widths.s_lh],
                 &rms.s_lh_digits,
             )?;
             write_digits(
-                &mut values[slots.s_hh_digits..slots.s_hh_digits + 6],
+                &mut values[slots.s_hh_digits..slots.s_hh_digits + slots.widths.s_hh],
                 &rms.s_hh_digits,
             )?;
             write_digits(
-                &mut values[slots.v_digits..slots.v_digits + 10],
+                &mut values[slots.v_digits..slots.v_digits + slots.widths.v],
                 &rms.v_digits,
             )?;
             for (index, carry) in rms.v_carries.iter().enumerate() {
@@ -6181,35 +6201,35 @@ impl NormRoundLayout {
                     Fp3::from_u64((encoded >> 8) as u64);
             }
             write_digits(
-                &mut values[slots.v_plus_digits..slots.v_plus_digits + 10],
+                &mut values[slots.v_plus_digits..slots.v_plus_digits + slots.widths.v],
                 &rms.v_plus_digits,
             )?;
             write_digits(
-                &mut values[slots.v_plus_carries..slots.v_plus_carries + 10],
+                &mut values[slots.v_plus_carries..slots.v_plus_carries + slots.widths.v],
                 &rms.v_plus_carries,
             )?;
             write_digits(
-                &mut values[slots.q1_digits..slots.q1_digits + 10],
+                &mut values[slots.q1_digits..slots.q1_digits + slots.widths.mean],
                 &rms.q1_digits,
             )?;
             write_digits(
-                &mut values[slots.shift_carries..slots.shift_carries + 10],
+                &mut values[slots.shift_carries..slots.shift_carries + slots.widths.mean],
                 &rms.shift_carries,
             )?;
             write_digits(
-                &mut values[slots.shift_slack..slots.shift_slack + 10],
+                &mut values[slots.shift_slack..slots.shift_slack + slots.widths.mean],
                 &rms.shift_slack,
             )?;
             write_digits(
-                &mut values[slots.q_digits..slots.q_digits + 10],
+                &mut values[slots.q_digits..slots.q_digits + slots.widths.mean],
                 &rms.mean_digits,
             )?;
             write_digits(
-                &mut values[slots.division_carries..slots.division_carries + 10],
+                &mut values[slots.division_carries..slots.division_carries + slots.widths.mean],
                 &rms.division_carries,
             )?;
             write_digits(
-                &mut values[slots.division_slack..slots.division_slack + 10],
+                &mut values[slots.division_slack..slots.division_slack + slots.widths.mean],
                 &rms.division_slack,
             )?;
             values[slots.mean_top_slack] = Fp3::from_u64(u64::from(rms.mean_top_slack));
@@ -8376,6 +8396,76 @@ mod tests {
         let mut changed = message.clone();
         changed.mask.as_mut().unwrap().positions = vec![1];
         assert!(changed.check_trusted(&plan).is_err());
+    }
+
+    /// The rounding layout keeps the published slot structure. The other RMS
+    /// shape derives exactly the historical literal tuple, so its slot
+    /// offsets, committed round rows and digests are unchanged; the timesfm
+    /// shape shifts only the S_ll block by its one extra byte. The widths are
+    /// the fields the plan encoding carries, so equal widths mean equal plan
+    /// identity for the other shape.
+    #[test]
+    fn the_rms_slot_layout_keeps_the_published_offsets() {
+        let other = crate::proof::rms_limbs::RmsLimbWidths::derive(1 << 33, 640).unwrap();
+        assert_eq!(
+            (
+                other.first_divisor,
+                other.second_divisor,
+                other.s_ll,
+                other.s_lh,
+                other.s_hh,
+                other.v,
+                other.mean
+            ),
+            (128, 5, 5, 6, 6, 10, 10)
+        );
+        let slots = RmsRoundSlots::new(1000, other.first_divisor, other.second_divisor, other);
+        assert_eq!(slots.s_ll_digits, 1000);
+        assert_eq!(slots.s_lh_digits, 1005);
+        assert_eq!(slots.s_hh_digits, 1011);
+        assert_eq!(slots.v_digits, 1017);
+        assert_eq!(slots.v_carries, 1027);
+        assert_eq!(slots.v_plus_digits, 1047);
+        assert_eq!(slots.v_plus_carries, 1057);
+        assert_eq!(slots.q1_digits, 1067);
+        assert_eq!(slots.shift_carries, 1077);
+        assert_eq!(slots.shift_slack, 1087);
+        assert_eq!(slots.q_digits, 1097);
+        assert_eq!(slots.division_carries, 1107);
+        assert_eq!(slots.division_slack, 1117);
+        assert_eq!(slots.mean_top_slack, 1127);
+        assert_eq!(slots.total, 1128);
+
+        let timesfm = crate::proof::rms_limbs::RmsLimbWidths::derive(1 << 17, 1280).unwrap();
+        assert_eq!(
+            (
+                timesfm.first_divisor,
+                timesfm.second_divisor,
+                timesfm.s_ll,
+                timesfm.s_lh,
+                timesfm.s_hh,
+                timesfm.v,
+                timesfm.mean
+            ),
+            (128, 10, 6, 6, 6, 10, 10)
+        );
+        let slots =
+            RmsRoundSlots::new(1000, timesfm.first_divisor, timesfm.second_divisor, timesfm);
+        assert_eq!(slots.s_ll_digits, 1000);
+        assert_eq!(slots.s_lh_digits, 1006);
+        assert_eq!(slots.s_hh_digits, 1012);
+        assert_eq!(slots.v_digits, 1018);
+        assert_eq!(slots.v_carries, 1028);
+        assert_eq!(slots.v_plus_digits, 1048);
+        assert_eq!(slots.v_plus_carries, 1058);
+        assert_eq!(slots.q1_digits, 1068);
+        assert_eq!(slots.shift_carries, 1078);
+        assert_eq!(slots.shift_slack, 1088);
+        assert_eq!(slots.q_digits, 1098);
+        assert_eq!(slots.division_carries, 1108);
+        assert_eq!(slots.division_slack, 1118);
+        assert_eq!(slots.mean_top_slack, 1128);
+        assert_eq!(slots.total, 1129);
     }
 
 }

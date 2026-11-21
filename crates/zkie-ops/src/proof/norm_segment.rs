@@ -334,7 +334,9 @@ pub fn build_core_plan(
         None
     };
     let round_layout = match &rms_widths {
-        Some(widths) => round_layout.with_rms(widths.first_divisor, widths.second_divisor)?,
+        Some(widths) => {
+            round_layout.with_rms(widths.first_divisor, widths.second_divisor, *widths)?
+        }
         None => round_layout,
     };
     let round_columns = u64::try_from(round_layout.total_slots())

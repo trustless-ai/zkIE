@@ -101,8 +101,14 @@ impl RmsLimbWidths {
         let first_divisor = if valid == 0 {
             return Err(Error::InvalidConfig);
         } else {
+            // The first divisor stays in the proven byte domain: at most 128,
+            // where the shift carries (below the first divisor) and the
+            // relation coefficients are certified, while the second divisor
+            // keeps the single byte range. Shapes whose power-of-two factor
+            // exceeds the old 256 cap split as 128 x (valid / 128) when that
+            // quotient fits a byte.
             let mut divisor: u32 = 1;
-            while divisor < 256 && valid % (divisor * 2) == 0 {
+            while divisor < 128 && valid % (divisor * 2) == 0 {
                 divisor *= 2;
             }
             divisor
@@ -541,5 +547,65 @@ mod tests {
         let mut values = vec![0i64; 640];
         values[3] = (1i64 << 33) + 1;
         assert!(RmsLimbRow::from_values(&values, 640, 1 << 33, widths()).is_err());
+    }
+
+    #[test]
+    fn the_two_byte_divisor_split_covers_the_shared_shapes() {
+        // The first divisor never exceeds the proven 128 domain; the second
+        // stays inside a byte, and the product is the exact valid count.
+        for (input_bound, valid, first, second) in [
+            (1u64 << 33, 640u32, 128u32, 5u32),
+            (1u64 << 33, 768, 128, 6),
+            (1u64 << 17, 1280, 128, 10),
+        ] {
+            let widths = RmsLimbWidths::derive(input_bound, valid).unwrap();
+            assert_eq!(
+                (widths.first_divisor, widths.second_divisor),
+                (first, second)
+            );
+            assert_eq!(widths.first_divisor * widths.second_divisor, valid);
+        }
+    }
+
+    #[test]
+    fn the_1280_row_is_exact_and_tampered_rows_are_refused() {
+        let widths = RmsLimbWidths::derive(1 << 17, 1280).unwrap();
+        let mut values = vec![0i64; 1280];
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = ((index as i64 * 37) % 251) - 125;
+        }
+        let row = RmsLimbRow::from_values(&values, 1280, 1 << 17, widths).unwrap();
+        let v: i128 = values
+            .iter()
+            .map(|value| (*value as i128) * (*value as i128))
+            .sum();
+        assert_eq!(row.mean_square, round_div_half_up(v, 1280).unwrap());
+        assert_eq!(
+            digits_value(&row.mean_digits).unwrap(),
+            row.mean_square as u128
+        );
+        assert_eq!(u128::from(row.remainder), ((v + 640) as u128) % 1280);
+        row.check(&values, 1280, 1 << 17, widths).unwrap();
+
+        // A factor pair whose product is not the valid count is refused
+        // before any row is built.
+        let mut wrong = widths;
+        wrong.first_divisor = 64;
+        assert!(RmsLimbRow::from_values(&values, 1280, 1 << 17, wrong).is_err());
+
+        // Carries, slack complements and quotient digits are all checked
+        // against a recomputation; any changed byte is refused.
+        let mut changed = row.clone();
+        changed.shift_carries[5] = changed.shift_carries[5].wrapping_add(1);
+        assert!(changed.check(&values, 1280, 1 << 17, widths).is_err());
+        let mut changed = row.clone();
+        changed.shift_slack[3] = changed.shift_slack[3].wrapping_add(1);
+        assert!(changed.check(&values, 1280, 1 << 17, widths).is_err());
+        let mut changed = row.clone();
+        changed.division_carries[4] = changed.division_carries[4].wrapping_add(1);
+        assert!(changed.check(&values, 1280, 1 << 17, widths).is_err());
+        let mut changed = row.clone();
+        changed.mean_digits[2] ^= 1;
+        assert!(changed.check(&values, 1280, 1 << 17, widths).is_err());
     }
 }

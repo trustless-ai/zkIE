@@ -5226,17 +5226,32 @@ fn hd_activation_identity(
             return Err(Error::StatementMismatch);
         }
     }
+    let roots: Vec<Digest> = entries.iter().map(|entry| entry.root).collect();
+    hd_activation_root(plan, &roots)
+}
+
+/// The activation identity of the norm hidden-output object derived from the
+/// committed out group roots. The verifier re-commits the materialized output
+/// rows with the plan-fixed public coins and compares this identity with the
+/// chain statement.
+pub fn hd_activation_root(plan: &HiddenLinPlan, roots: &[Digest]) -> Result<Digest> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let group = &output.out;
+    if roots.len() != plan.send.positions() as usize || roots.iter().any(|root| *root == Digest::ZERO) {
+        return Err(Error::ShapeMismatch);
+    }
     let mut writer = CanonicalWriter::new();
     writer.put_u64(HD_ACTIVATION_IDENTITY_VERSION);
     writer.put_u64(group.oracle_base);
     writer.put_u64(group.group);
     writer.put_u64(group.columns);
     group.shape.encode_into(&mut writer);
-    writer.put_u64(entries.len() as u64);
-    for entry in entries {
-        writer.put_u64(entry.position as u64);
-        writer.put_u64(entry.oracle);
-        writer.put_digest(&entry.root);
+    writer.put_u64(roots.len() as u64);
+    for (position, root) in roots.iter().enumerate() {
+        writer.put_u64(position as u64);
+        writer.put_u64(group.oracle_base + position as u64);
+        writer.put_digest(root);
     }
     hash_labeled(tag_word(PARAMETERS, 7), 0, None, &writer.into_bytes())
 }
@@ -9441,7 +9456,10 @@ impl HiddenLinPlan {
             let norm = self.norm.as_ref().ok_or(Error::InvalidConfig)?;
             let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
             let out = &output.out;
-            if u64::from(norm.shape.valid) != self.send.matrix_rows
+            // The norm may carry zero padding columns: the valid statistical
+            // columns are at most the matrix rows, and the padded columns are
+            // bound column by column through the output tail padding rows.
+            if u64::from(norm.shape.valid) > self.send.matrix_rows
                 || norm.columns < self.send.matrix_rows
                 || out.columns != norm.columns
                 || out.oracle_base == 0
@@ -21153,7 +21171,7 @@ fn norm_pointwise_maps(
 /// Resolves the key cells of the norm digit lookup across the committed
 /// rounding and tail messages. The key groups name the message each source
 /// addresses; the caller supplies the unencoded message rows of both groups.
-fn norm_lookup_key_values(
+pub(crate) fn norm_lookup_key_values(
     plan: &NormPlan,
     lookup: &crate::proof::hidden_norm_psc::NormLookupPlan,
     round_rows: &[Vec<Vec<Fp3>>],
@@ -23185,7 +23203,7 @@ fn norm_plain_rows(
                 for index in 0..width {
                     let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
                     *entry = power.mul(&eq[index]);
-                    power = power.add(&power);
+                    power = power.mul(&Fp3::from_u64(256));
                 }
                 if let Some(slot) = value_slot {
                     let entry = dense.get_mut(slot).ok_or(Error::ShapeMismatch)?;
@@ -24287,21 +24305,29 @@ fn output_tail_plain_rows(
                     (low_at, clamp.low, low_half, low as i128),
                     (high_at, clamp.high, high_half, high as i128),
                 ] {
-                    let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
+                    let mut row = BatRow::new(BatRowKind::Plain);
                     let mut power = Fp3::ONE;
                     for digit in 0..bound_width {
                         let at = base + bound_at + digit;
-                        coefficients[at] = coefficients[at].add(&power);
+                        row.add_unit(
+                            tail_member.bat_oracle,
+                            BatPart::Main,
+                            u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                            power,
+                        );
                         power = power.mul(&Fp3::from_u64(256));
                     }
                     let mut power = Fp3::ONE;
                     for digit in 0..widths.pre_clamp {
                         let at = base + pre_at + digit;
-                        coefficients[at] = coefficients[at].sub(&power);
+                        row.add_unit(
+                            tail_member.bat_oracle,
+                            BatPart::Main,
+                            u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                            Fp3::ZERO.sub(&power),
+                        );
                         power = power.mul(&Fp3::from_u64(256));
                     }
-                    let mut row = BatRow::new(BatRowKind::Plain);
-                    row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
                     row.target = crate::proof::output_closure::fp3_signed(
                         bound_half as i128 - pre_half as i128 - bound,
                     )?;
@@ -24465,11 +24491,17 @@ fn output_tail_padding_rows(
             if column * slots + pre_at + tail_plan.widths.pre_clamp > tail_rows * tail_ell {
                 return Err(Error::ShapeMismatch);
             }
-            let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
             let base = column * slots + pre_at;
+            let mut row = BatRow::new(BatRowKind::Plain);
             let mut power = Fp3::ONE;
             for digit in 0..tail_plan.widths.pre_clamp {
-                coefficients[base + digit] = power;
+                let at = base + digit;
+                row.add_unit(
+                    tail_member.bat_oracle,
+                    BatPart::Main,
+                    u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                    power,
+                );
                 power = power.mul(&Fp3::from_u64(256));
             }
             let mut unit = vec![Fp3::ZERO; bits];
@@ -24478,15 +24510,15 @@ fn output_tail_padding_rows(
                     unit[bit] = Fp3::ONE;
                 }
             }
-            let bias_coefficients =
-                norm_param_eval_coefficients(&bias_claim.gu, norm.columns, &unit)?;
-            let negated: Vec<Fp3> = bias_coefficients
-                .iter()
-                .map(|value| Fp3::ZERO.sub(value))
-                .collect();
-            let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
-            row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+            let index = gu_vector_bat_index(&bias_claim.gu, column as u64)?;
+            let eq = crate::proof::output_closure::eq_vector(&unit)?;
+            let coefficient = eq.get(column).copied().ok_or(Error::ShapeMismatch)?;
+            row.add_unit(
+                bias_member.bat_oracle,
+                BatPart::Main,
+                u64::try_from(index).map_err(|_| Error::ResourceLimit)?,
+                Fp3::ZERO.sub(&coefficient),
+            );
             row.target = target;
             rows.push(row);
         }
@@ -26399,6 +26431,37 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
         Some(norm),
         Some(rstd_table),
         None,
+        None,
+    )
+}
+
+/// Proves the norm hidden-output chain with the frozen-table rstd view and
+/// the parameter tables. This is the NormHd form of the rstd-table prover:
+/// the prover reads the same frozen table the verifier checks.
+pub fn prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+    plan: &HiddenLinPlan,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    rstd_table: &dyn crate::proof::lookup::LookupTable,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty()
+        || plan.norm.is_none()
+        || !plan.send.activation_source.is_norm_hd()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        None,
+        table,
+        None,
+        seed,
+        true,
+        Some(norm),
+        Some(rstd_table),
+        param_tables,
         None,
     )
 }
@@ -30215,6 +30278,7 @@ mod merged_tests {
             POSITIONS,
             config,
             Fp3::from_u64(values[0] as u64),
+            1000,
             &params,
         )
         .unwrap();
@@ -36023,6 +36087,7 @@ mod merged_tests {
             out: group(93, 20_300, 61_300),
             shift: 3,
             clamp: Some((-1_000, 1_000)),
+            no_op_clamp: false,
             tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
                 group: NormGroupPlan {
                     shape: WShape::new(
